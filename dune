@@ -1,0 +1,3 @@
+; Only these directories hold build targets; corpus/ contains symlinks into
+; the OCaml tree, which has dune files of its own.
+(dirs bin src test)

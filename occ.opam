@@ -1,0 +1,15 @@
+opam-version: "2.0"
+synopsis: "A textbook C11 compiler in OCaml, sized to build the OCaml runtime"
+maintainer: "mark.elvers@tunbury.org"
+authors: ["Mark Elvers"]
+license: "MIT"
+homepage: "https://github.com/mtelvers/occ"
+bug-reports: "https://github.com/mtelvers/occ/issues"
+depends: [
+  "ocaml" {>= "5.1"}
+  "dune" {>= "3.0"}
+]
+build: [
+  ["dune" "build" "-p" name "-j" jobs]
+  ["dune" "build" "-p" name "@runtest"] {with-test}
+]

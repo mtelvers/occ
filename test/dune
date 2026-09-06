@@ -1,0 +1,12 @@
+; Whole-program tests: each programs/*.c carries an "// expect: N" line giving
+; the exit status the compiled program must return.
+(executable
+ (name run))
+
+(rule
+ (alias runtest)
+ (deps
+  (glob_files programs/*.c)
+  %{exe:../bin/main.exe})
+ (action
+  (run %{exe:run.exe} %{exe:../bin/main.exe} programs)))
