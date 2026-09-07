@@ -9,3 +9,9 @@
  (modules occas)
  (public_name occas)
  (libraries occ))
+
+(executable
+ (name occar)
+ (modules occar)
+ (public_name occar)
+ (libraries occ))

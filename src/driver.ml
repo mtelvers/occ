@@ -170,7 +170,9 @@ let preprocess o input output =
          __PIE__ as well; the runtime's amd64.S chooses GOT addressing by
          these. *)
       let pic = [ "__PIC__", Some "2"; "__pic__", Some "2" ] @ (if o.pic then [] else [ "__PIE__", Some "2"; "__pie__", Some "2" ]) in
-      let cfg = { o.cpp with Preprocess.system_dirs = o.cpp.system_dirs @ defaults; defines = extras @ pic @ o.cpp.defines } in
+      (* gcc's -pthread also defines _REENTRANT, which configure scripts test *)
+      let pthread = if List.mem "-pthread" o.passthrough then [ "_REENTRANT", Some "1" ] else [] in
+      let cfg = { o.cpp with Preprocess.system_dirs = o.cpp.system_dirs @ defaults; defines = extras @ pic @ pthread @ o.cpp.defines } in
       let text, included = Preprocess.run cfg input in
       Out_channel.with_open_bin output (fun oc -> output_string oc text);
       (* -MMD: a make rule listing the headers this unit depends on *)

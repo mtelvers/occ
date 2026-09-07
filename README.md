@@ -18,6 +18,7 @@ everything occ and ocamlopt produce); linking is left to binutils.
 
     bin/main.ml          entry point of occ, the compiler driver
     bin/occas.ml         entry point of occas, the assembler (GNU as command line)
+    bin/occar.ml         entry point of occar, the archiver (ar command line)
     src/
       loc, diag          positions, diagnostics (first error stops)
       token, lexer       6.4, phases 1–3 and 7
@@ -32,6 +33,7 @@ everything occ and ocamlopt produce); linking is left to binutils.
       assembler/         gas syntax (lexer, parser), x86-64 encoding,
                          layout and relaxation, .eh_frame, .debug_line,
                          ELF relocatable output
+      archiver/          ar archives with a symbol index; ELF symbol reading
     include/             stdarg.h, stdatomic.h, stddef.h, ... (7.15–7.23)
     test/programs/       whole-program tests: // expect: N
     tools/mkcorpus.sh    preprocess the OCaml runtime into corpus/
@@ -46,6 +48,7 @@ everything occ and ocamlopt produce); linking is left to binutils.
     tools/corpus-check.sh obj                    # compile + assemble the runtime corpus
     tools/ascheck.sh dir...                      # occas vs GNU as on every .s under dir
     tools/asdiff.sh file.s                       # where one file's object differs
+    tools/archeck.sh dir                         # occar vs GNU ar on every .a under dir
 
 ## Staging
 
@@ -78,6 +81,17 @@ demand identical section bytes and relocations: it does, on all 239
 runtime units, 281 ocamlopt-compiled compiler modules and `amd64.S`.
 OCaml's configure picks `occ -c` for `AS` and `ASPP` when `CC=occ`, so
 `make world.opt` assembles every `.s` and `.S` with it.
+
+## Archiver
+
+`occar` is the `ar` command: `r`, `q`, `d`, `t`, `x` and `s` with the
+`c` and `v` modifiers, which covers `ar rc` from the Makefiles and
+ocamlopt and `ar rcs` from ocamlmklib. `Ar` writes the GNU archive
+format with a symbol index built by reading each member's ELF symbol
+table (`Elf_read`), in deterministic mode, so `tools/archeck.sh`
+rebuilds every static library in the OCaml tree from its members and
+gets the original file back byte for byte (34 of 34). Configure with
+`AR=occar` to use it.
 
 ## Definition of done
 
