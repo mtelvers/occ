@@ -1,4 +1,11 @@
 (executable
  (name main)
+ (modules main)
  (public_name occ)
+ (libraries occ))
+
+(executable
+ (name occas)
+ (modules occas)
+ (public_name occas)
  (libraries occ))

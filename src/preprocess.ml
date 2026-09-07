@@ -5,6 +5,7 @@ type config = {
   undefines : string list;
   includes : string list;
   line_markers : bool;
+  assembler : bool;
 }
 
 let predefined_extras = [
@@ -78,7 +79,11 @@ let loc c = { Loc.file = c.file; line = c.presumed_line; col = c.col + 1 }
 (* ---- Phase 3: tokens ---------------------------------------------------------- *)
 
 let is_digit ch = '0' <= ch && ch <= '9'
-let is_nondigit ch = ch = '_' || ('a' <= ch && ch <= 'z') || ('A' <= ch && ch <= 'Z') || ch = '$'
+(* Preprocessing assembly (.S): a failed ## pastes as two adjacent tokens,
+   and "$" is not an identifier character, both as in cpp's assembler mode. *)
+let assembler_mode = ref false
+
+let is_nondigit ch = ch = '_' || ('a' <= ch && ch <= 'z') || ('A' <= ch && ch <= 'Z') || (ch = '$' && not !assembler_mode)
 let is_ident ch = is_nondigit ch || is_digit ch || Char.code ch >= 0x80
 
 (* Longest-match punctuators, digraphs spelled as themselves. *)
@@ -276,11 +281,16 @@ let stringize (toks : ptok list) : string =
   Buffer.add_char b '"';
   Buffer.contents b
 
-(* ## (6.10.3.3): the two spellings joined must form one token. *)
-let paste loc (a : ptok) (b : ptok) : ptok =
+(* ## (6.10.3.3): the two spellings joined must form one token.  In
+   assembler input (gcc -x assembler-with-cpp) a failed paste is not an
+   error: the two tokens are simply written next to each other, which is
+   what "caml_##x##.##y" in the OCaml runtime relies on. *)
+
+let paste loc (a : ptok) (b : ptok) : ptok list =
   let text = a.text ^ b.text in
   match tokens_of_string text with
-  | [ t ] -> { t with ws = a.ws; bol = a.bol; loc = a.loc; hide = a.hide }
+  | [ t ] -> [ { t with ws = a.ws; bol = a.bol; loc = a.loc; hide = a.hide } ]
+  | _ when !assembler_mode -> [ { b with ws = false; bol = false }; a ]   (* reversed: callers build lists back to front *)
   | _ -> error loc "pasting \"%s\" and \"%s\" does not give a valid preprocessing token" a.text b.text
 
 let builtin_expansion st (t : ptok) : ptok list =
@@ -297,6 +307,21 @@ let builtin_expansion st (t : ptok) : ptok list =
 
 (* Expand tokens from [s] until Eof, returning the expanded list.  [one]
    stops after the first token has been fully dealt with, for #if. *)
+(* The result of a macro expansion takes the position of the macro name:
+   its whitespace, whether it began a line, and its location, so the
+   output's line structure and line markers follow the invocation. *)
+let placed (s : stream) (t : ptok) (result : ptok list) : ptok list =
+  match result with
+  | r :: rest -> { r with ws = t.ws || r.ws; bol = t.bol; loc = t.loc } :: rest
+  | [] ->
+      (* an empty expansion at the start of a line passes the start of
+         line on to whatever follows it *)
+      if t.bol then begin
+        let n = next_tok s in
+        if n.kind <> Eof then push_back s [ { n with bol = true; loc = t.loc } ]
+      end;
+      []
+
 let rec expand_all st (s : stream) : ptok list =
   let out = ref [] in
   let rec loop () =
@@ -309,7 +334,7 @@ let rec expand_all st (s : stream) : ptok list =
          | Builtin -> push_back s (builtin_expansion st t); loop ()
          | Object body ->
              let hs = t.text :: t.hide in
-             push_back s (subst st t body [] [] hs);
+             push_back s (placed s t (subst st t body [] [] hs));
              loop ()
          | Function { params; variadic; body } ->
              (* a function-like macro name not followed by ( is not an invocation *)
@@ -323,7 +348,7 @@ let rec expand_all st (s : stream) : ptok list =
                let hs = List.sort_uniq compare (t.text :: List.filter (fun h -> List.mem h rparen.hide) t.hide) in
                let result = subst st t body params args hs in
                (* the result takes the whitespace of the macro name *)
-               let result = match result with r :: rest -> { r with ws = t.ws || r.ws; bol = t.bol } :: rest | [] -> [] in
+               let result = placed s t result in
                push_back s result;
                loop ()
              end else begin
@@ -389,11 +414,11 @@ and subst st (name : ptok) (is : ptok list) (fp : string list) (ap : ptok list l
          | _, ({ kind = Punct; text = ","; _ } :: _) when p = "__VA_ARGS__" ->
              (* GNU ", ## __VA_ARGS__" with arguments present: the comma stays, nothing is pasted *)
              go rest (List.rev_append a os)
-         | first :: more, prev :: os' -> go rest (List.rev_append more (paste loc prev first :: os'))
+         | first :: more, prev :: os' -> go rest (List.rev_append more (paste loc prev first @ os'))
          | first :: more, [] -> go rest (List.rev_append more [ first ]))
     | ({ kind = Punct; text = "##"; loc; _ }) :: t :: rest ->
         (match os with
-         | prev :: os' -> go rest (paste loc prev t :: os')
+         | prev :: os' -> go rest (paste loc prev t @ os')
          | [] -> go rest [ t ])
     | ({ kind = Ident; text = p; _ }) :: ({ kind = Punct; text = "##"; _ } :: _ as rest) when actual p <> None ->
         let a = Option.get (actual p) in
@@ -617,8 +642,15 @@ let would_paste (a : string) (b : string) =
   (match tokens_of_string (a ^ b) with [ _ ] -> true | _ -> false)
 
 let emit st (t : ptok) =
-  if t.loc.file <> st.out_file || t.loc.line < st.out_line || t.loc.line > st.out_line + 8 then emit_marker st t.loc
-  else while st.out_line < t.loc.line do Buffer.add_char st.out '\n'; st.out_line <- st.out_line + 1; st.at_line_start <- true done;
+  (* The output's line structure follows the source's logical lines: only
+     a token that began a line may begin one here, so a macro expansion
+     stays on the line of its invocation even when the macro's body was
+     written across continuation lines (an assembler needs this: a newline
+     ends a statement). *)
+  if t.bol then begin
+    if t.loc.file <> st.out_file || t.loc.line < st.out_line || t.loc.line > st.out_line + 8 then emit_marker st t.loc
+    else while st.out_line < t.loc.line do Buffer.add_char st.out '\n'; st.out_line <- st.out_line + 1; st.at_line_start <- true done
+  end;
   if not st.at_line_start && (t.ws || would_paste st.last_text t.text) then Buffer.add_char st.out ' ';
   Buffer.add_string st.out t.text;
   st.last_text <- t.text;
@@ -777,7 +809,7 @@ and expand_first st (s : stream) : ptok list =
       (match Hashtbl.find st.macros t.text with
        | Builtin -> push_back s (builtin_expansion st t); expand_first st s
        | Object body ->
-           push_back s (subst st t body [] [] (t.text :: t.hide));
+           push_back s (placed s t (subst st t body [] [] (t.text :: t.hide)));
            expand_first st s
        | Function { params; variadic; body } ->
            let rec skip_nl acc =
@@ -788,7 +820,7 @@ and expand_first st (s : stream) : ptok list =
              let args, rparen = collect_args st s t (List.length params) variadic in
              let hs = List.sort_uniq compare (t.text :: List.filter (fun h -> List.mem h rparen.hide) t.hide) in
              let result = subst st t body params args hs in
-             let result = match result with r :: rest -> { r with ws = t.ws || r.ws; bol = t.bol } :: rest | [] -> [] in
+             let result = placed s t result in
              push_back s result;
              expand_first st s
            end else begin
@@ -834,6 +866,7 @@ let builtin_names = [ "__FILE__"; "__LINE__"; "__COUNTER__"; "__INCLUDE_LEVEL__"
                       "__has_builtin"; "__has_attribute"; "__has_feature"; "__has_extension"; "__has_c_attribute"; "__has_include" ]
 
 let run cfg file =
+  assembler_mode := cfg.assembler;
   let st = { cfg; macros = Hashtbl.create 512; once = Hashtbl.create 16; out = Buffer.create 65536;
              out_file = ""; out_line = 0; at_line_start = true; counter = 0; depth = 0; main_file = file; included = []; last_text = "" } in
   List.iter (fun n -> Hashtbl.replace st.macros n Builtin) builtin_names;

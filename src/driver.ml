@@ -62,7 +62,7 @@ let usage = "usage: occ [gcc-compatible options] files...\n\
 let parse_args argv =
   let o = {
     stop_after = Link; output = None; inputs = []; link_args = [];
-    cpp = { Preprocess.include_dirs = []; system_dirs = []; defines = []; undefines = []; includes = []; line_markers = true };
+    cpp = { Preprocess.include_dirs = []; system_dirs = []; defines = []; undefines = []; includes = []; line_markers = true; assembler = false };
     passthrough = []; verbose = false; dump = None; pic = false; debug = false; deps = false; deps_file = None; deps_target = None } in
   let n = Array.length argv in
   let i = ref 1 in
@@ -165,7 +165,12 @@ let preprocess o input output =
           match String.index_opt d '=' with
           | None -> d, None
           | Some k -> String.sub d 0 k, Some (String.sub d (k + 1) (String.length d - k - 1))) Preprocess.predefined_extras in
-      let cfg = { o.cpp with Preprocess.system_dirs = o.cpp.system_dirs @ defaults; defines = extras @ o.cpp.defines } in
+      (* Like gcc on this platform, code is position-independent: -fPIC
+         defines __PIC__, and the default (PIE-compatible) code defines
+         __PIE__ as well; the runtime's amd64.S chooses GOT addressing by
+         these. *)
+      let pic = [ "__PIC__", Some "2"; "__pic__", Some "2" ] @ (if o.pic then [] else [ "__PIE__", Some "2"; "__pie__", Some "2" ]) in
+      let cfg = { o.cpp with Preprocess.system_dirs = o.cpp.system_dirs @ defaults; defines = extras @ pic @ o.cpp.defines } in
       let text, included = Preprocess.run cfg input in
       Out_channel.with_open_bin output (fun oc -> output_string oc text);
       (* -MMD: a make rule listing the headers this unit depends on *)
@@ -205,7 +210,9 @@ let compile o ~src input output =
 let assemble o input output =
   match mode Assemble with
   | Delegate -> run o delegate_cc ([ "-c" ] @ o.passthrough @ [ input; "-o"; output ])
-  | Native -> run o "as" [ "--64"; input; "-o"; output ]
+  | Native ->
+      if o.verbose then Printf.eprintf "occas %s -o %s\n" input output;
+      Assemble.files [ input ] output
 
 let link o objects output =
   match mode Link with
@@ -230,23 +237,31 @@ let main argv =
   let objects =
     List.filter_map (fun input ->
         let kind = kind_of_file input in
-        (* Assembly with cpp directives is gcc's job on every path. *)
-        if kind = Asm_cpp then begin
+        (* Assembly with cpp directives needs both a native preprocessor and
+           a native assembler; otherwise gcc does the whole job. *)
+        if kind = Asm_cpp && (mode Preprocess = Delegate || mode Assemble = Delegate) then begin
           let out = if o.stop_after = Link then temp ".o" else final_for input Assemble in
           run o delegate_cc ([ "-c" ] @ cpp_flags o.cpp @ o.passthrough @ [ input; "-o"; out ]);
           if o.stop_after = Link then Some out else None
         end else begin
           let i_file =
-            if kind = C then begin
-              let out = if o.stop_after = Preprocess then final_for input Preprocess else temp ".i" in
-              if out = "-" then begin
-                let t = temp ".i" in preprocess o input t;
-                print_string (In_channel.with_open_bin t In_channel.input_all); None
-              end else (preprocess o input out; Some out)
+            if kind = C || kind = Asm_cpp then begin
+              let out = if o.stop_after = Preprocess then final_for input Preprocess else temp (if kind = C then ".i" else ".s") in
+              let saved = o.cpp in
+              (* as gcc does for .S: define __ASSEMBLER__ and leave out line markers *)
+              if kind = Asm_cpp then o.cpp <- { o.cpp with line_markers = false; assembler = true; defines = ("__ASSEMBLER__", Some "1") :: o.cpp.defines };
+              let result =
+                if out = "-" then begin
+                  let t = temp ".i" in preprocess o input t;
+                  print_string (In_channel.with_open_bin t In_channel.input_all); None
+                end else (preprocess o input out; Some out) in
+              o.cpp <- saved;
+              result
             end else if kind = Preprocessed then Some input else None in
           if o.stop_after = Preprocess then None else
           let s_file =
             match i_file with
+            | Some i when kind = Asm_cpp -> Some i
             | Some i ->
                 let out = if o.stop_after = Compile then final_for input Compile else temp ".s" in
                 compile o ~src:input i out; Some out

@@ -15,6 +15,7 @@ type config = {
   undefines : string list; (** -U *)
   includes : string list; (** -include: files read before the main file *)
   line_markers : bool; (** false for -P: no # line "file" lines in the output *)
+  assembler : bool; (** the input is assembly (.S): ## may yield two adjacent tokens, as in cpp's assembler mode *)
 }
 
 val run : config -> string -> string * string list
