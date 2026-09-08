@@ -41,6 +41,7 @@ let expand_depth = ref 0
 
 let rec expand ctx (s : string) : string =
   incr expand_depth;
+
   if !expand_depth > 100000 then (decr expand_depth; raise (Make_error "expansion nested too deeply (recursive variable?)"));
   let r = expand_body ctx s in
   decr expand_depth; r
@@ -220,7 +221,10 @@ and call_function ctx name argstr =
        | fn :: params ->
            let fn = String.trim (expand ctx fn) in
            let args = Array.of_list (List.map (expand ctx) params) in
-           (match Value.find ctx.db fn with
+           (* a call nested absurdly deep is a runaway self-reference; GNU
+              make would also diverge, so we stop rather than hang *)
+           if List.length ctx.call_stack > 400 then ""
+           else (match Value.find ctx.db fn with
             | Some { value; _ } -> expand { ctx with call_stack = (fn, args) :: ctx.call_stack } value
             | None -> "")
        | [] -> "")

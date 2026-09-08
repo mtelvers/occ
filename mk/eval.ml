@@ -289,7 +289,7 @@ and collect_define st line rest =
   let body = Buffer.create 128 in
   let rec take = function
     | [] -> []
-    | l :: tl when String.trim l = "endef" -> tl
+    | l :: tl when (let t = String.trim (strip_comment l) in t = "endef") -> tl
     | l :: tl -> if Buffer.length body > 0 then Buffer.add_char body '\n'; Buffer.add_string body l; take tl in
   let rest = take rest in
   Value.set st.db ~flavour (expand st name) (if flavour = Value.Simple then expand st (Buffer.contents body) else Buffer.contents body);
