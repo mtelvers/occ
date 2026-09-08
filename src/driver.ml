@@ -18,6 +18,20 @@ let mode stage =
 
 let delegate_cc = Option.value (Sys.getenv_opt "OCC_CC") ~default:"gcc"
 
+(* --sysroot=DIR, see [sysroot] *)
+let sysroot_flag = ref None
+
+(* A sysroot (--sysroot=DIR or OCC_SYSROOT) is an installed C library of
+   our own: DIR/include replaces the system headers and DIR/lib holds
+   crt1.o, crti.o, crtn.o and libc.a, with nothing from gcc or glibc.
+   Without one, the system's glibc and gcc runtime files are used. *)
+let sysroot () =
+  match !sysroot_flag, Sys.getenv_opt "OCC_SYSROOT" with
+  | Some d, _ | None, Some d when d <> "" -> Some d
+  | _ -> None
+
+
+
 (* The include directory holding our stdarg.h, stdatomic.h and friends
    (C11 7.16, 7.17, 7.19).  Found relative to the executable so a build
    tree works without installation. *)
@@ -93,6 +107,7 @@ let parse_args argv =
      | "-include" -> let f = next a in o.cpp <- { o.cpp with includes = o.cpp.includes @ [ f ] }; o.passthrough <- o.passthrough @ [ a; f ]
      | "-nostdinc" -> o.passthrough <- o.passthrough @ [ a ]
      | "-P" -> o.cpp <- { o.cpp with line_markers = false }; o.passthrough <- o.passthrough @ [ a ]
+     | _ when String.length a > 10 && String.sub a 0 10 = "--sysroot=" -> sysroot_flag := Some (String.sub a 10 (String.length a - 10))
      | "-l" | "-L" -> o.link_args <- o.link_args @ [ a; next a ]
      | _ when List.mem a with_arg_passthrough -> o.passthrough <- o.passthrough @ [ a; next a ]
      | _ when String.length a > 2 && String.sub a 0 2 = "-I" -> o.cpp <- { o.cpp with include_dirs = o.cpp.include_dirs @ [ split "-I" ] }
@@ -157,9 +172,10 @@ let preprocess o input output =
       (* our headers first, then the C library's; -nostdinc drops the defaults *)
       let defaults =
         if List.mem "-nostdinc" o.passthrough then []
-        else match include_dir with
-          | Some d -> [ d; "/usr/include/x86_64-linux-gnu"; "/usr/include" ]
-          | None -> failwith "cannot find include/ next to the executable" in
+        else match include_dir, sysroot () with
+          | Some d, Some root -> [ d; Filename.concat root "include" ]
+          | Some d, None -> [ d; "/usr/include/x86_64-linux-gnu"; "/usr/include" ]
+          | None, _ -> failwith "cannot find include/ next to the executable" in
       let extras = List.map (fun d ->
           let d = String.sub d 2 (String.length d - 2) in
           match String.index_opt d '=' with
@@ -240,14 +256,17 @@ let link o objects output =
   | Native ->
       let user_dirs = List.filter_map (fun a ->
           if String.length a > 2 && String.sub a 0 2 = "-L" then Some (String.sub a 2 (String.length a - 2)) else None) o.link_args in
-      let search = user_dirs @ system_lib_dirs () in
+      let search = user_dirs @ (match sysroot () with Some d -> [ Filename.concat d "lib" ] | None -> system_lib_dirs ()) in
       let items = List.filter_map (fun a ->
           if String.length a > 2 && String.sub a 0 2 = "-l" then Some (Link.Library (String.sub a 2 (String.length a - 2)))
           else if Filename.check_suffix a ".a" then Some (Link.Archive a)
           else if Filename.check_suffix a ".o" then Some (Link.Object a)
           else None) (objects @ o.link_args) in
       let crt name = Link.Object (find_file search name) in
-      let items = [ crt "crt1.o"; crt "crti.o"; crt "crtbeginT.o" ] @ items
+      let items =
+        match sysroot () with
+        | Some _ -> [ crt "crt1.o"; crt "crti.o" ] @ items @ [ Link.Library "c"; crt "crtn.o" ]
+        | None -> [ crt "crt1.o"; crt "crti.o"; crt "crtbeginT.o" ] @ items
                   @ [ Link.Library "gcc"; Link.Library "gcc_eh"; Link.Library "c"; crt "crtend.o"; crt "crtn.o" ] in
       if o.verbose then prerr_endline ("occld -o " ^ output);
       Link.link ~output ~entry:"_start" ~search items

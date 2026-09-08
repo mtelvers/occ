@@ -15,13 +15,17 @@ type ctx = {
   mutable case_values : (int64 list ref) list;
   mutable loops : int;
   mutable func_name : string;
+  mutable vla_sizes : (int * T.expr) list;   (* variable length array id -> its size, as an expression *)
+  mutable vla_pending : T.stmt list;          (* declarations of hidden size variables, for the declaration in progress *)
+  mutable in_type_name : bool;                (* elaborating a type name: sizes stay expressions *)
+  mutable vla_count : int;
 }
 
 let error = Diag.error
 
 (* What a declarator yields: the declared name (absent for abstract
    declarators), the type, and two extension annotations. *)
-type decl_result = { name : string option; ty : C.t; asm_label : string option; kr_params : string list option }
+type decl_result = { name : string option; ty : C.t; asm_label : string option; kr_params : string list option; attrs : S.attribute list }
 
 let mk ?(lvalue = false) loc ty e : T.expr = { T.e; ty; lvalue; loc }
 let int_const loc ty v = mk loc ty (T.Int (Const_eval.normalise ty v))
@@ -34,7 +38,7 @@ let int_const loc ty v = mk loc ty (T.Int (Const_eval.normalise ty v))
    Qualifiers are dropped from the result. *)
 let rvalue (e : T.expr) : T.expr =
   match e.ty.u with
-  | C.Array (elem, _) -> mk e.loc (C.pointer elem) (T.Convert e)
+  | C.Array (elem, _) | C.Vla (elem, _) -> mk e.loc (C.pointer elem) (T.Convert e)
   | C.Func _ -> mk e.loc (C.pointer e.ty) (T.Convert e)
   | _ -> { e with ty = C.strip e.ty; lvalue = false }
 
@@ -107,7 +111,10 @@ let assign_convert ctx ~what (e : T.expr) (ty : C.t) : T.expr =
   | (C.Integer _ | C.Floating _ | C.Enum _), (C.Integer _ | C.Floating _ | C.Enum _) -> convert e ty
   | (C.Struct _ | C.Union _), _ when C.compatible ty e.ty -> e
   | C.Pointer p, C.Pointer q ->
-      let qual_ok = (p.q.const || not q.q.const) && (p.q.volatile || not q.q.volatile) in
+      (* an array type is qualified through its element type (6.7.3p9) *)
+      let rec quals (t : C.t) = match t.u with C.Array (e, _) | C.Vla (e, _) -> quals e | _ -> t.q in
+      let pq = quals p and qq = quals q in
+      let qual_ok = (pq.const || not qq.const) && (pq.volatile || not qq.volatile) in
       (* Extension (doc/extensions.md): void * converts to and from pointers
          to functions, as POSIX dlsym requires and every Unix compiler allows. *)
       if C.compatible (C.strip p) (C.strip q) || p.u = C.Void || q.u = C.Void then begin
@@ -140,6 +147,7 @@ let quals_of (qs : S.qualifier list) : C.qual =
 let rec qualify (t : C.t) (q : C.qual) : C.t =
   match t.u with
   | C.Array (e, n) -> { t with u = C.Array (qualify e q, n) }
+  | C.Vla (e, id) -> { t with u = C.Vla (qualify e q, id) }
   | _ -> { t with q = C.merge_qual t.q q }
 
 (* 6.7.5: _Alignas(type) or _Alignas(constant); zero means unspecified. *)
@@ -267,37 +275,41 @@ and enum_type ctx loc (es : S.enum_spec) : C.t =
    declared name.  See [Syntax.declarator]. *)
 and apply_declarator ctx (base : C.t) (d : S.declarator) : decl_result =
   match d.d with
-  | S.D_ident name -> { name = Some name; ty = base; asm_label = None; kr_params = None }
-  | S.D_abstract -> { name = None; ty = base; asm_label = None; kr_params = None }
+  | S.D_ident name -> { name = Some name; ty = base; asm_label = None; kr_params = None; attrs = [] }
+  | S.D_abstract -> { name = None; ty = base; asm_label = None; kr_params = None; attrs = [] }
   | S.D_pointer (qs, inner) -> apply_declarator ctx (qualify (C.pointer base) (quals_of qs)) inner
   | S.D_array (inner, _qs, size, _static) ->
       if C.is_function base then error d.dloc "declaration of array of functions";
       if not (Env.is_complete ctx.env base) then error d.dloc "array type has incomplete element type '%a'" C.pp base;
-      let n = Option.map (fun e ->
-          let v = Const_eval.int_const ctx.env (expr ctx e) in
-          if v < 0L then error d.dloc "size of array is negative";
-          Int64.to_int v) size in
-      apply_declarator ctx (C.array base n) inner
+      let ty =
+        match size with
+        | None -> C.array base None
+        | Some e ->
+            let se = expr ctx e in
+            if not (C.is_integer se.ty) then error d.dloc "size of array has non-integer type";
+            (match Const_eval.eval ctx.env se with
+             | Some (Const_eval.Int v) ->
+                 if v < 0L then error d.dloc "size of array is negative";
+                 C.array base (Some (Int64.to_int v))
+             | _ -> vla_type ctx d.dloc base se) in
+      apply_declarator ctx ty inner
   | S.D_func (inner, params, variadic) ->
       if C.is_function base then error d.dloc "function returning a function";
       if C.is_array base then error d.dloc "function returning an array";
       Env.push ctx.env; (* prototype scope, for tags declared in the list *)
       let params =
         match params with
-        | [ { S.pspecs; pdecl = { d = S.D_abstract; _ } } ] when (base_type ctx d.dloc pspecs).u = C.Void -> []
-        | ps -> List.map (parameter ctx) ps in
+        | [ { S.pspecs; pdecl = { d = S.D_abstract; _ } } ] when (base_type ctx d.dloc pspecs).u = C.Void -> Some []
+        | [] -> None   (* "()" says nothing about the parameters (6.7.6.3p14) *)
+        | ps -> Some (List.map (parameter ctx) ps) in
       Env.pop ctx.env;
-      apply_declarator ctx (C.unqualified (C.Func { ret = base; params = Some params; variadic })) inner
+      apply_declarator ctx (C.unqualified (C.Func { ret = base; params; variadic })) inner
   | S.D_ident_list (inner, names) ->
       let r = apply_declarator ctx (C.unqualified (C.Func { ret = base; params = None; variadic = false })) inner in
       { r with kr_params = Some names }
   | S.D_attr (inner, attrs) ->
       let r = apply_declarator ctx base inner in
-      List.iter (fun (a : S.attribute) ->
-          match a.aname with
-          | "aligned" | "__aligned__" -> ()  (* honoured by Lower via symbol alignment: TODO *)
-          | _ -> ()) attrs;
-      r
+      { r with attrs = r.attrs @ attrs }
   | S.D_asm_label (inner, label) ->
       let r = apply_declarator ctx base inner in
       { r with asm_label = Some label }
@@ -309,7 +321,7 @@ and parameter ctx (p : S.param_decl) : C.param =
   let r = apply_declarator ctx base p.pdecl in
   (* 6.7.6.3p7-8: arrays and functions adjust to pointers *)
   let ty = match r.ty.u with
-    | C.Array (e, _) -> { (C.pointer e) with q = r.ty.q }
+    | C.Array (e, _) | C.Vla (e, _) -> { (C.pointer e) with q = r.ty.q }
     | C.Func _ -> C.pointer r.ty
     | _ -> r.ty in
   (match r.name with Some n -> Env.declare ctx.env n (Env.Var (Env.fresh_symbol ctx.env n ty T.Local)) | None -> ());
@@ -317,9 +329,39 @@ and parameter ctx (p : S.param_decl) : C.param =
 
 and type_name ctx (tn : S.type_name) : C.t =
   let base = base_type ctx tn.tdecl.dloc tn.tspecs in
+  let saved = ctx.in_type_name in
+  ctx.in_type_name <- true;
   let r = apply_declarator ctx base tn.tdecl in
+  ctx.in_type_name <- saved;
   if r.name <> None then error tn.tdecl.dloc "type name declares an identifier";
   r.ty
+
+(* A variable length array type (6.7.6.2p4).  In a declaration the size is
+   evaluated once, into a hidden variable declared just before; in a type
+   name (sizeof, a cast) the expression itself is kept and evaluated where
+   the type name is. *)
+and vla_type ctx loc elem (size : T.expr) : C.t =
+  if ctx.func_name = "" then error loc "variably modified type at file scope";
+  let size = convert (rvalue size) C.size_t in
+  ctx.vla_count <- ctx.vla_count + 1;
+  let id = ctx.vla_count in
+  let size_expr =
+    if ctx.in_type_name then size
+    else begin
+      let sym = Env.fresh_symbol ctx.env (Printf.sprintf "__vla_size%d" id) C.size_t T.Local in
+      ctx.vla_pending <- ctx.vla_pending @ [ T.Decl (sym, Some (T.Init_scalar size)) ];
+      mk ~lvalue:true loc C.size_t (T.Var sym)
+    end in
+  ctx.vla_sizes <- (id, size_expr) :: ctx.vla_sizes;
+  C.vla elem id
+
+(* sizeof a type with a run-time size: the product of the sizes *)
+and vla_sizeof ctx loc (ty : C.t) : T.expr =
+  match ty.u with
+  | C.Vla (e, id) -> mk loc C.size_t (T.Binop (Syntax.Mul, rvalue (List.assoc id ctx.vla_sizes), vla_sizeof ctx loc e))
+  | C.Array (e, Some k) when C.has_vla e ->
+      mk loc C.size_t (T.Binop (Syntax.Mul, int_const loc C.size_t (Int64.of_int k), vla_sizeof ctx loc e))
+  | _ -> int_const loc C.size_t (Int64.of_int (Env.size_of ctx.env loc ty))
 
 (* ---- Constants (6.4.4) ------------------------------------------------------- *)
 
@@ -497,11 +539,13 @@ and expr ctx (e : S.expr) : T.expr =
   | S.Sizeof_expr x ->
       let x = expr ctx x in
       if C.is_function x.ty then error loc "invalid application of 'sizeof' to a function type";
-      int_const loc C.size_t (Int64.of_int (Env.size_of ctx.env loc x.ty))
+      if C.has_vla x.ty then vla_sizeof ctx loc x.ty
+      else int_const loc C.size_t (Int64.of_int (Env.size_of ctx.env loc x.ty))
   | S.Sizeof_type tn ->
       let ty = type_name ctx tn in
       if C.is_function ty then error loc "invalid application of 'sizeof' to a function type";
-      int_const loc C.size_t (Int64.of_int (Env.size_of ctx.env loc ty))
+      if C.has_vla ty then vla_sizeof ctx loc ty
+      else int_const loc C.size_t (Int64.of_int (Env.size_of ctx.env loc ty))
   | S.Alignof tn -> int_const loc C.size_t (Int64.of_int (Env.align_of ctx.env loc (type_name ctx tn)))
   | S.Compound_literal (tn, init) ->
       let ty = type_name ctx tn in
@@ -939,7 +983,34 @@ and declare_global ctx (sym : T.symbol) =
 
 (* One declaration, returning the statements it contributes to a block
    (declarations of locals with automatic storage). *)
+(* GNU linkage attributes (extension, doc/extensions.md): the ones the C
+   library needs turned from parsed syntax into facts on the symbol. *)
+and apply_attributes ctx (sym : T.symbol) (attrs : S.attribute list) =
+  let prio a = match a with [] -> Some 65535 | [ e ] -> Some (Int64.to_int (Const_eval.int_const ctx.env (expr ctx e))) | _ -> None in
+  List.iter (fun (a : S.attribute) ->
+      match a.aname with
+      | "weak" | "__weak__" -> sym.link.weak <- true
+      | "alias" | "__alias__" ->
+          (match a.aargs with [ { S.e = S.String (s, _); _ } ] -> sym.link.alias <- Some s | _ -> ())
+      | "visibility" | "__visibility__" ->
+          (match a.aargs with
+           | [ { S.e = S.String (v, _); _ } ] ->
+               sym.link.visibility <- (match v with "hidden" -> T.Hidden | "protected" -> T.Protected | "internal" -> T.Internal | _ -> T.Default)
+           | _ -> ())
+      | "constructor" | "__constructor__" -> sym.link.constructor <- prio a.aargs
+      | "destructor" | "__destructor__" -> sym.link.destructor <- prio a.aargs
+      | "aligned" | "__aligned__" ->
+          (match a.aargs with [ e ] -> let n = Int64.to_int (Const_eval.int_const ctx.env (expr ctx e)) in if Option.value sym.align ~default:0 < n then sym.align <- Some n | _ -> ())
+      | _ -> ()  (* the many attributes that do not affect code are ignored *)) attrs
+
+(* the hidden size variables of any variable length arrays come first *)
 and declaration ctx (d : S.declaration) : T.stmt list =
+  let stmts = declaration_body ctx d in
+  let pending = ctx.vla_pending in
+  ctx.vla_pending <- [];
+  pending @ stmts
+
+and declaration_body ctx (d : S.declaration) : T.stmt list =
   match d with
   | S.Static_assert (e, msg) ->
       let v = Const_eval.int_const ctx.env (expr ctx e) in
@@ -971,6 +1042,7 @@ and init_declarator ctx (specs : S.specifiers) (base : C.t) (idecl : S.init_decl
     (match alignment ctx loc specs with
      | Some n -> if Option.value sym.align ~default:0 < n then sym.align <- Some n
      | None -> ());
+    apply_attributes ctx sym (specs.S.attrs @ r.attrs);
     sym in
   match specs.storage with
   | Some S.Typedef ->
@@ -992,7 +1064,7 @@ and init_declarator ctx (specs : S.specifiers) (base : C.t) (idecl : S.init_decl
               if List.mem S.Fs_inline specs.funcs && storage <> Some S.Extern && not file_scope then T.External
               else T.External in
         let sym = annotate (redeclare ctx loc name ty (T.Static { linkage; tls = false })) in
-        declare_global ctx sym;
+        if sym.link.alias <> None then define_global ctx sym None else declare_global ctx sym;
         []
       end else begin
         if ty.u = C.Void then error loc "variable '%s' declared void" name;
@@ -1028,6 +1100,7 @@ and init_declarator ctx (specs : S.specifiers) (base : C.t) (idecl : S.init_decl
           if Env.lookup_here ctx.env name <> None then error loc "redeclaration of '%s'" name;
           let sym = annotate (Env.fresh_symbol ctx.env name ty T.Local) in
           Env.declare ctx.env name (Env.Var sym);
+          if idecl.init <> None && C.has_vla sym.ty then error loc "variable-sized object '%s' may not be initialized" name;
           let init = Option.map (fun init ->
               let init, ty = initialiser ctx sym.ty init in
               sym.ty <- ty; init) idecl.init in
@@ -1145,7 +1218,19 @@ and statement ctx (s : S.stmt) : T.stmt =
         if not (C.is_void (rvalue e).ty) then error loc "'return' with a value, in function returning void";
         T.Return None
       end else T.Return (Some (assign_convert ctx ~what:"return" e ctx.ret_type))
-  | S.Asm text -> T.Asm text
+  | S.Asm a ->
+      (* outputs are modifiable lvalues; inputs are values (a memory
+         constraint keeps its lvalue, since its address is what the
+         assembler sees) *)
+      let outputs = List.map (fun (o : S.asm_operand) ->
+          let e = expr ctx o.aexpr in
+          modifiable_lvalue ctx e;
+          (o.oname, o.constr, e)) a.outputs in
+      let inputs = List.map (fun (o : S.asm_operand) ->
+          let e = expr ctx o.aexpr in
+          let e = if String.contains o.constr 'm' then e else rvalue e in
+          (o.oname, o.constr, e)) a.inputs in
+      T.Asm { T.template = a.template; outputs; inputs; clobbers = a.clobbers }
 
 and in_loop ctx = ctx.loops > List.length ctx.switch_types
 
@@ -1232,7 +1317,7 @@ let translation_unit (tu : S.translation_unit) : Env.t * T.translation_unit =
   let ctx = {
     env = Env.create (); globals = Hashtbl.create 64; global_order = []; funcs = [];
     ret_type = C.void; labels = Hashtbl.create 16; gotos = []; switch_types = []; case_values = [];
-    loops = 0; func_name = "" } in
+    loops = 0; func_name = ""; vla_sizes = []; vla_pending = []; in_type_name = false; vla_count = 0 } in
   Env.declare ctx.env "__builtin_va_list"
     (Env.Typedef (C.array (C.unqualified (C.Struct (Env.new_tag ctx.env `Struct (Some "__va_list_tag")).tag)) (Some 1)));
   (* the va_list tag: struct { unsigned gp_offset, fp_offset; void *overflow_arg_area, *reg_save_area; } (ABI 3.5.7) *)
@@ -1243,10 +1328,14 @@ let translation_unit (tu : S.translation_unit) : Env.t * T.translation_unit =
                               [ Some "gp_offset", C.uint, None, None; Some "fp_offset", C.uint, None, None;
                                 Some "overflow_arg_area", C.pointer C.void, None, None; Some "reg_save_area", C.pointer C.void, None, None ] Loc.none)
    | _ -> assert false);
+  let asm_blocks = ref [] in
   List.iter (function
       | S.Ext_decl d -> ignore (declaration ctx d)
-      | S.Ext_func f -> function_definition ctx f) tu;
+      | S.Ext_func f -> function_definition ctx f
+      | S.Ext_asm text -> asm_blocks := text :: !asm_blocks) tu;
   let globals = List.rev_map (fun (s : T.symbol) -> Hashtbl.find ctx.globals s.id) ctx.global_order in
   (* functions are in [funcs]; drop their placeholder globals *)
-  let globals = List.filter (fun (g : T.global) -> not (C.is_function g.gsym.ty && g.defined)) globals in
-  ctx.env, { T.funcs = List.rev ctx.funcs; globals }
+  (* function definitions live in [funcs]; drop their placeholder globals,
+     but keep function aliases, which have no body of their own *)
+  let globals = List.filter (fun (g : T.global) -> not (C.is_function g.gsym.ty && g.defined && g.gsym.link.alias = None)) globals in
+  ctx.env, { T.funcs = List.rev ctx.funcs; globals; asm_blocks = List.rev !asm_blocks; vla_sizes = ctx.vla_sizes }

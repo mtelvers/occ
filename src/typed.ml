@@ -8,6 +8,19 @@
    address or its value is wanted is decided by the node using it.  Names
    are resolved to unique symbols; scopes are gone. *)
 
+type visibility = Default | Hidden | Protected | Internal
+
+(* GNU __attribute__ facts, all with their defaults *)
+type attrs = {
+  mutable weak : bool;
+  mutable alias : string option;           (* alias("target"): this symbol equals target *)
+  mutable visibility : visibility;
+  mutable constructor : int option;        (* constructor[(prio)]: run before main *)
+  mutable destructor : int option;
+}
+
+let no_attrs () = { weak = false; alias = None; visibility = Default; constructor = None; destructor = None }
+
 type symbol = {
   id : int;
   name : string;
@@ -15,6 +28,7 @@ type symbol = {
   storage : storage;
   mutable align : int option; (* _Alignas (6.7.5), or __attribute__((aligned)) *)
   mutable asm_name : string option; (* __asm__("label") on the declaration *)
+  mutable link : attrs;
 }
 
 and storage =
@@ -73,7 +87,14 @@ type stmt =
   | Continue
   | Break
   | Return of expr option
-  | Asm of string
+  | Asm of asm   (* extension: inline assembly with typed operands *)
+
+and asm = {
+  template : string;
+  outputs : (string option * string * expr) list;   (* name, constraint, lvalue *)
+  inputs : (string option * string * expr) list;
+  clobbers : string list;
+}
 
 type func = { fsym : symbol; params : symbol list; body : stmt; inline : bool; loc : Loc.t }
 (** [inline]: an inline definition (6.7.4p7); it is emitted only if
@@ -86,4 +107,9 @@ type global = { gsym : symbol; ginit : init option; defined : bool }
     function); [ginit = None] with [defined] is a tentative definition
     zero-initialised (6.9.2p2). *)
 
-type translation_unit = { funcs : func list; globals : global list }
+type translation_unit = {
+  funcs : func list;
+  globals : global list;
+  asm_blocks : string list;              (* file-scope asm *)
+  vla_sizes : (int * expr) list;         (* the size expression of each variable length array type, by id *)
+}

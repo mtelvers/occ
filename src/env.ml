@@ -40,7 +40,7 @@ let lookup_here env name = Hashtbl.find_opt (List.hd env.scopes).names name
 
 let fresh_symbol env name ty storage : Typed.symbol =
   env.next_sym <- env.next_sym + 1;
-  { Typed.id = env.next_sym; name; ty; storage; align = None; asm_name = None }
+  { Typed.id = env.next_sym; name; ty; storage; align = None; asm_name = None; link = Typed.no_attrs () }
 
 let declare_tag env name info = Hashtbl.replace (List.hd env.scopes).tags name info
 let lookup_tag env name = find (fun s -> Hashtbl.find_opt s.tags name) env.scopes
@@ -62,7 +62,7 @@ let rec size_align env (t : Ctype.t) =
   | Integer k -> Some (Target.size_of_ikind k, Target.align_of_ikind k)
   | Floating k -> Some (Target.size_of_fkind k, Target.align_of_fkind k)
   | Pointer _ -> Some (Target.pointer_size, Target.pointer_size)
-  | Array (_, None) -> None
+  | Array (_, None) | Vla _ -> None   (* a variable length array has no size at compile time *)
   | Array (e, Some n) ->
       (match size_align env e with Some (s, a) -> Some (s * n, a) | None -> None)
   | Struct tag | Union tag ->
@@ -70,7 +70,7 @@ let rec size_align env (t : Ctype.t) =
   | Enum tag ->
       (match (tag_info env tag).underlying with Some u -> size_align env u | None -> None)
 
-let is_complete env t = size_align env t <> None
+let is_complete env (t : Ctype.t) = (match t.u with Ctype.Vla _ -> true | _ -> false) || size_align env t <> None
 
 let size_of env loc t =
   match size_align env t with

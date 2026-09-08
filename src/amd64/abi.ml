@@ -15,7 +15,7 @@ let rec leaves env (t : Ctype.t) base acc =
       (match (Env.tag_info env tag).layout with
        | Some l -> List.fold_left (fun acc (f : Ctype.field) -> leaves env f.ftype (base + f.offset) acc) acc l.fields
        | None -> acc)
-  | Ctype.Array (_, None) | Ctype.Void | Ctype.Func _ -> acc
+  | Ctype.Array (_, None) | Ctype.Vla _ | Ctype.Void | Ctype.Func _ -> acc
 
 let classify env (t : Ctype.t) : Ir.cls list =
   let size = Env.size_of env Loc.none t in

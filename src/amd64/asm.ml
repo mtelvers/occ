@@ -57,6 +57,7 @@ type instr =
   | Ud2
   | Label of string
   | Raw of string (* an exact line the assembler must see, e.g. the TLS GD sequence *)
+  | X87 of string * operand option (* an x87 instruction: fldt, fstpt, faddp, ... with at most one memory operand *)
   | Comment of string
   | Cfi of string (* a .cfi_* directive, e.g. "def_cfa_offset 16" *)
   | File of int * string (* .file N "name", for the line table *)
@@ -81,19 +82,23 @@ type dbg_func = {
   dret : dwarf_type;
 }
 
-type func = { name : string; global : bool; body : instr list; debug : dbg_func option }
+type func = { name : string; global : bool; weak : bool; hidden : bool; body : instr list; debug : dbg_func option }
 
 type data_item =
   | Bytes of string | Zeros of int | Quad_sym of string * int64 | Quad of int64 | Long of int32
+  | Word of int (* two bytes: the sign and exponent of a long double constant *)
   | Long_diff of string * string (* .long a - b: a position-independent table entry *)
 
 type section = Data | Bss | Rodata | Tdata | Tbss
 
-type data = { dname : string; dglobal : bool; dalign : int; section : section; size : int; items : data_item list }
+type data = { dname : string; dglobal : bool; dweak : bool; dhidden : bool; dalias : string option; dfunc : bool; ddecl : bool; dtls : bool; dalign : int; section : section; size : int; items : data_item list }
 
 type program = {
   funcs : func list;
   data : data list;
   source : string option; (* Some when emitting debug info *)
   files : (int * string) list; (* the .file table for line information *)
+  asm_blocks : string list; (* file-scope asm, emitted as written *)
+  init_array : (int * string) list; (* constructors: priority, function *)
+  fini_array : (int * string) list;
 }

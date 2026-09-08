@@ -13,9 +13,10 @@ let allocatable = callee_saved @ caller_saved
    allocated.  Mirrors [Select]. *)
 let clobbers (i : Ir.instr) : Asm.reg list =
   match i with
-  | Ir.Call _ -> caller_saved
+  | Ir.Call _ | Ir.Inline_asm _ -> caller_saved
   | Ir.Memcpy _ | Ir.Memzero _ -> [ RDI; RSI ]
   | Ir.Atomic_rmw _ | Ir.Atomic_cmpxchg _ | Ir.Va_arg _ -> [ RSI ]
+  | Ir.Va_arg_aggregate _ -> [ RSI; RDI; R8 ]
   | Ir.Ret (Some (Ir.Rv_aggregate _)) -> [ RDI; RSI ]
   | _ -> []
 
@@ -25,12 +26,19 @@ let regs_of_instr (i : Ir.instr) : int list * int list =
   let arg = function Ir.Scalar (_, o) -> u o | Ir.Aggregate a -> u a.addr in
   match i with
   | Ir.Mov (_, r, o) | Ir.Neg (_, r, o) | Ir.Not (_, r, o) | Ir.Conv (_, r, o) | Ir.Load (_, r, o)
-  | Ir.Va_arg (_, r, o) | Ir.Atomic_load (_, r, o, _) | Ir.Intrinsic (_, _, r, o) -> [ r ], u o
+  | Ir.Va_arg (_, r, o) | Ir.Atomic_load (_, r, o, _) | Ir.Intrinsic (_, _, r, o) | Ir.Alloca (r, o) -> [ r ], u o
   | Ir.Binop (_, _, r, a, b) | Ir.Cmp (_, _, r, a, b) | Ir.Atomic_rmw (_, _, r, a, b, _) | Ir.Atomic_xchg (_, r, a, b, _) -> [ r ], u a @ u b
   | Ir.Binop_overflow (_, _, _, r, f, a, b) -> [ r; f ], u a @ u b
   | Ir.Atomic_cmpxchg (_, r, a, b, c, _) -> [ r ], u a @ u b @ u c
-  | Ir.Store (_, a, b) | Ir.Memcpy (a, b, _) | Ir.Atomic_store (_, a, b, _) -> [], u a @ u b
+  | Ir.Store (_, a, b) | Ir.Memcpy (a, b, _) | Ir.Atomic_store (_, a, b, _) | Ir.Va_arg_aggregate (a, _, _, b) -> [], u a @ u b
   | Ir.Memzero (o, _) | Ir.Va_start o | Ir.Branch (o, _, _) | Ir.Switch (_, o, _, _) -> [], u o
+  | Ir.Inline_asm a ->
+      Array.fold_left (fun (d, us) op ->
+          match op with
+          | Ir.Asm_in (_, _, o) | Ir.Asm_mem (_, o) -> d, us @ u o
+          | Ir.Asm_out (_, _, r) -> r :: d, us
+          | Ir.Asm_inout (_, _, r, o) -> r :: d, us @ u o
+          | Ir.Asm_imm _ -> d, us) ([], []) a.operands
   | Ir.Call (res, f, args, _) ->
       (match res with Some (Ir.Ret_scalar (_, r)) -> [ r ] | _ -> []),
       u f @ List.concat_map arg args @ (match res with Some (Ir.Ret_aggregate a) -> u a.addr | _ -> [])
@@ -42,14 +50,18 @@ let regs_of_instr (i : Ir.instr) : int list * int list =
 (* Which registers hold floating-point values: those defined with an F type. *)
 let float_regs (f : Ir.func) =
   let fl = Hashtbl.create 16 in
-  let is_f = function Ir.F32 | Ir.F64 -> true | _ -> false in
+  let is_f = function Ir.F32 | Ir.F64 | Ir.F80 -> true | _ -> false in
   List.iter (function Ir.P_scalar (t, r) when is_f t -> Hashtbl.replace fl r () | _ -> ()) f.params;
   List.iter (fun i ->
       match i with
       | Ir.Mov (t, r, _) | Ir.Neg (t, r, _) | Ir.Load (t, r, _) | Ir.Va_arg (t, r, _) | Ir.Atomic_load (t, r, _, _)
       | Ir.Intrinsic (_, t, r, _) | Ir.Binop (_, t, r, _, _) when is_f t -> Hashtbl.replace fl r ()
-      | Ir.Conv ((Ir.Fext | Ir.Ftrunc | Ir.Stof _ | Ir.Utof _), r, _) -> Hashtbl.replace fl r ()
+      | Ir.Conv ((Ir.Fext | Ir.Ftrunc | Ir.Stof _ | Ir.Utof _ | Ir.Fconv _), r, _) -> Hashtbl.replace fl r ()
       | Ir.Call (Some (Ir.Ret_scalar (t, r)), _, _, _) when is_f t -> Hashtbl.replace fl r ()
+      | Ir.Inline_asm a ->
+          Array.iter (function
+              | Ir.Asm_out (_, t, r) | Ir.Asm_inout (_, t, r, _) when is_f t -> Hashtbl.replace fl r ()
+              | _ -> ()) a.operands
       | _ -> ()) f.body;
   fl
 

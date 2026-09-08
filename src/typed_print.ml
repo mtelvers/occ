@@ -67,7 +67,7 @@ let rec stmt indent ppf (s : stmt) =
   | Break -> p ppf "%sbreak@." ind
   | Return None -> p ppf "%sreturn@." ind
   | Return (Some e) -> p ppf "%sreturn %a@." ind expr e
-  | Asm text -> p ppf "%sasm %S@." ind text
+  | Asm a -> p ppf "%sasm %S@." ind a.template
 
 let translation_unit ppf (tu : translation_unit) =
   List.iter (fun (g : global) ->

@@ -67,8 +67,10 @@ let keywords : (string * keyword) list =
     (* extensions, see doc/extensions.md *)
     "__attribute__", Attribute; "__asm__", Asm; "asm", Asm;
     "__inline", Inline; "__inline__", Inline; "__restrict", Restrict;
-    "__signed__", Signed; "__volatile__", Volatile;
-    "typeof", Typeof; "__typeof__", Typeof ]
+    "__signed__", Signed; "__signed", Signed; "__volatile__", Volatile; "__volatile", Volatile;
+    "__const", Const; "__const__", Const; "__restrict__", Restrict; "__asm", Asm; "__attribute", Attribute;
+    "__alignof__", Alignof; "__alignof", Alignof;
+    "typeof", Typeof; "__typeof__", Typeof; "__typeof", Typeof ]
 
 let keyword_of_string s = List.assoc_opt s keywords
 

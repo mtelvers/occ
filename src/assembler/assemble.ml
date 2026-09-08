@@ -98,7 +98,8 @@ let default_section_attrs name =
   else if name = ".tdata" then shf_alloc lor shf_write lor shf_tls, sht_progbits
   else if name = ".tbss" then shf_alloc lor shf_write lor shf_tls, sht_nobits
   else if name = ".eh_frame" then shf_alloc, sht_progbits
-  else if name = ".init_array" || name = ".fini_array" then shf_alloc lor shf_write, sht_progbits
+  else if name = ".init" || name = ".fini" then shf_alloc lor shf_execinstr, sht_progbits   (* legacy init/fini code, like .text *)
+  else if name = ".init_array" || name = ".fini_array" || name = ".preinit_array" then shf_alloc lor shf_write, sht_progbits
   else if name = ".note.GNU-stack" then 0, sht_progbits
   else 0, sht_progbits
 
@@ -327,7 +328,11 @@ let rec eval st e =
       sy.referenced <- true;
       (match sy.def with
        | Absolute v -> const v
-       | Alias e -> eval st e
+       (* a global or weak alias may be overridden by a strong definition in
+          another object, so a reference to it stays a symbol reference for
+          the linker to bind (musl's weak __stdout_used); only a local alias
+          is followed here *)
+       | Alias e when sy.binding <> Some Elf.stb_global && sy.binding <> Some Elf.stb_weak -> eval st e
        | _ -> { sym = Some sy; addend = 0L; minus = None })
   | Neg x ->
       let v = eval st x in
@@ -520,6 +525,9 @@ let against st rtype (sy : symbol) =
                      && sy.binding <> Some Elf.stb_global && sy.binding <> Some Elf.stb_weak ->
       `Section sec, Int64.of_int sec.offsets.(i)
   | At _ | Undefined | Common _ -> sy.needed <- true; `Sym sy, 0L
+  (* a weak or global alias is referenced by symbol so the linker can bind
+     it to a strong definition elsewhere *)
+  | Alias _ when sy.binding = Some Elf.stb_global || sy.binding = Some Elf.stb_weak -> sy.needed <- true; `Sym sy, 0L
   | Absolute _ | Alias _ -> error st "cannot relocate against %s" sy.name
 
 (* [pos] is the fixup's offset in the section; [base] the position

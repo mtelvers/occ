@@ -12,6 +12,7 @@ type fn = {
   locals : (int, int) Hashtbl.t; (* symbol id -> slot, for locals in memory *)
   vars : (int, int) Hashtbl.t; (* symbol id -> IR register, for scalar locals never addressed *)
   addressed : (int, unit) Hashtbl.t; (* locals whose address is taken *)
+  vla_addr : (int, Ir.reg) Hashtbl.t; (* variable length arrays: the register holding their address *)
   mutable breaks : string list; (* innermost first *)
   mutable continues : string list;
   mutable cases : ((int64 * string) list * string option) list; (* per enclosing switch, innermost first *)
@@ -23,10 +24,24 @@ type fn = {
 (* Translation-unit state: interned string literals and static data. *)
 type tu = {
   tenv : Env.t;
+  vla_sizes : (int * T.expr) list; (* the size expression of each variable length array type *)
   mutable strings : (string * Ir.global) list; (* content key -> global *)
   mutable extra_globals : Ir.global list;
   mutable string_count : int;
 }
+
+module Str_replace = struct
+  (* replace every occurrence of [pat] in [s] by [by] *)
+  let all s pat by =
+    let n = String.length pat in
+    let b = Buffer.create (String.length s) in
+    let i = ref 0 in
+    while !i < String.length s do
+      if !i + n <= String.length s && String.sub s !i n = pat then begin Buffer.add_string b by; i := !i + n end
+      else begin Buffer.add_char b s.[!i]; incr i end
+    done;
+    Buffer.contents b
+end
 
 let emit fn i = fn.code <- i :: fn.code
 
@@ -64,8 +79,9 @@ let ir_type env (t : C.t) : Ir.ty =
   match (underlying env t).u with
   | C.Integer k -> (match Target.size_of_ikind k with 1 -> Ir.I8 | 2 -> Ir.I16 | 4 -> Ir.I32 | _ -> Ir.I64)
   | C.Floating C.Float -> Ir.F32
-  | C.Floating (C.Double | C.LongDouble) -> Ir.F64 (* long double is treated as double *)
-  | C.Pointer _ | C.Array _ | C.Func _ -> Ir.I64
+  | C.Floating C.Double -> Ir.F64
+  | C.Floating C.LongDouble -> Ir.F80
+  | C.Pointer _ | C.Array _ | C.Vla _ | C.Func _ -> Ir.I64
   | _ -> failwith ("Lower.ir_type: not a scalar: " ^ C.to_string t)
 
 let is_signed env (t : C.t) =
@@ -108,7 +124,7 @@ let intern_string tu (s : T.expr) : string =
   | Some g -> g.Ir.gname
   | None ->
       tu.string_count <- tu.string_count + 1;
-      let g = { Ir.gname = Printf.sprintf ".LC%d" tu.string_count; gglobal = false; galign = align_of tu.tenv elem;
+      let g = { Ir.gfunc = false; glink = Ir.plain_link; gname = Printf.sprintf ".LC%d" tu.string_count; gglobal = false; galign = align_of tu.tenv elem;
                 gtls = false; gsize = n * size_of tu.tenv elem; ginit = Some [ Ir.Bytes image ]; gdefined = true } in
       tu.strings <- (key, g) :: tu.strings;
       g.Ir.gname
@@ -170,6 +186,10 @@ let data_of_image (img : image) : Ir.data list =
       | Ir.Bytes s when String.for_all (fun c -> c = '\000') s -> Ir.Zeros (String.length s)
       | d -> d) (go 0 relocs [])
 
+let link_of (sym : T.symbol) : Ir.link =
+  { Ir.weak = sym.link.weak; alias = sym.link.alias;
+    hidden = (match sym.link.visibility with T.Hidden | T.Internal -> true | _ -> false) }
+
 let global_of tu (g : T.global) : Ir.global =
   let env = tu.tenv in
   let sym = g.gsym in
@@ -181,7 +201,8 @@ let global_of tu (g : T.global) : Ir.global =
       let img = { bytes = Bytes.make size '\000'; relocs = [] } in
       fill_image tu img 0 sym.ty init;
       data_of_image img) g.ginit in
-  { Ir.gname = asm_name sym; gglobal; galign = align; gtls = tls; gsize = size; ginit; gdefined = g.defined }
+  { Ir.gname = asm_name sym; gglobal; galign = align; gtls = tls; gsize = size; ginit;
+    gdefined = g.defined || sym.link.alias <> None; gfunc = C.is_function sym.ty; glink = link_of sym }
 
 (* ---- Expressions ----------------------------------------------------------- *)
 
@@ -202,6 +223,7 @@ let var_reg fn (s : T.symbol) =
 
 let rec address fn tu (e : T.expr) : Ir.operand =
   match e.e with
+  | T.Var s when Hashtbl.mem fn.vla_addr s.id -> Ir.Reg (Hashtbl.find fn.vla_addr s.id)
   | T.Var s ->
       (match s.storage with
        | T.Local ->
@@ -258,7 +280,7 @@ and copy_into fn tu (dst : Ir.operand) (e : T.expr) =
   | T.Binop (Syntax.Comma, a, b) -> ignore (side_effect fn tu a); copy_into fn tu dst b
   | T.Compound_literal (_, init) -> initialise fn tu dst e.ty init
   | T.Va_arg (ap, ty) ->
-      Diag.error e.loc "va_arg of aggregate type '%a' is not supported" C.pp ty |> ignore; ignore ap
+      emit fn (Ir.Va_arg_aggregate (dst, size, Abi.classify fn.env ty, value fn tu ap))
   | _ ->
       let src = address fn tu e in
       emit fn (Ir.Memcpy (dst, src, size))
@@ -313,7 +335,7 @@ and convert fn (from : C.t) (to_ : C.t) (v : Ir.operand) : Ir.operand =
   let env = fn.env in
   let fi = ir_type env from and ti = ir_type env to_ in
   let to_u = underlying env to_ in
-  let size = function Ir.I8 -> 1 | Ir.I16 -> 2 | Ir.I32 -> 4 | Ir.I64 -> 8 | Ir.F32 -> 4 | Ir.F64 -> 8 in
+  let size = function Ir.I8 -> 1 | Ir.I16 -> 2 | Ir.I32 -> 4 | Ir.I64 -> 8 | Ir.F32 -> 4 | Ir.F64 -> 8 | Ir.F80 -> 16 in
   let r = fresh fn in
   match to_u.u, fi, ti with
   | C.Integer C.Bool, _, _ ->
@@ -321,12 +343,14 @@ and convert fn (from : C.t) (to_ : C.t) (v : Ir.operand) : Ir.operand =
       let zero = if is_float from then Ir.Fimm 0.0 else Ir.Imm 0L in
       emit fn (Ir.Cmp ((if is_float from then Ir.Fne else Ir.Ne), fi, r, v, zero));
       Ir.Reg r
-  | _, (Ir.F32 | Ir.F64), (Ir.F32 | Ir.F64) ->
+  | _, (Ir.F32 | Ir.F64 | Ir.F80), (Ir.F32 | Ir.F64 | Ir.F80) when fi = Ir.F80 || ti = Ir.F80 ->
+      if fi = ti then v else begin emit fn (Ir.Conv (Ir.Fconv (fi, ti), r, v)); Ir.Reg r end
+  | _, (Ir.F32 | Ir.F64 | Ir.F80), (Ir.F32 | Ir.F64 | Ir.F80) ->
       if fi = ti then v
       else (emit fn (Ir.Conv ((if ti = Ir.F64 then Ir.Fext else Ir.Ftrunc), r, v)); Ir.Reg r)
-  | _, (Ir.F32 | Ir.F64), _ ->
+  | _, (Ir.F32 | Ir.F64 | Ir.F80), _ ->
       emit fn (Ir.Conv ((if is_signed env to_ then Ir.Ftos (fi, ti) else Ir.Ftou (fi, ti)), r, v)); Ir.Reg r
-  | _, _, (Ir.F32 | Ir.F64) ->
+  | _, _, (Ir.F32 | Ir.F64 | Ir.F80) ->
       emit fn (Ir.Conv ((if is_signed env from then Ir.Stof (fi, ti) else Ir.Utof (fi, ti)), r, v)); Ir.Reg r
   | _ ->
       if size fi = size ti then v
@@ -356,12 +380,31 @@ and cond_of env (op : Syntax.binop) (ty : C.t) : Ir.cond =
   | Syntax.Ge -> if f then Ir.Fge else if s then Ir.Sge else Ir.Uge
   | _ -> assert false
 
+(* The size of a type with a variable length array in it, as a value:
+   the product of the run-time sizes and the constant ones (6.5.3.4p2). *)
+and vla_size fn tu (t : C.t) : Ir.operand =
+  match t.u with
+  | C.Vla (e, id) ->
+      let n = value fn tu (List.assoc id tu.vla_sizes) in
+      let inner = vla_size fn tu e in
+      let r = fresh fn in emit fn (Ir.Binop (Ir.Mul, Ir.I64, r, n, inner)); Ir.Reg r
+  | C.Array (e, Some k) when C.has_vla e ->
+      let inner = vla_size fn tu e in
+      let r = fresh fn in emit fn (Ir.Binop (Ir.Mul, Ir.I64, r, Ir.Imm (Int64.of_int k), inner)); Ir.Reg r
+  | _ -> Ir.Imm (Int64.of_int (size_of fn.env t))
+
 (* The arithmetic of [a op b] on values already converted to [ty], with
    pointer operands scaled by the pointee size (6.5.6p8-9). *)
-and arith fn (op : Syntax.binop) (ty : C.t) (a_ty : C.t) (b_ty : C.t) (a : Ir.operand) (b : Ir.operand) : Ir.operand =
+and arith fn tu (op : Syntax.binop) (ty : C.t) (a_ty : C.t) (b_ty : C.t) (a : Ir.operand) (b : Ir.operand) : Ir.operand =
   let env = fn.env in
   let r = fresh fn in
   match op, a_ty.u, b_ty.u with
+  | (Syntax.Add | Syntax.Sub), C.Pointer p, (C.Integer _ | C.Enum _) when C.has_vla p ->
+      (* the element size is a run-time value *)
+      let s = fresh fn in
+      emit fn (Ir.Binop (Ir.Mul, Ir.I64, s, b, vla_size fn tu p));
+      emit fn (Ir.Binop ((if op = Syntax.Add then Ir.Add else Ir.Sub), Ir.I64, r, a, Ir.Reg s));
+      Ir.Reg r
   | (Syntax.Add | Syntax.Sub), C.Pointer p, (C.Integer _ | C.Enum _) ->
       let size = size_of env p in
       let scaled =
@@ -374,7 +417,8 @@ and arith fn (op : Syntax.binop) (ty : C.t) (a_ty : C.t) (b_ty : C.t) (a : Ir.op
   | Syntax.Sub, C.Pointer p, C.Pointer _ ->
       let diff = fresh fn in
       emit fn (Ir.Binop (Ir.Sub, Ir.I64, diff, a, b));
-      emit fn (Ir.Binop (Ir.Sdiv, Ir.I64, r, Ir.Reg diff, Ir.Imm (Int64.of_int (size_of env p))));
+      let size = if C.has_vla p then vla_size fn tu p else Ir.Imm (Int64.of_int (size_of env p)) in
+      emit fn (Ir.Binop (Ir.Sdiv, Ir.I64, r, Ir.Reg diff, size));
       Ir.Reg r
   | (Syntax.Eq | Syntax.Ne | Syntax.Lt | Syntax.Le | Syntax.Gt | Syntax.Ge), _, _ ->
       emit fn (Ir.Cmp (cond_of env op a_ty, ir_type env a_ty, r, a, b)); Ir.Reg r
@@ -430,8 +474,8 @@ and value fn tu (e : T.expr) : Ir.operand =
       let sub = (op = Syntax.Predec || op = Syntax.Postdec) in
       let int_one_ty = C.long in
       let nv =
-        if C.is_pointer x.ty then arith fn (if sub then Syntax.Sub else Syntax.Add) x.ty x.ty int_one_ty old one
-        else arith fn (if sub then Syntax.Sub else Syntax.Add) x.ty x.ty x.ty old one in
+        if C.is_pointer x.ty then arith fn tu (if sub then Syntax.Sub else Syntax.Add) x.ty x.ty int_one_ty old one
+        else arith fn tu (if sub then Syntax.Sub else Syntax.Add) x.ty x.ty x.ty old one in
       let nv = if (match (underlying env x.ty).u with C.Integer C.Bool -> true | _ -> false) then convert fn C.int x.ty nv else nv in
       (* a register variable's old value must be copied before it is overwritten *)
       let old = match pl, old with
@@ -459,7 +503,7 @@ and value fn tu (e : T.expr) : Ir.operand =
   | T.Binop (op, a, b) ->
       let av = value fn tu a in
       let bv = value fn tu b in
-      arith fn op e.ty a.ty b.ty av bv
+      arith fn tu op e.ty a.ty b.ty av bv
   | T.Assign (l, r) ->
       if is_aggregate l.ty then (let la = address fn tu l in copy_into fn tu la r; la)
       else begin
@@ -474,10 +518,10 @@ and value fn tu (e : T.expr) : Ir.operand =
       let old = read fn l.ty pl in
       let rv = value fn tu r in
       let nv =
-        if C.is_pointer l.ty then arith fn op l.ty l.ty r.ty old rv
+        if C.is_pointer l.ty then arith fn tu op l.ty l.ty r.ty old rv
         else begin
           let old_c = convert fn l.ty comp_ty old in
-          let res = arith fn op comp_ty comp_ty r.ty old_c rv in
+          let res = arith fn tu op comp_ty comp_ty r.ty old_c rv in
           convert fn comp_ty l.ty res
         end in
       write fn l.ty pl nv;
@@ -621,7 +665,7 @@ and initialise fn tu (dst : Ir.operand) (ty : C.t) (init : T.init) =
       fill_image tu img 0 ty init;
       tu.string_count <- tu.string_count + 1;
       let name = Printf.sprintf ".LC%d" tu.string_count in
-      tu.extra_globals <- { Ir.gname = name; gglobal = false; galign = align_of env ty; gtls = false; gsize = size;
+      tu.extra_globals <- { Ir.gfunc = false; glink = Ir.plain_link; gname = name; gglobal = false; galign = align_of env ty; gtls = false; gsize = size;
                             ginit = Some (data_of_image img); gdefined = true } :: tu.extra_globals;
       emit fn (Ir.Memcpy (dst, Ir.Sym name, size))
   | T.Init_agg items ->
@@ -644,6 +688,12 @@ let rec stmt fn tu (s : T.stmt) =
    | _ -> ());
   match s with
   | T.Expr e -> side_effect fn tu e
+  | T.Decl (sym, init) when C.has_vla sym.ty ->
+      (* a variable length array: its storage is allocated now, on the stack *)
+      if init <> None then Diag.error Loc.none "variable length array '%s' cannot be initialized" sym.name;
+      let r = fresh fn in
+      emit fn (Ir.Alloca (r, vla_size fn tu sym.ty));
+      Hashtbl.replace fn.vla_addr sym.id r
   | T.Decl (sym, init) when registerable fn sym ->
       (match init with
        | Some (T.Init_scalar e) -> write fn sym.ty (In_reg (var_reg fn sym)) (value fn tu e)
@@ -723,7 +773,7 @@ let rec stmt fn tu (s : T.stmt) =
       if is_aggregate e.ty then
         emit fn (Ir.Ret (Some (Ir.Rv_aggregate { Ir.addr = address fn tu e; size = size_of fn.env e.ty; classes = Abi.classify fn.env e.ty })))
       else emit fn (Ir.Ret (Some (Ir.Rv_scalar (ir_type fn.env e.ty, value fn tu e))))
-  | T.Asm _ -> Diag.error Loc.none "inline assembly is not supported"
+  | T.Asm a -> inline_asm fn tu a
 
 and loop fn tu ~brk ~cont body =
   fn.breaks <- brk :: fn.breaks;
@@ -735,6 +785,49 @@ and loop fn tu ~brk ~cont body =
 (* ---- Functions and the program ------------------------------------------------ *)
 
 (* Locals whose address is taken must live in memory. *)
+(* GNU inline assembly (extension).  Each operand is prepared for the
+   instruction selector: outputs get a fresh register that is written to
+   the lvalue afterwards ("+" also reads it first); inputs are evaluated
+   to values; "m" operands become addresses; "i" operands constants; and a
+   local variable bound to a register by __asm__("name") turns its
+   constraint into that register.  Named operands %[name] are renumbered
+   here so later phases only see positions. *)
+and inline_asm fn tu (a : T.asm) =
+  let strip c = String.of_seq (Seq.filter (fun ch -> ch <> '=' && ch <> '+' && ch <> '&') (String.to_seq c)) in
+  let hard (e : T.expr) =
+    match e.e with
+    | T.Var s when (match s.asm_name with Some r -> Gas.register_of_name r <> None | None -> false) ->
+        Some ("{" ^ Option.get s.asm_name ^ "}")
+    | _ -> None in
+  let register_class c e = match hard e with Some r -> r | None -> c in
+  let outputs = List.map (fun (_, c, (lv : T.expr)) ->
+      let cs = strip c in
+      if String.contains cs 'm' then Ir.Asm_mem (cs, address fn tu lv), None
+      else begin
+        let r = fresh fn in
+        let pl = place fn tu lv in
+        let ity = ir_type fn.env lv.ty in
+        let op = if String.contains c '+' then Ir.Asm_inout (register_class cs lv, ity, r, read fn lv.ty pl)
+          else Ir.Asm_out (register_class cs lv, ity, r) in
+        op, Some (lv.ty, pl, r)
+      end) a.outputs in
+  let inputs = List.map (fun (_, c, (e : T.expr)) ->
+      let cs = strip c in
+      if String.contains cs 'm' then Ir.Asm_mem (cs, address fn tu e)
+      else if cs = "i" || cs = "n" then
+        (match Const_eval.eval fn.env e with
+         | Some (Const_eval.Int v) -> Ir.Asm_imm v
+         | _ -> Diag.error Loc.none "asm operand with constraint %S is not a constant" c)
+      else Ir.Asm_in (register_class cs e, ir_type fn.env e.ty, value fn tu e)) a.inputs in
+  (* %[name] -> %k *)
+  let names = List.mapi (fun i (n, _, _) -> n, i) (a.outputs @ a.inputs) in
+  let template = List.fold_left (fun t (n, i) ->
+      match n with
+      | Some n -> Str_replace.all t ("%[" ^ n ^ "]") ("%" ^ string_of_int i)
+      | None -> t) a.template names in
+  emit fn (Ir.Inline_asm { Ir.template; operands = Array.of_list (List.map fst outputs @ inputs); clobbers = a.clobbers });
+  List.iter (function (_, Some (ty, pl, r)) -> write fn ty pl (Ir.Reg r) | _ -> ()) outputs
+
 let rec find_addressed fn (s : T.stmt) =
   let rec expr (e : T.expr) =
     match e.e with
@@ -755,7 +848,12 @@ let rec find_addressed fn (s : T.stmt) =
   match s with
   | T.Expr e -> expr e
   | T.Decl (_, Some i) -> init i
-  | T.Decl (_, None) | T.Goto _ | T.Continue | T.Break | T.Return None | T.Asm _ -> ()
+  | T.Decl (_, None) | T.Goto _ | T.Continue | T.Break | T.Return None -> ()
+  | T.Asm a ->
+      (* a memory operand needs its variable in memory *)
+      List.iter (fun (_, c, (e : T.expr)) ->
+          (match e.e with T.Var s when String.contains c 'm' -> Hashtbl.replace fn.addressed s.id () | _ -> ());
+          expr e) (a.outputs @ a.inputs)
   | T.Block ss -> List.iter (find_addressed fn) ss
   | T.If (c, a, b) -> expr c; find_addressed fn a; Option.iter (find_addressed fn) b
   | T.Switch (c, b) | T.While (c, b) | T.Do (b, c) -> expr c; find_addressed fn b
@@ -766,7 +864,7 @@ let rec find_addressed fn (s : T.stmt) =
 let func tu (f : T.func) : Ir.func =
   let env = tu.tenv in
   let fn = { env; code = []; next_reg = 0; slots = []; next_slot = 0; locals = Hashtbl.create 32;
-             vars = Hashtbl.create 32; addressed = Hashtbl.create 16;
+             vars = Hashtbl.create 32; addressed = Hashtbl.create 16; vla_addr = Hashtbl.create 4;
              breaks = []; continues = []; cases = []; fname = asm_name f.fsym; next_label = 0; last_line = f.loc } in
   find_addressed fn f.body;
   (* the prologue and parameter stores belong to the definition's line,
@@ -791,12 +889,12 @@ let func tu (f : T.func) : Ir.func =
    | _ ->
        if f.fsym.name = "main" then emit fn (Ir.Ret (Some (Ir.Rv_scalar (Ir.I32, Ir.Imm 0L))))
        else emit fn (Ir.Ret None));
-  { Ir.name = fn.fname; params; variadic = fty.variadic;
+  { Ir.flink = link_of f.fsym; name = fn.fname; params; variadic = fty.variadic;
     returns_aggregate = (if is_aggregate fty.ret then Some (size_of env fty.ret, Abi.classify env fty.ret) else None);
     slots = Array.of_list (List.rev fn.slots); body = List.rev fn.code;
     global = (match f.fsym.storage with T.Static { linkage = T.External; _ } -> true | _ -> false);
     discardable = f.inline; loc = f.loc;
-    variables = Hashtbl.fold (fun _ r acc -> r :: acc) fn.vars [];
+    variables = Hashtbl.fold (fun _ r acc -> r :: acc) fn.vars (Hashtbl.fold (fun _ r acc -> r :: acc) fn.vla_addr []);   (* VLA addresses live like variables *)
     params_dbg = List.map (fun (p : T.symbol) -> p.name, p.ty) f.params; ret_dbg = fty.ret }
 
 (* Symbols an instruction refers to. *)
@@ -811,11 +909,17 @@ let syms_of_instr (i : Ir.instr) : string list =
   | Ir.Memcpy (a, b, _) | Ir.Atomic_store (_, a, b, _) | Ir.Atomic_rmw (_, _, _, a, b, _) | Ir.Atomic_xchg (_, _, a, b, _) -> op a @ op b
   | Ir.Atomic_cmpxchg (_, _, a, b, c, _) -> op a @ op b @ op c
   | Ir.Memzero (o, _) -> op o
+  | Ir.Alloca (_, o) -> op o
+  | Ir.Va_arg_aggregate (d, _, _, ap) -> op d @ op ap
   | Ir.Call (res, f, args, _) ->
       op f @ List.concat_map arg args @ (match res with Some (Ir.Ret_aggregate a) -> op a.addr | _ -> [])
   | Ir.Ret (Some (Ir.Rv_scalar (_, o))) -> op o
   | Ir.Ret (Some (Ir.Rv_aggregate a)) -> op a.addr
   | Ir.Intrinsic (_, _, _, o) -> op o
+  | Ir.Inline_asm a ->
+      List.concat_map (function
+          | Ir.Asm_in (_, _, o) | Ir.Asm_mem (_, o) | Ir.Asm_inout (_, _, _, o) -> op o
+          | Ir.Asm_out _ | Ir.Asm_imm _ -> []) (Array.to_list a.operands)
   | Ir.Ret None | Ir.Label _ | Ir.Jump _ | Ir.Fence _ | Ir.Trap | Ir.Return_address _ | Ir.Line _ -> []
 
 (* Drop inline definitions nothing refers to, transitively. *)
@@ -840,9 +944,12 @@ let prune (funcs : Ir.func list) (globals : Ir.global list) : Ir.func list =
   List.filter (fun (f : Ir.func) -> not f.discardable || Hashtbl.mem visited f.name) funcs
 
 let program ~source env (tu : T.translation_unit) : Ir.program =
-  let st = { tenv = env; strings = []; extra_globals = []; string_count = 0 } in
+  let st = { tenv = env; strings = []; extra_globals = []; string_count = 0; vla_sizes = tu.vla_sizes } in
   let funcs = List.map (func st) tu.funcs in
   let globals = List.map (global_of st) tu.globals in
   let funcs = prune funcs globals in
   let strings = List.rev_map snd st.strings in
-  { Ir.funcs; globals = globals @ strings @ List.rev st.extra_globals; source }
+  let ctor which =
+    List.filter_map (fun (f : T.func) -> Option.map (fun p -> p, asm_name f.fsym) (which f.fsym.link)) tu.funcs in
+  { Ir.funcs; globals = globals @ strings @ List.rev st.extra_globals; source; asm_blocks = tu.asm_blocks;
+    init_array = ctor (fun l -> l.constructor); fini_array = ctor (fun l -> l.destructor) }

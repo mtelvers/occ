@@ -2,7 +2,7 @@
 
 open Ir
 
-let ty = function I8 -> "i8" | I16 -> "i16" | I32 -> "i32" | I64 -> "i64" | F32 -> "f32" | F64 -> "f64"
+let ty = function I8 -> "i8" | I16 -> "i16" | I32 -> "i32" | I64 -> "i64" | F32 -> "f32" | F64 -> "f64" | F80 -> "f80"
 
 let operand = function
   | Reg r -> Printf.sprintf "%%%d" r
@@ -27,7 +27,8 @@ let order = function
 
 let conv = function
   | Sext (a, b) -> Printf.sprintf "sext %s->%s" (ty a) (ty b) | Zext (a, b) -> Printf.sprintf "zext %s->%s" (ty a) (ty b)
-  | Trunc (a, b) -> Printf.sprintf "trunc %s->%s" (ty a) (ty b) | Fext -> "fext" | Ftrunc -> "ftrunc"
+  | Trunc (a, b) -> Printf.sprintf "trunc %s->%s" (ty a) (ty b) | Fconv (a, b) -> Printf.sprintf "fconv %s->%s" (ty a) (ty b)
+  | Fext -> "fext" | Ftrunc -> "ftrunc"
   | Stof (a, b) -> Printf.sprintf "stof %s->%s" (ty a) (ty b) | Utof (a, b) -> Printf.sprintf "utof %s->%s" (ty a) (ty b)
   | Ftos (a, b) -> Printf.sprintf "ftos %s->%s" (ty a) (ty b) | Ftou (a, b) -> Printf.sprintf "ftou %s->%s" (ty a) (ty b)
 
@@ -73,8 +74,19 @@ let instr ppf i =
   | Atomic_cmpxchg (t, r, a, e, d, o) -> p "  %%%d = atomic_cmpxchg.%s.%s [%s], [%s], %s" r (ty t) (order o) (operand a) (operand e) (operand d)
   | Fence o -> p "  fence.%s" (order o)
   | Va_start a -> p "  va_start %s" (operand a)
+  | Alloca (r, n) -> p "  %s = alloca %s" (operand (Reg r)) (operand n)
+  | Va_arg_aggregate (dst, size, _, ap) -> p "  va_arg_aggregate %s, %d, %s" (operand dst) size (operand ap)
   | Va_arg (t, r, a) -> p "  %%%d = va_arg.%s %s" r (ty t) (operand a)
   | Trap -> p "  trap"
+  | Inline_asm a ->
+      p "  asm %S" a.template;
+      Array.iter (function
+          | Asm_in (c, _, o) -> p " in %s(%s)" c (operand o)
+          | Asm_out (c, _, r) -> p " out %s(%s)" c (operand (Reg r))
+          | Asm_inout (c, _, r, o) -> p " inout %s(%s<-%s)" c (operand (Reg r)) (operand o)
+          | Asm_mem (c, o) -> p " mem %s(%s)" c (operand o)
+          | Asm_imm v -> p " imm %Ld" v) a.operands;
+      if a.clobbers <> [] then p " clobbers %s" (String.concat "," a.clobbers)
   | Return_address r -> p "  %%%d = return_address" r
   | Intrinsic (f, t, r, o) -> p "  %%%d = %s.%s %s" r (match f with Fabs -> "fabs" | Fsqrt -> "fsqrt") (ty t) (operand o)
   | Line l -> p "  # line %d" l.Loc.line

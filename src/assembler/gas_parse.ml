@@ -149,6 +149,12 @@ let rec operand st =
       if r.rclass = Segment then begin
         expect st COLON ":";
         memory st (Some r)
+      end else if r.rclass = X87 && st.tok = LPAREN then begin
+        (* %st(i) *)
+        advance st;
+        let i = match st.tok with INT n -> advance st; Int64.to_int n | _ -> error st "expected a stack register number" in
+        expect st RPAREN ")";
+        Reg { r with rnum = i; rname = Printf.sprintf "st(%d)" i }
       end else Reg r
   | _ -> memory st None
 
@@ -199,6 +205,7 @@ let cfi_register st =
        | Gpr -> dwarf_number_of_gpr.(r.rnum)
        | Xmm -> 17 + r.rnum
        | Rip -> 16
+       | X87 -> 33 + r.rnum
        | Segment -> error st "no DWARF number for %%%s" r.rname)
   | _ -> constant st
 

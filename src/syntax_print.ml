@@ -120,7 +120,7 @@ let rec stmt indent ppf (s : stmt) =
   | Break -> p ppf "%sbreak@." ind
   | Return None -> p ppf "%sreturn@." ind
   | Return (Some e) -> p ppf "%sreturn %a@." ind expr e
-  | Asm text -> p ppf "%sasm %S@." ind text
+  | Asm a -> p ppf "%sasm %S@." ind a.template
 
 and block_item indent ppf = function
   | Item_decl d -> declaration indent ppf d
@@ -140,6 +140,7 @@ and declaration indent ppf (d : declaration) =
 let translation_unit ppf (tu : translation_unit) =
   List.iter (function
       | Ext_decl d -> declaration 0 ppf d
+      | Ext_asm text -> p ppf "asm %S@." text
       | Ext_func f ->
           p ppf "function %a %a@." specifiers f.fspecs declarator f.fdecl;
           List.iter (declaration 2 ppf) f.kr_decls;

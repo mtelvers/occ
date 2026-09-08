@@ -463,6 +463,89 @@ let imm8 = function
   | Imm e -> (match const e with Some v -> String.make 1 (Char.chr (Int64.to_int v land 0xff)) | None -> bad "expected a constant")
   | _ -> bad "expected an immediate"
 
+(* ---- x87 (SDM chapter 8 and the D8-DF opcode maps) ----------------------------
+
+   Memory forms are an opcode byte with the operation in ModRM.reg; register
+   forms are two bytes with the stack register added to the second.  The
+   AT&T spellings of the subtract and divide pop forms are those of GNU as,
+   which are the reverse of Intel's: "fsubrp" here is Intel's FSUBP, that
+   is st(1) = st(1) - st(0) then pop. *)
+
+let x87_memory = [
+  "flds", (0xD9, 0); "fldl", (0xDD, 0); "fldt", (0xDB, 5);
+  "fsts", (0xD9, 2); "fstl", (0xDD, 2); "fstps", (0xD9, 3); "fstpl", (0xDD, 3); "fstpt", (0xDB, 7);
+  "filds", (0xDF, 0); "fildl", (0xDB, 0); "fildll", (0xDF, 5); "fildq", (0xDF, 5);
+  "fistps", (0xDF, 3); "fistpl", (0xDB, 3); "fistpll", (0xDF, 7); "fistpq", (0xDF, 7);
+  "fisttps", (0xDF, 1); "fisttpl", (0xDB, 1); "fisttpll", (0xDD, 1); "fisttpq", (0xDD, 1);
+  "fadds", (0xD8, 0); "faddl", (0xDC, 0); "fmuls", (0xD8, 1); "fmull", (0xDC, 1);
+  "fsubs", (0xD8, 4); "fsubl", (0xDC, 4); "fsubrs", (0xD8, 5); "fsubrl", (0xDC, 5);
+  "fdivs", (0xD8, 6); "fdivl", (0xDC, 6); "fdivrs", (0xD8, 7); "fdivrl", (0xDC, 7);
+  "fcoms", (0xD8, 2); "fcoml", (0xDC, 2); "fcomps", (0xD8, 3); "fcompl", (0xDC, 3);
+  "fnstcw", (0xD9, 7); "fldcw", (0xD9, 5); "fnstsw", (0xDD, 7); "fnstenv", (0xD9, 6); "fldenv", (0xD9, 4);
+  "fistl", (0xDB, 2); "fists", (0xDF, 2); "fisttpl", (0xDB, 1);
+  "fnsave", (0xDD, 6); "frstor", (0xDD, 4) ]
+
+(* two-operand register arithmetic: "op %st(i), %st" (result in st(0),
+   the D8 row) or "op %st, %st(i)" (result in st(i), the DC row, where
+   GNU as swaps the sub and div spellings) *)
+let x87_binary = [
+  "fadd", (0xC0, 0xC0); "fmul", (0xC8, 0xC8); "fsub", (0xE0, 0xE0); "fsubr", (0xE8, 0xE8); "fdiv", (0xF0, 0xF0); "fdivr", (0xF8, 0xF8) ]
+
+let x87_register = [
+  "fld", (0xD9, 0xC0); "fxch", (0xD9, 0xC8); "fst", (0xDD, 0xD0); "fstp", (0xDD, 0xD8); "ffree", (0xDD, 0xC0);
+  "fcom", (0xD8, 0xD0); "fcomp", (0xD8, 0xD8);
+  "faddp", (0xDE, 0xC0); "fmulp", (0xDE, 0xC8); "fsubp", (0xDE, 0xE0); "fsubrp", (0xDE, 0xE8);
+  "fdivp", (0xDE, 0xF0); "fdivrp", (0xDE, 0xF8);
+  "fucom", (0xDD, 0xE0); "fucomp", (0xDD, 0xE8); "fucomi", (0xDB, 0xE8); "fucomip", (0xDF, 0xE8);
+  "fcomi", (0xDB, 0xF0); "fcomip", (0xDF, 0xF0) ]
+
+let x87_plain = [
+  "fchs", "\xD9\xE0"; "fabs", "\xD9\xE1"; "ftst", "\xD9\xE4"; "fxam", "\xD9\xE5"; "fld1", "\xD9\xE8";
+  "fldl2t", "\xD9\xE9"; "fldl2e", "\xD9\xEA"; "fldpi", "\xD9\xEB"; "fldlg2", "\xD9\xEC"; "fldln2", "\xD9\xED"; "fldz", "\xD9\xEE";
+  "f2xm1", "\xD9\xF0"; "fyl2x", "\xD9\xF1"; "fptan", "\xD9\xF2"; "fpatan", "\xD9\xF3"; "fxtract", "\xD9\xF4"; "fprem1", "\xD9\xF5";
+  "fdecstp", "\xD9\xF6"; "fincstp", "\xD9\xF7"; "fprem", "\xD9\xF8"; "fyl2xp1", "\xD9\xF9"; "fsqrt", "\xD9\xFA";
+  "fsincos", "\xD9\xFB"; "frndint", "\xD9\xFC"; "fscale", "\xD9\xFD"; "fsin", "\xD9\xFE"; "fcos", "\xD9\xFF";
+  "fucompp", "\xDA\xE9"; "fcompp", "\xDE\xD9"; "fninit", "\xDB\xE3"; "fnclex", "\xDB\xE2"; "fwait", "\x9B"; "fnop", "\xD9\xD0" ]
+
+let is_x87 m = List.mem m [ "fstcw"; "fstsw"; "fclex"; "finit"; "stmxcsr"; "ldmxcsr" ] || List.mem_assoc m x87_memory || List.mem_assoc m x87_register || List.mem_assoc m x87_plain || List.mem_assoc m x87_binary || m = "fnstsw"
+
+let rec x87 mnemonic operands =
+  let stack_index ops =
+    (* the st(i) operand, if any; "faddp" alone means st(1) *)
+    match List.filter_map (function Reg { rclass = X87; rnum; _ } -> Some rnum | _ -> None) ops with
+    | [] -> 1
+    | [ i ] -> i
+    | [ a; b ] -> max a b
+    | _ -> bad "too many operands for %s" mnemonic in
+  match mnemonic, operands with
+  | "fnstsw", [ Reg { rclass = Gpr; rnum = 0; _ } ] -> Fixed ("\xDF\xE0", [])
+  | "fstsw", [ Reg { rclass = Gpr; rnum = 0; _ } ] -> Fixed ("\x9B\xDF\xE0", [])
+  | ("fstcw" | "fstsw" | "fclex" | "finit"), _ ->
+      (* the waiting forms: fwait then the no-wait instruction *)
+      let m = "fn" ^ String.sub mnemonic 1 (String.length mnemonic - 1) in
+      (match x87 m operands with Fixed (b, f) -> Fixed ("\x9B" ^ b, f) | Branch _ -> assert false)
+  | "stmxcsr", [ (Mem _ as m) ] -> let rm, seg, _ = rm_of S64 m in build { default with legacy = seg; reg = 3; rm = Some rm; opcode = [ 0x0F; 0xAE ] }
+  | "ldmxcsr", [ (Mem _ as m) ] -> let rm, seg, _ = rm_of S64 m in build { default with legacy = seg; reg = 2; rm = Some rm; opcode = [ 0x0F; 0xAE ] }
+  | _, ([ Reg { rclass = X87; rnum = i; _ } ] | [ Reg { rclass = X87; rnum = i; _ }; Reg { rclass = X87; rnum = 0; _ } ])
+    when List.mem_assoc mnemonic x87_binary ->
+      (* result in st(0) *)
+      let to_st0, _ = List.assoc mnemonic x87_binary in
+      Fixed ("\xD8" ^ String.make 1 (Char.chr (to_st0 + i)), [])
+  | _, [ Reg { rclass = X87; rnum = 0; _ }; Reg { rclass = X87; rnum = i; _ } ] when List.mem_assoc mnemonic x87_binary ->
+      (* result in st(i) *)
+      let _, to_sti = List.assoc mnemonic x87_binary in
+      Fixed ("\xDC" ^ String.make 1 (Char.chr (to_sti + i)), [])
+  | _, [] when List.mem_assoc mnemonic x87_plain -> Fixed (List.assoc mnemonic x87_plain, [])
+  | _, [ (Mem _ as m) ] when List.mem_assoc mnemonic x87_memory ->
+      let opcode, ext = List.assoc mnemonic x87_memory in
+      let rm, seg, _ = rm_of S64 m in
+      build { default with legacy = seg; reg = ext; rm = Some rm; opcode = [ opcode ] }
+  | _, _ when List.mem_assoc mnemonic x87_register ->
+      let first, base = List.assoc mnemonic x87_register in
+      let i = if operands = [] then (if mnemonic = "fstp" || mnemonic = "fst" || mnemonic = "fld" then 0 else 1) else stack_index operands in
+      Fixed (String.make 1 (Char.chr first) ^ String.make 1 (Char.chr (base + i)), [])
+  | _ -> bad "bad operands for %s" mnemonic
+
 (* ---- Mnemonic dispatch --------------------------------------------------- *)
 
 let strip s n = String.sub s 0 (String.length s - n)
@@ -487,6 +570,12 @@ let rec encode mnemonic operands =
   | "ud2", [] -> Fixed ("\x0F\x0B", [])
   | "pause", [] -> Fixed ("\xF3\x90", [])
   | "mfence", [] -> Fixed ("\x0F\xAE\xF0", [])
+  | "syscall", [] -> Fixed ("\x0F\x05", [])
+  | "cpuid", [] -> Fixed ("\x0F\xA2", [])
+  | "rdtsc", [] -> Fixed ("\x0F\x31", [])
+  | "cld", [] -> Fixed ("\xFC", [])
+  | "std", [] -> Fixed ("\xFD", [])
+  | "int", [ Imm e ] -> Fixed ("\xCD" ^ imm8 (Imm e), [])
   | "lfence", [] -> Fixed ("\x0F\xAE\xE8", [])
   | "sfence", [] -> Fixed ("\x0F\xAE\xF8", [])
   | "cqto", [] | "cqo", [] -> Fixed ("\x48\x99", [])
@@ -557,11 +646,28 @@ let rec encode mnemonic operands =
       sse [ 0xF3 ] [ 0x2C ] ~w:((gpr d).rwidth = 64) ~reg:(gpr d).rnum s
   | ("cvtsd2si" | "cvtsd2sil" | "cvtsd2siq"), [ s; d ] ->
       sse [ 0xF2 ] [ 0x2D ] ~w:((gpr d).rwidth = 64) ~reg:(gpr d).rnum s
+  | ("cvtss2si" | "cvtss2sil" | "cvtss2siq"), [ s; d ] ->
+      sse [ 0xF3 ] [ 0x2D ] ~w:((gpr d).rwidth = 64) ~reg:(gpr d).rnum s
+  | "pcmpeqd", [ s; d ] -> sse_load [ 0x66 ] 0x76 s d
+  | ("psrlq" | "psrld" | "psllq" | "pslld" | "psrlw" | "psllw" | "psraw" | "psrad"), [ (Imm _ as i); d ] ->
+      (* shift of a packed register by an immediate: 66 0F 7x /n ib *)
+      let opcode, ext = match mnemonic with
+        | "psrlq" -> 0x73, 2 | "psllq" -> 0x73, 6 | "psrld" -> 0x72, 2 | "pslld" -> 0x72, 6 | "psrad" -> 0x72, 4
+        | "psrlw" -> 0x71, 2 | "psllw" -> 0x71, 6 | _ -> 0x71, 4 in
+      let rm, _, _ = rm_of S64 d in
+      (match build { default with legacy = [ 0x66 ]; reg = ext; rm = Some rm; opcode = [ 0x0F; opcode ] } with
+       | Fixed (b, f) -> Fixed (b ^ imm8 i, f)
+       | Branch _ -> assert false)
+  | "pcmpeqb", [ s; d ] -> sse_load [ 0x66 ] 0x74 s d
+  | "pmovmskb", [ s; d ] -> sse [ 0x66 ] [ 0xD7 ] ~w:false ~reg:(gpr d).rnum s
+  | "movmskpd", [ s; d ] -> sse [ 0x66 ] [ 0x50 ] ~w:false ~reg:(gpr d).rnum s
+  | "movmskps", [ s; d ] -> sse [] [ 0x50 ] ~w:false ~reg:(gpr d).rnum s
   | "roundsd", [ i; s; d ] -> sse ~imm:(imm8 i) [ 0x66 ] [ 0x3A; 0x0B ] ~w:false ~reg:(xmm d).rnum s
   | _, [ s; d ] when n > 5 && String.sub mnemonic 0 3 = "cmp" && String.sub mnemonic (n - 2) 2 = "sd"
                      && List.mem_assoc (String.sub mnemonic 3 (n - 5)) sse_predicates ->
       let pred = List.assoc (String.sub mnemonic 3 (n - 5)) sse_predicates in
       sse ~imm:(String.make 1 (Char.chr pred)) [ 0xF2 ] [ 0xC2 ] ~w:false ~reg:(xmm d).rnum s
+  | _, _ when is_x87 mnemonic -> x87 mnemonic operands
   (* --- condition codes --- *)
   | _, [ op ] when n > 1 && mnemonic.[0] = 'j' && cc_of (String.sub mnemonic 1 (n - 1)) <> None ->
       jcc (Option.get (cc_of (String.sub mnemonic 1 (n - 1)))) op

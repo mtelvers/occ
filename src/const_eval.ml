@@ -38,12 +38,16 @@ let rec eval env (e : Typed.expr) : value option =
   | Var { storage = Static _; _ } when Ctype.is_array e.ty || Ctype.is_function e.ty ->
       (* an array or function designator is already an address *)
       (match e.e with Var s -> Some (Addr (s, 0L)) | _ -> None)
+  | Member _ when Ctype.is_array e.ty ->
+      (* an array member designates its own address, like an array variable *)
+      eval env { e with e = Addr e; ty = Ctype.pointer e.ty; lvalue = false }
   | Addr { e = Var ({ storage = Static _; _ } as s); _ } -> Some (Addr (s, 0L))
   | Addr { e = Deref p; _ } -> eval env p
   | Addr { e = Member (base, f); _ } ->
       let* b = eval env { base with e = Addr base; ty = Ctype.pointer base.ty; lvalue = false } in
       (match b with
        | Addr (s, o) -> Some (Addr (s, Int64.add o (Int64.of_int f.offset)))
+       | Int i -> Some (Int (Int64.add i (Int64.of_int f.offset)))   (* the offsetof idiom: a member of the object at address zero *)
        | Str (s, t, o) -> Some (Str (s, t, Int64.add o (Int64.of_int f.offset)))
        | _ -> None)
   | Convert x ->
@@ -81,10 +85,20 @@ let rec eval env (e : Typed.expr) : value option =
 
 and binop env (rty : Ctype.t) (aty : Ctype.t) op va vb =
   let open Syntax in
+  (* pointer arithmetic on a variable length array is never constant *)
+  if (match aty.u with Pointer p -> Ctype.has_vla p | _ -> false) then None else
   let unsigned = is_unsigned aty in
   let elem_size (t : Ctype.t) =
     match t.u with Pointer p -> Int64.of_int (Env.size_of env Loc.none p) | _ -> 1L in
   match va, vb with
+  | Int x, Int y when (match aty.u with Pointer _ -> true | _ -> false) && (op = Add || op = Sub) ->
+      (* arithmetic on an integer-valued pointer constant, as in the
+         offsetof idiom: the address of a member of the object at zero,
+         minus the null pointer *)
+      (match op, rty.u with
+       | Sub, Pointer _ -> Some (Int (Int64.sub x (Int64.mul y (elem_size aty))))
+       | Sub, _ -> Some (Int (Int64.div (Int64.sub x y) (elem_size aty)))
+       | _ -> Some (Int (Int64.add x (Int64.mul y (elem_size aty)))))
   | Int x, Int y ->
       let int_result v = Some (Int (normalise rty v)) in
       let cmp c = Some (Int (if c then 1L else 0L)) in

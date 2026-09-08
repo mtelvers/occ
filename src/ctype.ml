@@ -32,6 +32,7 @@ and u =
   | Floating of fkind
   | Pointer of t
   | Array of t * int option (* None: incomplete, 6.7.6.2 *)
+  | Vla of t * int (* variable length array (6.7.6.2p4): element type and the id of its size, known at run time *)
   | Func of func
   | Struct of tag
   | Union of tag
@@ -60,6 +61,7 @@ let bool = unqualified (Integer Bool)
 let double = unqualified (Floating Double)
 let pointer t = unqualified (Pointer t)
 let array t n = unqualified (Array (t, n))
+let vla t id = unqualified (Vla (t, id))
 
 (* wchar_t, char16_t, char32_t, size_t and ptrdiff_t on x86-64 System V. *)
 let wchar = int
@@ -81,7 +83,10 @@ let is_floating t = match t.u with Floating _ -> true | _ -> false
 let is_arithmetic t = is_integer t || is_floating t
 let is_pointer t = match t.u with Pointer _ -> true | _ -> false
 let is_scalar t = is_arithmetic t || is_pointer t
-let is_array t = match t.u with Array _ -> true | _ -> false
+let is_array t = match t.u with Array _ | Vla _ -> true | _ -> false
+
+(* does the size of this type depend on a run-time value? *)
+let rec has_vla t = match t.u with Vla _ -> true | Array (e, _) -> has_vla e | _ -> false
 let is_function t = match t.u with Func _ -> true | _ -> false
 let is_void t = t.u = Void
 let is_record t = match t.u with Struct _ | Union _ -> true | _ -> false
@@ -111,6 +116,7 @@ let rec compatible a b =
   | Floating x, Floating y -> x = y
   | Pointer x, Pointer y -> compatible x y
   | Array (x, n), Array (y, m) -> compatible x y && (n = None || m = None || n = m)
+  | Vla (x, _), (Array (y, _) | Vla (y, _)) | Array (x, _), Vla (y, _) -> compatible x y   (* 6.7.6.2p6 *)
   | (Struct x | Union x | Enum x), (Struct y | Union y | Enum y) -> x.id = y.id
   | Func f, Func g ->
       compatible f.ret g.ret &&
@@ -165,6 +171,7 @@ let rec pp ppf t =
         split p inner
     | Array (e, n) ->
         split e (Format.asprintf "%s[%s]" inner (match n with Some n -> string_of_int n | None -> ""))
+    | Vla (e, _) -> split e (inner ^ "[*]")
     | Func f ->
         let params = match f.params with
           | None -> ""
@@ -179,7 +186,7 @@ let rec pp ppf t =
     (match base.u with
      | Void -> "void" | Integer k -> ikind_to_string k | Floating k -> fkind_to_string k
      | Struct tag -> tag_to_string "struct" tag | Union tag -> tag_to_string "union" tag
-     | Enum tag -> tag_to_string "enum" tag | Pointer _ | Array _ | Func _ -> assert false)
+     | Enum tag -> tag_to_string "enum" tag | Pointer _ | Array _ | Vla _ | Func _ -> assert false)
     (if decl = "" then "" else " " ^ decl)
 
 let to_string t = Format.asprintf "%a" pp t

@@ -128,8 +128,18 @@ and stmt_desc =
   | Continue
   | Break
   | Return of expr option
-  (* extension *)
-  | Asm of string
+  (* extension: GNU inline assembly, basic or with operands *)
+  | Asm of asm
+
+and asm = {
+  template : string;
+  outputs : asm_operand list;
+  inputs : asm_operand list;
+  clobbers : string list;
+  volatile : bool;
+}
+
+and asm_operand = { oname : string option; constr : string; aexpr : expr }
 
 and for_init = For_none | For_expr of expr | For_decl of declaration
 
@@ -143,6 +153,6 @@ and func_def = {
   floc : loc;
 }
 
-and external_decl = Ext_decl of declaration | Ext_func of func_def
+and external_decl = Ext_decl of declaration | Ext_func of func_def | Ext_asm of string (* file-scope asm *)
 
 type translation_unit = external_decl list

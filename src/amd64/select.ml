@@ -14,6 +14,9 @@ type st = {
   mutable slots : int array; (* Ir slot -> rbp offset *)
   mutable frame : int; (* bytes below rbp allocated so far *)
   mutable float_consts : (int64 * string) list;
+  mutable f80_consts : (int64 * string) list; (* long double constants, keyed by the double's bits *)
+  mutable f80 : (int, int) Hashtbl.t; (* long double Ir reg -> its 16-byte slot *)
+  mutable scratch : int; (* a 16-byte slot for moving values between the FPU and the integer unit *)
   mutable tables : data list; (* jump tables, one data object each *)
   mutable const_count : int;
   mutable label_count : int;
@@ -28,8 +31,8 @@ type st = {
 let emit st i = st.code <- i :: st.code
 let fresh_label st hint = st.label_count <- st.label_count + 1; Printf.sprintf ".L%s.%s%d" st.fname hint st.label_count
 
-let width_of = function Ir.I8 -> B | Ir.I16 -> W | Ir.I32 -> L | Ir.I64 -> Q | Ir.F32 -> L | Ir.F64 -> Q
-let is_float = function Ir.F32 | Ir.F64 -> true | _ -> false
+let width_of = function Ir.I8 -> B | Ir.I16 -> W | Ir.I32 -> L | Ir.I64 -> Q | Ir.F32 -> L | Ir.F64 | Ir.F80 -> Q
+let is_float = function Ir.F32 | Ir.F64 | Ir.F80 -> true | _ -> false
 let sse_suffix = function Ir.F32 -> "ss" | _ -> "sd"
 let round_up n a = (n + a - 1) / a * a
 
@@ -133,6 +136,59 @@ let store_int st (ty : Ir.ty) (r : int) (src : reg) =
 let store_float st (ty : Ir.ty) (r : int) (src : reg) = emit st (Sse ("mov" ^ sse_suffix ty, Reg src, Mem (RBP, reg_slot st r)))
 let store st ty r src = if is_float ty then store_float st ty r src else store_int st ty r src
 
+(* ---- long double: the x87 unit ----------------------------------------------------
+
+   long double is the 80-bit extended format, class X87 in the ABI, kept
+   in 16-byte frame slots and passed in memory.  Each operation pushes its
+   operands on the FPU register stack, computes, and pops the result back
+   to a slot, so the stack is empty between IR instructions.  GNU as's
+   AT&T spellings are used: "fsubrp" is st(1) - st(0). *)
+
+let f80_slot st r =
+  match Hashtbl.find_opt st.f80 r with
+  | Some off -> off
+  | None -> let off = alloc st 16 16 in Hashtbl.replace st.f80 r off; off
+
+let scratch st = if st.scratch = 0 then st.scratch <- alloc st 16 16; st.scratch
+
+let x87 st m op = emit st (X87 (m, op))
+
+(* the 80-bit encoding of a double: sign and 15-bit biased exponent, then a
+   64-bit significand with an explicit integer bit *)
+let f80_of_float f =
+  let bits = Int64.bits_of_float f in
+  let sign = Int64.to_int (Int64.shift_right_logical bits 63) lsl 15 in
+  let exp = Int64.to_int (Int64.logand (Int64.shift_right_logical bits 52) 0x7ffL) in
+  let frac = Int64.logand bits 0xfffffffffffffL in
+  if exp = 0 && frac = 0L then 0L, sign
+  else if exp = 0x7ff then Int64.logor Int64.min_int (Int64.shift_left frac 11), sign lor 0x7fff
+  else if exp = 0 then begin
+    let m = ref frac and e = ref (1 - 1023 + 16383) in
+    while Int64.logand !m 0x10000000000000L = 0L do m := Int64.shift_left !m 1; decr e done;
+    Int64.shift_left !m 11, sign lor !e
+  end
+  else Int64.logor Int64.min_int (Int64.shift_left frac 11), sign lor (exp - 1023 + 16383)
+
+let f80_const st f =
+  let bits = Int64.bits_of_float f in
+  match List.assoc_opt bits st.f80_consts with
+  | Some l -> l
+  | None ->
+      st.const_count <- st.const_count + 1;
+      let l = Printf.sprintf ".LCL%d" st.const_count in
+      st.f80_consts <- (bits, l) :: st.f80_consts; l
+
+(* push a long double operand on the FPU stack *)
+let fpush st (op : Ir.operand) =
+  match op with
+  | Ir.Reg r -> x87 st "fldt" (Some (Mem (RBP, f80_slot st r)))
+  | Ir.Fimm f -> x87 st "fldt" (Some (Rip (f80_const st f, 0)))
+  | Ir.Imm v -> x87 st "fldt" (Some (Rip (f80_const st (Int64.to_float v), 0)))
+  | Ir.Sym _ | Ir.Slot _ -> failwith "Select: address in long double context"
+
+(* pop st(0) into a long double register *)
+let fpop_to st r = x87 st "fstpt" (Some (Mem (RBP, f80_slot st r)))
+
 (* A 0/1 result from the flags, into an I32 register. *)
 let set_flag st cc (r : int) =
   emit st (Setcc (cc, Reg RAX));
@@ -161,7 +217,7 @@ let dwarf_type (t : Ctype.t) : dwarf_type =
       Dw_base (Ctype.ikind_to_string k, enc, size)
   | Ctype.Floating k -> Dw_base (Ctype.fkind_to_string k, 4, Target.size_of_fkind k)
   | Ctype.Enum _ -> Dw_base ("unsigned int", 7, 4)
-  | Ctype.Pointer _ | Ctype.Array _ | Ctype.Func _ -> Dw_pointer
+  | Ctype.Pointer _ | Ctype.Array _ | Ctype.Vla _ | Ctype.Func _ -> Dw_pointer
   | Ctype.Struct tag -> Dw_struct (Option.value tag.name ~default:"<anonymous>")
   | Ctype.Union tag -> Dw_union (Option.value tag.name ~default:"<anonymous>")
 
@@ -177,6 +233,10 @@ let assign_args ~(hidden : bool) (args : Ir.arg list) : place list * int * int *
   let ni = ref (if hidden then 1 else 0) and nf = ref 0 and stack = ref 0 in
   let places = List.map (fun a ->
       match a with
+      | Ir.Scalar (Ir.F80, _) ->
+          (* class X87: in memory, 16-byte aligned *)
+          stack := round_up !stack 16;
+          let o = !stack in stack := !stack + 16; On_stack o
       | Ir.Scalar (ty, _) when is_float ty ->
           if !nf < 8 then (let r = XMM !nf in incr nf; In_regs [ r ])
           else (let o = !stack in stack := !stack + 8; On_stack o)
@@ -236,6 +296,7 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
   (* stack arguments first, while the argument registers are still free *)
   List.iter2 (fun a place ->
       match a, place with
+      | Ir.Scalar (Ir.F80, op), On_stack off -> fpush st op; x87 st "fstpt" (Some (Mem (RSP, off)))
       | Ir.Scalar (ty, op), On_stack off ->
           if is_float ty then (load_float st ty op (XMM 0); emit st (Sse ("mov" ^ sse_suffix ty, Reg (XMM 0), Mem (RSP, off))))
           else (load_int st ty op RAX; emit st (Mov (Q, Reg RAX, Mem (RSP, off))))
@@ -268,6 +329,7 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
   if area > 0 then emit st (Alu ("add", Q, Imm (Int64.of_int area), Reg RSP));
   match res with
   | None -> ()
+  | Some (Ir.Ret_scalar (Ir.F80, r)) -> fpop_to st r   (* returned in st(0) *)
   | Some (Ir.Ret_scalar (ty, r)) -> store st ty r (if is_float ty then XMM 0 else RAX)
   | Some (Ir.Ret_aggregate a) when hidden -> ignore a (* the callee wrote through the hidden pointer *)
   | Some (Ir.Ret_aggregate a) ->
@@ -285,6 +347,64 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
 
 let conv st (c : Ir.conv) (r : int) (op : Ir.operand) =
   match c with
+  | Ir.Fconv (Ir.F80, t) -> fpush st op; x87 st (if t = Ir.F32 then "fstps" else "fstpl") (Some (Mem (RBP, reg_slot st r)))
+  | Ir.Fconv (f, Ir.F80) ->
+      load_float st f op (XMM 0);
+      let sc = scratch st in
+      emit st (Sse ("mov" ^ sse_suffix f, Reg (XMM 0), Mem (RBP, sc)));
+      x87 st (if f = Ir.F32 then "flds" else "fldl") (Some (Mem (RBP, sc)));
+      fpop_to st r
+  | Ir.Fconv (f, t) -> failwith (Printf.sprintf "Select: Fconv %s" (if f = t then "identity" else "between SSE types"))
+  | Ir.Stof (f, Ir.F80) ->
+      load_int st f op RAX;
+      (match f with Ir.I8 | Ir.I16 | Ir.I32 -> emit st (Movsx (width_of f, Q, Reg RAX, Reg RAX)) | _ -> ());
+      let sc = scratch st in
+      emit st (Mov (Q, Reg RAX, Mem (RBP, sc))); x87 st "fildll" (Some (Mem (RBP, sc))); fpop_to st r
+  | Ir.Utof (f, Ir.F80) ->
+      load_int st f op RAX;
+      (match f with
+       | Ir.I8 | Ir.I16 -> emit st (Movzx (width_of f, L, Reg RAX, Reg RAX))
+       | Ir.I32 -> emit st (Mov (L, Reg RAX, Reg RAX))
+       | _ -> ());
+      let sc = scratch st in
+      emit st (Mov (Q, Reg RAX, Mem (RBP, sc))); x87 st "fildll" (Some (Mem (RBP, sc)));
+      if f = Ir.I64 then begin
+        (* a value with the top bit set was loaded as negative: add 2^64 *)
+        let ok = fresh_label st "utof" in
+        emit st (Alu ("test", Q, Reg RAX, Reg RAX)); emit st (Jcc (CNS, ok));
+        x87 st "fadds" (Some (Rip (float_const st Ir.F32 18446744073709551616.0, 0)));
+        emit st (Label ok)
+      end;
+      fpop_to st r
+  | Ir.Ftos (Ir.F80, t) ->
+      fpush st op;
+      let sc = scratch st in
+      x87 st "fisttpll" (Some (Mem (RBP, sc)));
+      emit st (Mov (Q, Mem (RBP, sc), Reg RAX)); store_int st t r RAX
+  | Ir.Ftou (Ir.F80, t) ->
+      fpush st op;
+      let sc = scratch st in
+      if t = Ir.I64 then begin
+        (* from 2^63 up: convert x - 2^63 and put the top bit back *)
+        let small = fresh_label st "ftou" and done_ = fresh_label st "ftoud" in
+        let two63 = float_const st Ir.F64 9223372036854775808.0 in
+        x87 st "fldl" (Some (Rip (two63, 0)));                    (* st0 = 2^63, st1 = x *)
+        emit st (Raw "\tfucomip\t%st(1), %st");                  (* CF: 2^63 < x *)
+        emit st (Jcc (CA, small));                                 (* 2^63 > x *)
+        x87 st "fsubl" (Some (Rip (two63, 0)));
+        x87 st "fisttpll" (Some (Mem (RBP, sc)));
+        emit st (Mov (Q, Mem (RBP, sc), Reg RAX));
+        emit st (Movabs (Int64.min_int, RCX)); emit st (Alu ("xor", Q, Reg RCX, Reg RAX));
+        emit st (Jmp done_);
+        emit st (Label small);
+        x87 st "fisttpll" (Some (Mem (RBP, sc)));
+        emit st (Mov (Q, Mem (RBP, sc), Reg RAX));
+        emit st (Label done_)
+      end else begin
+        x87 st "fisttpll" (Some (Mem (RBP, sc)));
+        emit st (Mov (Q, Mem (RBP, sc), Reg RAX))
+      end;
+      store_int st t r RAX
   | Ir.Sext (f, t) -> load_int st f op RAX; emit st (Movsx (width_of f, width_of t, Reg RAX, Reg RAX)); store_int st t r RAX
   | Ir.Zext (f, t) ->
       load_int st f op RAX;
@@ -399,8 +519,152 @@ let binop st op ty r a b =
        | _ -> load_int st ty b RCX; emit st (Shift (m, width_of ty, Reg RCX, Reg RAX)));
       store_int st ty r RAX
 
+(* ---- Inline assembly (extension) ----------------------------------------------
+
+   The template is text for the assembler with operands to fill in.  Each
+   operand gets a register from its constraint: a fixed one ("a" is rax,
+   "D" is rdi, "{r10}" names one), or one from the pool of caller-saved
+   registers for "r", or an xmm register for "x"; "m" operands are memory
+   references and "i" immediates; a digit ties an input to an earlier
+   operand's register.  Inputs are loaded before the text and outputs
+   stored after it.  The register allocator treats the statement as
+   clobbering every caller-saved register; callee-saved registers the
+   template names are saved around it. *)
+
+let reg_of_num = [| RAX; RCX; RDX; RBX; RSP; RBP; RSI; RDI; R8; R9; R10; R11; R12; R13; R14; R15 |]
+
+let inline_asm st (a : Ir.asm) =
+  let n = Array.length a.operands in
+  let constr = function
+    | Ir.Asm_in (c, _, _) | Ir.Asm_out (c, _, _) | Ir.Asm_inout (c, _, _, _) | Ir.Asm_mem (c, _) -> c
+    | Ir.Asm_imm _ -> "i" in
+  let named name = match Gas.register_of_name name with
+    | Some { Gas.rclass = Gas.Gpr; rnum; _ } -> Some reg_of_num.(rnum)
+    | Some { Gas.rclass = Gas.Xmm; rnum; _ } -> Some (XMM rnum)
+    | _ -> None in
+  let fixed c =
+    match c with
+    | "a" -> Some RAX | "b" -> Some RBX | "c" -> Some RCX | "d" -> Some RDX | "S" -> Some RSI | "D" -> Some RDI
+    | _ when String.length c > 2 && c.[0] = '{' -> named (String.sub c 1 (String.length c - 2))
+    | _ -> None in
+  let clobbered = List.filter_map named a.clobbers in
+  let regs = Array.make n None in
+  Array.iteri (fun i op -> regs.(i) <- fixed (constr op)) a.operands;
+  let taken = List.filter_map Fun.id (Array.to_list regs) @ clobbered in
+  let pool = ref (List.filter (fun r -> not (List.mem r taken)) [ RAX; RCX; RDX; RSI; RDI; R8; R9; R10; R11 ]) in
+  let xmm_pool = ref (List.filter (fun r -> not (List.mem r taken)) (List.init 16 (fun k -> XMM k))) in
+  let take pool = match !pool with r :: rest -> pool := rest; r | [] -> failwith "inline asm: out of registers" in
+  Array.iteri (fun i op ->
+      if regs.(i) = None then
+        match constr op, op with
+        | _, Ir.Asm_imm _ -> ()
+        | c, Ir.Asm_mem _ when String.contains c 'm' -> regs.(i) <- Some (take pool)   (* holds the address *)
+        | ("r" | "q" | "g" | "X"), _ -> regs.(i) <- Some (take pool)
+        | "x", _ -> regs.(i) <- Some (take xmm_pool)
+        | ("t" | "u"), _ -> ()   (* on the FPU stack *)
+        | c, _ when String.length c = 1 && c.[0] >= '0' && c.[0] <= '9' -> ()
+        | c, _ -> failwith ("inline asm: unsupported constraint " ^ c)) a.operands;
+  (* digits: the same register as the operand they name *)
+  Array.iteri (fun i op ->
+      let c = constr op in
+      if String.length c = 1 && c.[0] >= '0' && c.[0] <= '9' then regs.(i) <- regs.(Char.code c.[0] - 48)) a.operands;
+  let reg i = match regs.(i) with Some r -> r | None -> failwith "inline asm: operand without a register" in
+  (* callee-saved registers the template may change *)
+  let saved = List.filter (fun r -> List.mem r [ RBX; R12; R13; R14; R15 ])
+      (List.sort_uniq compare (clobbered @ List.filter_map Fun.id (Array.to_list regs))) in
+  List.iter (fun r -> emit st (Push (Reg r))) saved;
+  (* inputs *)
+  let on_fpu c = c = "t" || c = "u" in
+  Array.iteri (fun i op ->
+      match op with
+      | Ir.Asm_in (c, ty, v) | Ir.Asm_inout (c, ty, _, v) -> if not (on_fpu c) then load st ty v (reg i)
+      | Ir.Asm_mem (_, addr) -> load_addr st addr (reg i)
+      | Ir.Asm_out _ | Ir.Asm_imm _ -> ()) a.operands;
+  (* FPU operands: "u" is st(1), "t" is st(0), so u is pushed first *)
+  let fpu_ops c = List.filter (fun i -> constr a.operands.(i) = c) (List.init n Fun.id) in
+  List.iter (fun i ->
+      match a.operands.(i) with
+      | Ir.Asm_in (_, _, v) | Ir.Asm_inout (_, _, _, v) -> fpush st v
+      | _ -> ()) (fpu_ops "u" @ fpu_ops "t");
+  (* the text, with %0 .. %9 (and %k0, %q0, %w0, %b0) substituted *)
+  let width_of_ty = function Ir.I8 -> B | Ir.I16 -> W | Ir.I32 -> L | _ -> Q in
+  let text i modifier =
+    match a.operands.(i) with
+    | Ir.Asm_imm v -> "$" ^ Int64.to_string v
+    | Ir.Asm_mem _ -> "(" ^ Emit.reg Q (reg i) ^ ")"
+    | Ir.Asm_in (c, _, _) | Ir.Asm_out (c, _, _) | Ir.Asm_inout (c, _, _, _) when on_fpu c -> if c = "t" then "%st" else "%st(1)"
+    | Ir.Asm_in (_, ty, _) | Ir.Asm_out (_, ty, _) | Ir.Asm_inout (_, ty, _, _) ->
+        (match reg i with
+         | XMM k -> Printf.sprintf "%%xmm%d" k
+         | r ->
+             let w = match modifier with
+               | Some 'b' -> B | Some 'w' -> W | Some 'k' -> L | Some 'q' -> Q
+               | _ -> width_of_ty ty in
+             Emit.reg w r) in
+  let b = Buffer.create (String.length a.template) in
+  let t = a.template in
+  let len = String.length t in
+  let i = ref 0 in
+  while !i < len do
+    if t.[!i] = '%' && !i + 1 < len then begin
+      let c = t.[!i + 1] in
+      if c = '%' then (Buffer.add_char b '%'; i := !i + 2)
+      else if c >= '0' && c <= '9' then (Buffer.add_string b (text (Char.code c - 48) None); i := !i + 2)
+      else if (c = 'k' || c = 'q' || c = 'w' || c = 'b') && !i + 2 < len && t.[!i + 2] >= '0' && t.[!i + 2] <= '9' then
+        (Buffer.add_string b (text (Char.code t.[!i + 2] - 48) (Some c)); i := !i + 3)
+      else (Buffer.add_char b '%'; incr i)
+    end else (Buffer.add_char b t.[!i]; incr i)
+  done;
+  List.iter (fun line -> if String.trim line <> "" then emit st (Raw ("\t" ^ String.trim line)))
+    (String.split_on_char '\n' (Buffer.contents b));
+  (* outputs: an FPU result is popped first, then the pushed inputs the
+     template did not consume ("st" among the clobbers says it did) *)
+  Array.iteri (fun i op ->
+      match op with
+      | Ir.Asm_out (c, _, r) | Ir.Asm_inout (c, _, r, _) when on_fpu c -> fpop_to st r
+      | Ir.Asm_out (_, ty, r) | Ir.Asm_inout (_, ty, r, _) -> store st ty r (reg i)
+      | _ -> ()) a.operands;
+  let consumed = List.mem "st" a.clobbers in
+  List.iter (fun i ->
+      match a.operands.(i) with
+      | Ir.Asm_in (c, _, _) when c = "u" || not consumed -> emit st (Raw "\tfstp\t%st(0)")
+      | _ -> ()) (fpu_ops "t" @ fpu_ops "u");
+  List.iter (fun r -> emit st (Pop (Reg r))) (List.rev saved)
+
 let instr st (i : Ir.instr) =
   match i with
+  | Ir.Mov (Ir.F80, r, op) -> fpush st op; fpop_to st r
+  | Ir.Binop ((Ir.Fadd | Ir.Fsub | Ir.Fmul | Ir.Fdiv) as op, Ir.F80, r, a, b) ->
+      fpush st a; fpush st b;
+      x87 st (match op with Ir.Fadd -> "faddp" | Ir.Fsub -> "fsubrp" | Ir.Fmul -> "fmulp" | _ -> "fdivrp") None;
+      fpop_to st r
+  | Ir.Neg (Ir.F80, r, op) -> fpush st op; x87 st "fchs" None; fpop_to st r
+  | Ir.Cmp (c, Ir.F80, r, a, b) ->
+      (* fucomip compares st(0) with st(1) and pops: CF for below, ZF for
+         equal, PF for unordered; the comparison is arranged so that the
+         test is false on NaN except for != *)
+      let against x y = fpush st y; fpush st x; emit st (Raw "\tfucomip\t%st(1), %st"); emit st (Raw "\tfstp\t%st(0)") in
+      (match c with
+       | Ir.Feq -> against a b; emit st (Setcc (CE, Reg RAX)); emit st (Setcc (CNP, Reg RCX)); emit st (Alu ("and", B, Reg RCX, Reg RAX))
+       | Ir.Fne -> against a b; emit st (Setcc (CNE, Reg RAX)); emit st (Setcc (CP, Reg RCX)); emit st (Alu ("or", B, Reg RCX, Reg RAX))
+       | Ir.Fgt -> against a b; emit st (Setcc (CA, Reg RAX))
+       | Ir.Fge -> against a b; emit st (Setcc (CAE, Reg RAX))
+       | Ir.Flt -> against b a; emit st (Setcc (CA, Reg RAX))
+       | Ir.Fle -> against b a; emit st (Setcc (CAE, Reg RAX))
+       | _ -> assert false);
+      emit st (Movzx (B, L, Reg RAX, Reg RAX));
+      store_int st Ir.I32 r RAX
+  | Ir.Load (Ir.F80, r, addr) -> let m = mem_operand st addr in x87 st "fldt" (Some m); fpop_to st r
+  | Ir.Store (Ir.F80, addr, v) -> fpush st v; let m = mem_operand st addr in x87 st "fstpt" (Some m)
+  | Ir.Va_arg (Ir.F80, r, ap) ->
+      (* always in the overflow area, 16-byte aligned (ABI 3.5.7) *)
+      load_addr st ap RCX;
+      emit st (Mov (Q, Mem (RCX, 8), Reg RDX));
+      emit st (Alu ("add", Q, Imm 15L, Reg RDX)); emit st (Alu ("and", Q, Imm (-16L), Reg RDX));
+      x87 st "fldt" (Some (Mem (RDX, 0)));
+      emit st (Alu ("add", Q, Imm 16L, Reg RDX)); emit st (Mov (Q, Reg RDX, Mem (RCX, 8)));
+      fpop_to st r
+  | Ir.Intrinsic (intr, Ir.F80, r, op) -> fpush st op; x87 st (if intr = Ir.Fabs then "fabs" else "fsqrt") None; fpop_to st r
   | Ir.Mov (ty, r, op) ->
       if is_float ty then (load_float st ty op (XMM 0); store_float st ty r (XMM 0))
       else (load_int st ty op RAX; store_int st ty r RAX)
@@ -463,6 +727,7 @@ let instr st (i : Ir.instr) =
       emit st (Mov (Q, Imm (Int64.of_int n), Reg RCX));
       emit st Rep_stosb
   | Ir.Call (res, callee, args, variadic) -> call st res callee args variadic
+  | Ir.Inline_asm a -> inline_asm st a
   | Ir.Label l -> emit st (Label l)
   | Ir.Jump l -> emit st (Jmp l)
   | Ir.Branch (c, t, f) ->
@@ -489,7 +754,7 @@ let instr st (i : Ir.instr) =
       let table = Printf.sprintf ".LJT%d" st.const_count in
       let entries = Array.make (Int64.to_int (Int64.sub hi lo) + 1) default in
       List.iter (fun (c, l) -> entries.(Int64.to_int (Int64.sub c lo)) <- l) cases;
-      st.tables <- { dname = table; dglobal = false; dalign = 4; section = Rodata; size = 4 * Array.length entries;
+      st.tables <- { dname = table; dglobal = false; dweak = false; dhidden = false; dalias = None; dfunc = false; ddecl = false; dtls = false; dalign = 4; section = Rodata; size = 4 * Array.length entries;
                      items = Array.to_list (Array.map (fun l -> Long_diff (l, table)) entries) } :: st.tables;
       emit st (Lea (Rip (table, 0), RCX));
       emit st (Movsx (L, Q, Mem_index (RCX, RAX, 4), Reg RAX));
@@ -513,6 +778,7 @@ let instr st (i : Ir.instr) =
   | Ir.Ret v ->
       (match v with
        | None -> ()
+       | Some (Ir.Rv_scalar (Ir.F80, op)) -> fpush st op
        | Some (Ir.Rv_scalar (ty, op)) -> load st ty op (if is_float ty then XMM 0 else RAX)
        | Some (Ir.Rv_aggregate a) ->
            if List.mem Ir.Memory a.classes then begin
@@ -608,6 +874,52 @@ let instr st (i : Ir.instr) =
       emit st (Label done_);
       if is_float ty then (emit st (Sse ("mov" ^ sse_suffix ty, Mem (RDX, 0), Reg (XMM 0))); store_float st ty r (XMM 0))
       else (emit st (Mov (width_of ty, Mem (RDX, 0), Reg RAX)); store_int st ty r RAX)
+  | Ir.Alloca (r, size) ->
+      (* stack space for a variable length array, kept 16-byte aligned; the
+         epilogue restores rsp from rbp, so nothing is freed before return *)
+      load_int st Ir.I64 size RAX;
+      emit st (Alu ("add", Q, Imm 15L, Reg RAX));
+      emit st (Alu ("and", Q, Imm (-16L), Reg RAX));
+      emit st (Alu ("sub", Q, Reg RAX, Reg RSP));
+      emit st (Mov (Q, Reg RSP, Reg RAX));
+      store_int st Ir.I64 r RAX
+  | Ir.Va_arg_aggregate (dst, size, classes, ap) ->
+      (* ABI 3.5.7 step by step: an aggregate whose eightbytes all fit in the
+         remaining register save area is copied from there, one class at a
+         time; otherwise it is taken from the overflow area *)
+      load_addr st ap RCX;
+      load_addr st dst RDI;
+      let overflow = fresh_label st "vaov" and done_ = fresh_label st "vad" in
+      let n_int = List.length (List.filter (( = ) Ir.Integer) classes) and n_sse = List.length (List.filter (( = ) Ir.Sse) classes) in
+      if List.mem Ir.Memory classes || size > 16 then emit st (Jmp overflow)
+      else begin
+        if n_int > 0 then begin
+          emit st (Mov (L, Mem (RCX, 0), Reg RAX));
+          emit st (Alu ("cmp", L, Imm (Int64.of_int (48 - 8 * n_int)), Reg RAX)); emit st (Jcc (CA, overflow))
+        end;
+        if n_sse > 0 then begin
+          emit st (Mov (L, Mem (RCX, 4), Reg RDX));
+          emit st (Alu ("cmp", L, Imm (Int64.of_int (176 - 16 * n_sse)), Reg RDX)); emit st (Jcc (CA, overflow))
+        end;
+        emit st (Mov (Q, Mem (RCX, 16), Reg RSI));   (* reg_save_area *)
+        List.iteri (fun i cls ->
+            let field = if cls = Ir.Integer then 0 else 4 in
+            emit st (Mov (L, Mem (RCX, field), Reg RAX));
+            emit st (Mov (Q, Mem_index (RSI, RAX, 1), Reg R8));
+            emit st (Mov (Q, Reg R8, Mem (RDI, 8 * i)));
+            emit st (Alu ("add", L, Imm (if cls = Ir.Integer then 8L else 16L), Mem (RCX, field)))) classes;
+        emit st (Jmp done_)
+      end;
+      emit st (Label overflow);
+      emit st (Mov (Q, Mem (RCX, 8), Reg RSI));      (* overflow_arg_area *)
+      let words = (size + 7) / 8 in
+      for i = 0 to words - 1 do
+        emit st (Mov (Q, Mem (RSI, 8 * i), Reg R8));
+        emit st (Mov (Q, Reg R8, Mem (RDI, 8 * i)))
+      done;
+      emit st (Alu ("add", Q, Imm (Int64.of_int (8 * words)), Reg RSI));
+      emit st (Mov (Q, Reg RSI, Mem (RCX, 8)));
+      emit st (Label done_)
   | Ir.Intrinsic (Ir.Fsqrt, ty, r, op) ->
       load_float st ty op (XMM 0);
       emit st (Sse ("sqrt" ^ sse_suffix ty, Reg (XMM 0), Reg (XMM 0)));
@@ -626,7 +938,7 @@ let instr st (i : Ir.instr) =
 (* ---- Functions ------------------------------------------------------------------- *)
 
 let func st (f : Ir.func) : func =
-  st.code <- []; st.regs <- Hashtbl.create 64; st.frame <- 0; st.fname <- f.name; st.label_count <- 0;
+  st.code <- []; st.regs <- Hashtbl.create 64; st.f80 <- Hashtbl.create 8; st.scratch <- 0; st.frame <- 0; st.fname <- f.name; st.label_count <- 0;
   (* frame: IR slots; spill slots are allocated as they are first used *)
   st.slots <- Array.map (fun (s : Ir.slot) -> alloc st s.size (max s.align 1)) f.slots;
   st.alloc <- Regalloc.allocate f;
@@ -647,6 +959,7 @@ let func st (f : Ir.func) : func =
   List.iter2 (fun p place ->
       match p, place with
       | Ir.P_scalar (ty, r), In_regs [ reg ] -> store st ty r reg
+      | Ir.P_scalar (Ir.F80, r), On_stack off -> x87 st "fldt" (Some (Mem (RBP, 16 + off))); fpop_to st r
       | Ir.P_scalar (ty, r), On_stack off ->
           if is_float ty then (emit st (Sse ("mov" ^ sse_suffix ty, Mem (RBP, 16 + off), Reg (XMM 0))); store_float st ty r (XMM 0))
           else (emit st (Mov (width_of ty, Mem (RBP, 16 + off), Reg RAX)); store_int st ty r RAX)
@@ -704,10 +1017,20 @@ let func st (f : Ir.func) : func =
       let dparams = List.map2 (fun p (pname, ty) -> { pname; ptype = dwarf_type ty; ploc = where p }) f.params f.params_dbg in
       Some { dfile = file_index st f.loc.Loc.file; dline = f.loc.Loc.line; dparams; dret = dwarf_type f.ret_dbg }
     end in
-  Peephole.func { name = f.name; global = f.global; body = prologue @ body @ epilogue; debug }
+  Peephole.func { name = f.name; global = f.global; weak = f.flink.weak; hidden = f.flink.hidden; body = prologue @ body @ epilogue; debug }
 
 let data_of_global (g : Ir.global) : data option =
-  if not g.gdefined then None
+  if not g.gdefined then
+    (* an undefined reference declared weak or hidden: emit just the
+       binding, so the assembler records it (e.g. musl's weak _DYNAMIC) *)
+    (if g.glink.weak || g.glink.hidden then
+       Some { dname = g.gname; dglobal = false; dweak = g.glink.weak; dhidden = g.glink.hidden;
+              dalias = None; dfunc = false; ddecl = true; dtls = false; dalign = 1; section = Data; size = 0; items = [] }
+     else None)
+  else if g.glink.alias <> None then
+    (* an alias defines no storage; it is a .set to its target *)
+    Some { dname = g.gname; dglobal = g.gglobal; dweak = g.glink.weak; dhidden = g.glink.hidden; dalias = g.glink.alias;
+           dfunc = g.gfunc; ddecl = false; dtls = g.gtls; dalign = 1; section = Data; size = 0; items = [] }
   else
     let items = match g.ginit with
       | None -> [ Zeros (max g.gsize 1) ]
@@ -716,7 +1039,7 @@ let data_of_global (g : Ir.global) : data option =
     let zero = g.ginit = None || List.for_all (function Zeros _ -> true | _ -> false) items in
     let section = match g.gtls, zero with
       | true, true -> Tbss | true, false -> Tdata | false, true -> Bss | false, false -> Data in
-    Some { dname = g.gname; dglobal = g.gglobal; dalign = g.galign; section; size = max g.gsize 1; items }
+    Some { dname = g.gname; dglobal = g.gglobal; dweak = g.glink.weak; dhidden = g.glink.hidden; dalias = None; dfunc = false; ddecl = false; dtls = g.gtls; dalign = g.galign; section; size = max g.gsize 1; items }
 
 let program ~pic ~debug (p : Ir.program) : program =
   let locals = Hashtbl.create 64 and tls = Hashtbl.create 16 in
@@ -725,13 +1048,16 @@ let program ~pic ~debug (p : Ir.program) : program =
       if g.gtls then Hashtbl.replace tls g.gname ()) p.globals;
   List.iter (fun (f : Ir.func) -> if not f.global then Hashtbl.replace locals f.name ()) p.funcs;
   let st = { pic; debug; files = Hashtbl.create 8; next_file = 1; locals; tls; code = []; tables = [];
-             alloc = { Regalloc.where = Hashtbl.create 1; spill_slots = 0; used = [] }; saved = []; regs = Hashtbl.create 64; slots = [||]; frame = 0; float_consts = [];
+             alloc = { Regalloc.where = Hashtbl.create 1; spill_slots = 0; used = [] }; saved = []; regs = Hashtbl.create 64; slots = [||]; frame = 0; float_consts = []; f80_consts = []; f80 = Hashtbl.create 8; scratch = 0;
              const_count = 0; label_count = 0; fname = ""; hidden_ptr = 0; save_area = 0; va_gp = 0; va_fp = 0; va_stack = 0 } in
   let funcs = List.map (func st) p.funcs in
   let data = List.filter_map data_of_global p.globals in
   let consts = List.rev_map (fun (bits, name) ->
       let is32 = Int64.logand bits 0x1_0000_0000L <> 0L && Int64.shift_right_logical bits 33 = 0L in
-      if is32 then { dname = name; dglobal = false; dalign = 4; section = Rodata; size = 4; items = [ Long (Int64.to_int32 bits) ] }
-      else { dname = name; dglobal = false; dalign = 8; section = Rodata; size = 8; items = [ Quad bits ] }) st.float_consts in
+      if is32 then { dname = name; dglobal = false; dweak = false; dhidden = false; dalias = None; dfunc = false; ddecl = false; dtls = false; dalign = 4; section = Rodata; size = 4; items = [ Long (Int64.to_int32 bits) ] }
+      else { dname = name; dglobal = false; dweak = false; dhidden = false; dalias = None; dfunc = false; ddecl = false; dtls = false; dalign = 8; section = Rodata; size = 8; items = [ Quad bits ] }) st.float_consts in
+  let long_consts = List.rev_map (fun (bits, name) ->
+      let m, se = f80_of_float (Int64.float_of_bits bits) in
+      { dname = name; dglobal = false; dweak = false; dhidden = false; dalias = None; dfunc = false; ddecl = false; dtls = false; dalign = 16; section = Rodata; size = 16; items = [ Quad m; Word se; Zeros 6 ] }) st.f80_consts in
   let files = List.sort compare (Hashtbl.fold (fun name n acc -> (n, name) :: acc) st.files []) in
-  { funcs; data = data @ consts @ List.rev st.tables; source = (if debug then Some p.source else None); files }
+  { funcs; data = data @ consts @ long_consts @ List.rev st.tables; source = (if debug then Some p.source else None); files; asm_blocks = p.asm_blocks; init_array = p.init_array; fini_array = p.fini_array }

@@ -560,11 +560,43 @@ and static_assert st : declaration =
   expect_punct st Semi;
   Static_assert (e, msg)
 
+(* GNU inline assembly (extension, doc/extensions.md):
+     asm [volatile] ( template [: outputs [: inputs [: clobbers]]] ) ;
+   with each operand  [name] "constraint" (expression). *)
+and asm_statement st : asm =
+  advance st;
+  let quals = type_qualifiers st in
+  let volatile = List.mem Q_volatile quals in
+  expect_punct st LParen;
+  let string () = match peek st with String_lit { bytes; _ } -> advance st; bytes | t -> error st "expected string literal before %s" (describe t) in
+  let template = string () in
+  let operand () =
+    let oname = if punct st LBracket then begin
+        let n = match peek st with Ident n -> advance st; n | t -> error st "expected operand name before %s" (describe t) in
+        expect_punct st RBracket; Some n end else None in
+    let constr = string () in
+    expect_punct st LParen;
+    let aexpr = expression st in
+    expect_punct st RParen;
+    { oname; constr; aexpr } in
+  let rec list f = if peek st = Punct Colon || peek st = Punct RParen then [] else begin
+      let x = f () in if punct st Comma then x :: list f else [ x ] end in
+  let outputs = if punct st Colon then list operand else [] in
+  let inputs = if punct st Colon then list operand else [] in
+  let clobbers = if punct st Colon then list string else [] in
+  expect_punct st RParen; expect_punct st Semi;
+  { template; outputs; inputs; clobbers; volatile }
+
 (* A declaration (6.7) or, at file scope, a function definition (6.9.1).
    The two share everything up to the first declarator. *)
 and declaration_or_function st ~allow_function : external_decl =
   if peek st = Keyword Static_assert then Ext_decl (static_assert st)
-  else begin
+  else if peek st = Keyword Asm && allow_function then begin
+    (* file-scope asm: the text goes to the assembler as it is *)
+    let a = asm_statement st in
+    if a.outputs <> [] || a.inputs <> [] then error st "file-scope asm takes no operands";
+    Ext_asm a.template
+  end else begin
     let l = loc st in
     let specs = specifiers st in
     if specs.type_specs = [] && specs.quals = [] && specs.storage = None && specs.funcs = [] then
@@ -590,7 +622,7 @@ and declaration_or_function st ~allow_function : external_decl =
           if peek st = Punct LBrace then List.rev acc
           else match declaration_or_function st ~allow_function:false with
             | Ext_decl d -> kr (d :: acc)
-            | Ext_func _ -> assert false in
+            | Ext_func _ | Ext_asm _ -> assert false in
         let kr_decls = kr [] in
         let body = compound_statement st in
         pop_scope st;
@@ -643,7 +675,7 @@ and starts_declaration st =
 and declaration st : declaration =
   match declaration_or_function st ~allow_function:false with
   | Ext_decl d -> d
-  | Ext_func _ -> assert false
+  | Ext_func _ | Ext_asm _ -> assert false
 
 and statement st : stmt =
   let l = loc st in
@@ -707,14 +739,7 @@ and statement st : stmt =
       let e = if peek st = Punct Semi then None else Some (expression st) in
       expect_punct st Semi;
       node (Return e)
-  | Keyword Asm ->
-      advance st;
-      let _ = type_qualifiers st in
-      expect_punct st LParen;
-      let text = match peek st with String_lit { bytes; _ } -> advance st; bytes | t -> error st "expected string literal before %s" (describe t) in
-      (* operands are not supported; see doc/extensions.md *)
-      expect_punct st RParen; expect_punct st Semi;
-      node (Asm text)
+  | Keyword Asm -> node (Asm (asm_statement st))
   | _ ->
       let e = expression st in
       expect_punct st Semi;

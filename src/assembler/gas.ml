@@ -15,6 +15,7 @@ type reg_class =
   | Xmm           (* xmm0 .. xmm15 *)
   | Segment       (* fs, gs: only as segment overrides on memory operands *)
   | Rip           (* only as the base of rip-relative addressing *)
+  | X87           (* st, st(0) .. st(7): the FPU register stack *)
 
 type reg = {
   rclass : reg_class;
@@ -156,6 +157,7 @@ let register_of_name name =
         | "fs" -> Some { rclass = Segment; rnum = 4; rwidth = 16; rname = name }
         | "gs" -> Some { rclass = Segment; rnum = 5; rwidth = 16; rname = name }
         | "rip" -> Some { rclass = Rip; rnum = 0; rwidth = 64; rname = name }
+        | "st" -> Some { rclass = X87; rnum = 0; rwidth = 80; rname = name }
         | _ -> None
 
 (* DWARF register numbers for .cfi directives (System V ABI, figure 3.36) *)

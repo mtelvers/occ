@@ -94,6 +94,8 @@ let rec instr ppf i =
   | Ud2 -> p "\tud2"
   | Label l -> p "%s:" l
   | Raw s -> p "%s" s
+  | X87 (m, None) -> p "\t%s" m
+  | X87 (m, Some a) -> p "\t%s\t%s" m (operand Q a)
   | Comment s -> p "\t# %s" s
   | Cfi d -> p "\t.cfi_%s" d
   | File (n, name) -> p "\t.file\t%d \"%s\"" n (escape name)
@@ -106,10 +108,22 @@ let section_directive = function
   | Tdata -> "\t.section .tdata,\"awT\",@progbits"
   | Tbss -> "\t.section .tbss,\"awT\",@nobits"
 
+(* the binding and visibility directives shared by data and functions *)
+let linkage ppf ~global ~weak ~hidden name =
+  let p fmt = Format.fprintf ppf fmt in
+  if weak then p "\t.weak\t%s@." name else if global then p "\t.globl\t%s@." name;
+  if hidden then p "\t.hidden\t%s@." name
+
 let data ppf (d : data) =
   let p fmt = Format.fprintf ppf fmt in
+  linkage ppf ~global:d.dglobal ~weak:d.dweak ~hidden:d.dhidden d.dname;
+  if d.ddecl then () else
+  (match d.dalias with
+   | Some target ->
+       p "\t.type\t%s, @%s@." d.dname (if d.dfunc then "function" else if d.dtls then "tls_object" else "object");
+       p "\t.set\t%s, %s@." d.dname target
+   | None ->
   p "%s@." (section_directive d.section);
-  if d.dglobal then p "\t.globl\t%s@." d.dname;
   p "\t.align\t%d@." d.dalign;
   p "\t.type\t%s, @%s@." d.dname (match d.section with Tdata | Tbss -> "tls_object" | _ -> "object");
   p "\t.size\t%s, %d@." d.dname d.size;
@@ -121,12 +135,13 @@ let data ppf (d : data) =
       | Quad_sym (s, o) -> p "\t.quad\t%s%+Ld@." s o
       | Quad v -> p "\t.quad\t%Ld@." v
       | Long v -> p "\t.long\t%ld@." v
-      | Long_diff (a, b) -> p "\t.long\t%s - %s@." a b) d.items
+      | Word v -> p "\t.value\t%d@." v
+      | Long_diff (a, b) -> p "\t.long\t%s - %s@." a b) d.items)
 
 let func ppf (f : func) =
   let p fmt = Format.fprintf ppf fmt in
   p "\t.text@.";
-  if f.global then p "\t.globl\t%s@." f.name;
+  linkage ppf ~global:f.global ~weak:f.weak ~hidden:f.hidden f.name;
   p "\t.type\t%s, @function@." f.name;
   p "%s:@." f.name;
   if f.debug <> None then p ".LFB.%s:@." f.name;
@@ -220,6 +235,7 @@ let debug_info ppf (prog : program) source =
 let program ppf (prog : program) =
   (* the .file table comes first, before any .loc refers to it *)
   List.iter (fun (n, name) -> Format.fprintf ppf "\t.file\t%d \"%s\"@." n (escape name)) prog.files;
+  List.iter (fun text -> Format.fprintf ppf "%s@." text) prog.asm_blocks;
   List.iter (data ppf) prog.data;
   if prog.source <> None then Format.fprintf ppf "\t.text@..Ltext0:@.";
   List.iter (func ppf) prog.funcs;
@@ -228,4 +244,12 @@ let program ppf (prog : program) =
        Format.fprintf ppf "\t.text@..Letext0:@.";
        debug_info ppf prog source
    | None -> ());
+  let array name entries =
+    if entries <> [] then begin
+      Format.fprintf ppf "\t.section %s,\"aw\",@init_array@." name;
+      List.iter (fun (prio, fn) -> ignore prio; Format.fprintf ppf "\t.align\t8@.\t.quad\t%s@." fn)
+        (List.stable_sort (fun (a, _) (b, _) -> compare a b) entries)
+    end in
+  array ".init_array" prog.init_array;
+  array ".fini_array" prog.fini_array;
   Format.fprintf ppf "\t.section .note.GNU-stack,\"\",@progbits@."

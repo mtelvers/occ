@@ -114,6 +114,32 @@ debuggers. It links glibc's `libc.a`, `libgcc_eh.a` and Ubuntu's
 linker-script `libm.a`; statically linked `ocamlrun` and ocamlopt
 programs run, and gdb finds their source lines.
 
+## C library
+
+occ builds musl (1.2.5) entirely on its own: `./configure --target=x86_64
+CC=occ AR=occar` in the musl tree produces `libc.a` with no gcc runtime.
+This needed the language and ABI features a real C library uses beyond
+the OCaml runtime's subset:
+
+  - GNU inline assembly with operands and constraints (`syntax`/`parser`
+    to `select`): fixed registers, register variables, tied and memory
+    operands, the x87 stack; enough for musl's syscalls, atomics and
+    thread-pointer access.
+  - variable length arrays (6.7.6.2): runtime `sizeof`, scaled pointer
+    arithmetic, stack allocation.
+  - `long double` as the 80-bit x87 format (class X87 in the ABI): kept in
+    16-byte slots, computed on the FPU stack, passed in memory, returned in
+    st(0); the assembler gained the x87 instruction set.
+  - `va_arg` of aggregates.
+  - linkage attributes: `weak`, `alias`, `visibility`, `constructor`,
+    `destructor`, emitted as `.weak`, `.set`, `.hidden` and `.init_array`.
+
+Programs link against the occ-built musl through a sysroot
+(`occ --sysroot=DIR`, or `OCC_SYSROOT`): DIR/include for headers, DIR/lib
+for crt1.o, crti.o, crtn.o and libc.a, with no gcc or glibc files. C
+programs using stdio, malloc, pthreads with thread-local storage and libm
+build and run this way.
+
 ## Definition of done
 
     ./configure CC=$PWD/_build/default/bin/main.exe   # in the OCaml tree

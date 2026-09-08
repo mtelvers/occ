@@ -13,7 +13,7 @@ type reg = int
 
 (* Machine scalar types.  Signedness is a property of operations, not of
    values, as on the hardware. *)
-type ty = I8 | I16 | I32 | I64 | F32 | F64
+type ty = I8 | I16 | I32 | I64 | F32 | F64 | F80 (* F80: the x87 extended format of long double *)
 
 type operand =
   | Reg of reg
@@ -35,7 +35,8 @@ type memory_order = Relaxed | Consume | Acquire | Release | Acq_rel | Seq_cst
 
 type conv =
   | Sext of ty * ty | Zext of ty * ty | Trunc of ty * ty
-  | Fext | Ftrunc
+  | Fext | Ftrunc (* float <-> double *)
+  | Fconv of ty * ty (* any conversion involving F80 *)
   | Stof of ty * ty | Utof of ty * ty | Ftos of ty * ty | Ftou of ty * ty
 
 (* How the calling convention treats each eightbyte of an aggregate
@@ -83,16 +84,39 @@ type instr =
   (* extensions the runtime needs; see doc/extensions.md *)
   | Va_start of operand (* address of the va_list *)
   | Va_arg of ty * reg * operand
+  | Va_arg_aggregate of operand * int * cls list * operand (* destination, size, classes, address of the va_list *)
+  | Alloca of reg * operand (* the address of that many fresh bytes of stack, for variable length arrays *)
   | Trap
   | Return_address of reg
   | Intrinsic of intrinsic * ty * reg * operand (* a library function computed inline *)
   | Line of Loc.t (* the source position of what follows, for debug line tables *)
+  | Inline_asm of asm (* extension: the template is emitted with its operands substituted *)
 
 and intrinsic = Fabs | Fsqrt
+
+(* Inline assembly operands after lowering.  Constraints are the GNU
+   letters with the = + & modifiers removed: a register class ("r", "x",
+   a fixed register such as "a" or "D", or "{name}" for a variable bound
+   to a register), "m" for a memory operand, "i" for an immediate, or a
+   digit tying an input to the register of an earlier operand. *)
+and asm = { template : string; operands : asm_operand array; clobbers : string list }
+
+and asm_operand =
+  | Asm_in of string * ty * operand          (* constraint, type, value *)
+  | Asm_out of string * ty * reg             (* the register the result is stored from *)
+  | Asm_inout of string * ty * reg * operand (* "+": value in, result out, one register *)
+  | Asm_mem of string * operand              (* "m": the address *)
+  | Asm_imm of int64
 
 type slot = { size : int; align : int }
 
 type param = P_scalar of ty * reg | P_aggregate of int * int * cls list (* slot, size, classes *)
+
+(* linkage facts carried to the assembler: weak binding, an alias target
+   (this symbol is defined equal to it), and ELF visibility *)
+type link = { weak : bool; alias : string option; hidden : bool }
+
+let plain_link = { weak = false; alias = None; hidden = false }
 
 type func = {
   name : string;
@@ -107,6 +131,7 @@ type func = {
   variables : reg list; (* registers holding C variables, favoured by the allocator *)
   params_dbg : (string * Ctype.t) list; (* parameter names and C types, in order, for DWARF *)
   ret_dbg : Ctype.t; (* the C return type *)
+  flink : link;
 }
 
 type data =
@@ -122,6 +147,15 @@ type global = {
   gsize : int;
   ginit : data list option; (* None: tentative or extern-less common, goes in .bss *)
   gdefined : bool; (* false: only referenced *)
+  gfunc : bool; (* the symbol has function type: an alias uses @function *)
+  glink : link;
 }
 
-type program = { funcs : func list; globals : global list; source : string (* the translation unit's file *) }
+type program = {
+  funcs : func list;
+  globals : global list;
+  source : string; (* the translation unit's file *)
+  asm_blocks : string list;
+  init_array : (int * string) list; (* constructor priority, function name *)
+  fini_array : (int * string) list;
+}
