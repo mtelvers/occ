@@ -22,9 +22,11 @@ variables, `$(eval $(call ...))` over `$(foreach)`, and incremental
 rebuilds by timestamp.
 
 It parses the OCaml runtime's 4500-line Makefile in full (about 2400
-rules) and generates GNU make's exact command for a runtime object, but
-does not yet drive the whole OCaml build: one `$(eval)`/`$(call)`
-interaction with the verbose `$(info)` variables expands without
-terminating, which an expansion-depth limit turns into an error rather
-than a hang. That, parallel jobs (`-j`), `vpath`, and secondary
-expansion are the remaining work.
+rules), handles `.SECONDEXPANSION` and the directory/file automatic
+variables, and drives real build steps: it compiles every runtime C and
+assembly file and archives `libcamlrun.a`, `libcamlrund.a` and
+`libasmrun.a` (each with the same members GNU make produces). Its
+command for an object matches GNU make's but for collapsed whitespace
+where a variable expands empty. Not yet covered: parallel jobs (`-j`),
+`vpath` search, `$(MAKE)` recursion for a whole `world.opt`, and a few
+generated rules (e.g. the PIC runtime library).
