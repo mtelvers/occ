@@ -599,9 +599,9 @@ and declaration_or_function st ~allow_function : external_decl =
   end else begin
     let l = loc st in
     let specs = specifiers st in
-    if specs.type_specs = [] && specs.quals = [] && specs.storage = None && specs.funcs = [] then
+    if specs.type_specs = [] && specs.quals = [] && specs.storage = None && specs.funcs = [] && specs.attrs = [] then
       error st "expected declaration specifiers before %s" (describe (peek st));
-    if punct st Semi then Ext_decl (Decl (specs, [])) (* e.g. "struct s { ... };" *)
+    if punct st Semi then Ext_decl (Decl (specs, [])) (* e.g. "struct s { ... };" or a statement attribute *)
     else begin
       let first = declarator st ~abstract:false in
       let register d =
@@ -681,6 +681,10 @@ and statement st : stmt =
   let l = loc st in
   let node s = { s; sloc = l } in
   match peek st with
+  | Keyword Attribute ->
+      (* a statement-position attribute, e.g. __attribute__((fallthrough)); *)
+      let _ = attributes st in
+      if punct st Semi then node (Expr None) else statement st
   | Ident name when peek2 st = Punct Colon ->
       advance st; advance st;
       let _ = attributes st in

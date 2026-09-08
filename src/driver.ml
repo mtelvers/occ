@@ -173,7 +173,10 @@ let preprocess o input output =
       let defaults =
         if List.mem "-nostdinc" o.passthrough then []
         else match include_dir, sysroot () with
-          | Some d, Some root -> [ d; Filename.concat root "include" ]
+          (* a real libc sysroot is self-contained; occ's own headers (which
+             replace gcc's on the glibc path) would only redefine NULL and the
+             like, so they are left out *)
+          | _, Some root -> [ Filename.concat root "include" ]
           | Some d, None -> [ d; "/usr/include/x86_64-linux-gnu"; "/usr/include" ]
           | None, _ -> failwith "cannot find include/ next to the executable" in
       let extras = List.map (fun d ->

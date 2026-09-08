@@ -1021,6 +1021,9 @@ and declaration_body ctx (d : S.declaration) : T.stmt list =
       []
   | S.Decl (specs, decls) ->
       let loc = match decls with d :: _ -> d.decl.dloc | [] -> Loc.none in
+      (* a declaration that is only attributes, e.g. __attribute__((fallthrough)); *)
+      if decls = [] && specs.type_specs = [] && specs.quals = [] && specs.storage = None then []
+      else
       let base = base_type ctx loc specs in
       if decls = [] then begin
         (* 6.7p2: a declaration must declare something, unless it is a tag *)
