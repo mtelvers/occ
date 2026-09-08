@@ -27,19 +27,58 @@ let expand st s = Expand.expand (ctx st) s
    elsewhere it becomes a single space (3.1.1). *)
 let logical_lines text =
   let lines = String.split_on_char '\n' text in
-  let out = ref [] and buf = Buffer.create 128 and joining = ref false in
+  let out = ref [] and buf = Buffer.create 128 in
+  let joining = ref false and recipe = ref false and in_define = ref false in
   List.iter (fun line ->
       let line = if String.length line > 0 && line.[String.length line - 1] = '\r' then String.sub line 0 (String.length line - 1) else line in
       let cont = String.length line > 0 && line.[String.length line - 1] = '\\'
                  && not (String.length line >= 2 && line.[String.length line - 2] = '\\') in
       let body = if cont then String.sub line 0 (String.length line - 1) else line in
+      (* Outside a recipe, a continuation stands for exactly one space:
+         the blanks before the backslash go with it, as do those at the
+         head of the next line.  A recipe keeps all of it, since the
+         shell reads the continuation itself. *)
+      let rtrim s =
+        let k = ref (String.length s) in
+        while !k > 0 && (s.[!k - 1] = ' ' || s.[!k - 1] = '\t') do decr k done;
+        String.sub s 0 !k in
       if !joining then begin
-        (* continuation: collapse leading whitespace to one space unless recipe *)
-        let trimmed = String.trim body in
-        Buffer.add_char buf ' '; Buffer.add_string buf trimmed
-      end else Buffer.add_string buf body;
+        if !recipe then begin
+          (* A recipe's continuation belongs to the shell, which reads the
+             backslash and newline itself, so both are kept and only the
+             leading tab of the line goes (5.1.1).  Joining them into one
+             line instead would change the text the shell is given. *)
+          Buffer.add_string buf "\\\n";
+          let k = if String.length body > 0 && body.[0] = '\t' then 1 else 0 in
+          Buffer.add_string buf (String.sub body k (String.length body - k))
+        end else begin
+          Buffer.add_char buf ' ';
+          Buffer.add_string buf (String.trim body)
+        end
+      end else begin
+        (* Inside a define body a tab line is not a recipe but part of a
+           variable's value, so its continuations collapse as any value's
+           do; the tabs become recipe lines only later, when $(eval)
+           reads the expanded text back (6.8). *)
+        recipe := String.length line > 0 && line.[0] = '\t' && not !in_define;
+        Buffer.add_string buf (if cont && not !recipe then rtrim body else body)
+      end;
       if cont then joining := true
-      else begin out := Buffer.contents buf :: !out; Buffer.clear buf; joining := false end)
+      else begin
+        let complete = Buffer.contents buf in
+        let trimmed = String.trim complete in
+        let opens =
+          trimmed = "define"
+          || (String.length trimmed > 6 && String.sub trimmed 0 7 = "define ") in
+        let closes =
+          trimmed = "endef"
+          || (String.length trimmed > 5
+              && String.sub trimmed 0 5 = "endef"
+              && (match trimmed.[5] with ' ' | '\t' | '#' -> true | _ -> false)) in
+        if !in_define then (if closes then in_define := false)
+        else if opens then in_define := true;
+        out := complete :: !out; Buffer.clear buf; joining := false
+      end)
     lines;
   if Buffer.length buf > 0 then out := Buffer.contents buf :: !out;
   List.rev !out
@@ -55,6 +94,15 @@ let strip_comment line =
 (* ---- Assignments and rules ----------------------------------------------------- *)
 
 let starts_with p s = String.length s >= String.length p && String.sub s 0 (String.length p) = p
+
+(* Blanks at the left of a line mean nothing, but blanks at the right
+   belong to whatever value the line assigns: make keeps them, and the
+   build's flag variables end in one on purpose. *)
+let ltrim s =
+  let n = String.length s in
+  let k = ref 0 in
+  while !k < n && (s.[!k] = ' ' || s.[!k] = '\t') do incr k done;
+  String.sub s !k (n - !k)
 
 (* find the assignment operator (=, :=, ::=, ?=, +=) at top level, before
    any ':' that would make it a rule *)
@@ -106,8 +154,8 @@ and eval_lines st lines =
           (match st.current with Some r -> st.current <- Some { r with recipe = r.recipe @ [ String.sub raw 1 (String.length raw - 1) ] } | None -> ());
           loop rest
         end else begin
-          let line = String.trim (strip_comment raw) in
-          if line = "" then (loop rest)
+          let line = ltrim (strip_comment raw) in
+          if String.trim line = "" then (loop rest)
           else begin
             let first = match String.index_opt line ' ' with Some i -> String.sub line 0 i | None -> line in
             match first with
@@ -140,7 +188,21 @@ and eval_lines st lines =
                 loop rest
             | "unexport" -> loop rest
             | "override" -> do_assignment ~origin:Value.Override st (String.trim (String.sub line 8 (String.length line - 8))); loop rest
-            | "vpath" -> loop rest
+            | "vpath" ->
+                (* `vpath pattern dirs' adds a search path, `vpath
+                   pattern' drops the ones for that pattern, and `vpath'
+                   alone drops them all (4.5.2) *)
+                (let rest_line = String.trim (String.sub line 5 (String.length line - 5)) in
+                 match Expand.words (expand st rest_line) with
+                 | [] -> st.rules.Rule.vpaths <- []
+                 | [ pat ] ->
+                     st.rules.Rule.vpaths <-
+                       List.filter (fun (p, _) -> p <> pat) st.rules.Rule.vpaths
+                 | pat :: dirs ->
+                     let dirs = List.concat_map (String.split_on_char ':') dirs in
+                     let dirs = List.filter (fun d -> d <> "") dirs in
+                     st.rules.Rule.vpaths <- st.rules.Rule.vpaths @ [ (pat, dirs) ]);
+                loop rest
             | _ ->
                 (match assignment_op line with
                  | Some _ -> do_assignment st line
@@ -188,7 +250,17 @@ and do_assignment ?origin st line =
   | Some (op_start, val_start) ->
       let name = String.trim (String.sub line 0 op_start) in
       let op = String.sub line op_start (val_start - op_start) in
-      let rhs = if val_start <= String.length line then String.trim (String.sub line val_start (String.length line - val_start)) else "" in
+      (* Only the blanks between the operator and the value go: make
+         keeps a value's trailing blanks, and recipes rely on it -- the
+         build's MKEXE_VIA_CC ends in a space so that what follows it is
+         separated. *)
+      let rhs =
+        if val_start <= String.length line then begin
+          let text = String.sub line val_start (String.length line - val_start) in
+          let k = ref 0 in
+          while !k < String.length text && (text.[!k] = ' ' || text.[!k] = '\t') do incr k done;
+          String.sub text !k (String.length text - !k)
+        end else "" in
       let name = expand st name in
       (match op with
        | "=" -> Value.set st.db ?origin ~flavour:Value.Recursive name rhs
@@ -221,7 +293,7 @@ and parse_rule_body st line =
         else rhs, None in
       let is_double = String.length rhs > 0 && rhs.[0] = ':' in
       let rhs = if is_double then String.sub rhs 1 (String.length rhs - 1) else rhs in
-      let targets = Expand.words (expand st targets_s) in
+      let targets = List.map Func.normalise (Expand.words (expand st targets_s)) in
       (* a target-specific variable: "targets: VAR OP value" (6.11) *)
       (match assignment_op rhs with
        | Some _ when top_colon rhs = None && not is_double ->
@@ -232,7 +304,7 @@ and parse_rule_body st line =
                    identifier before the operator marks a variable *)
                 if var <> "" && not (String.contains var ' ') && not (String.contains var '/') && not (String.contains var '.') then begin
                   let op = String.sub rhs op_start (val_start - op_start) in
-                  let value = if val_start <= String.length rhs then String.trim (String.sub rhs val_start (String.length rhs - val_start)) else "" in
+                  let value = if val_start <= String.length rhs then ltrim (String.sub rhs val_start (String.length rhs - val_start)) else "" in
                   finish_recipe st;
                   List.iter (fun t -> st.rules.Rule.tsvs <- st.rules.Rule.tsvs @ [ { Rule.pat = t; var; op; rhs = value } ]) targets;
                   raise Exit
@@ -248,6 +320,8 @@ and parse_rule_body st line =
               | Some j -> String.sub rhs 0 j, String.sub rhs (j + 1) (String.length rhs - j - 1), None
               | None -> rhs, "", None)) in
       let make_rule targets prereqs order is_pattern =
+        let prereqs = List.map Func.normalise prereqs in
+        let order = List.map Func.normalise order in
         finish_recipe st;
         let r = { Rule.targets; prereqs; order_only = order; recipe = (match inline_recipe with Some c -> [ c ] | None -> []); is_pattern;
                   is_double_colon = is_double; phony = false } in
@@ -266,6 +340,8 @@ and parse_rule_body st line =
            let prereqs = Expand.words (expand st prereqs_s) and order = Expand.words (expand st order_s) in
            let is_pattern = List.exists (fun t -> String.contains t '%') targets in
            if List.mem ".PHONY" targets then List.iter (Rule.mark_phony st.rules) prereqs;
+           if List.mem ".PRECIOUS" targets || List.mem ".SECONDARY" targets then
+             List.iter (Rule.mark_precious st.rules) prereqs;
            if List.mem ".SECONDEXPANSION" targets then st.rules.Rule.second_expansion <- true;
            make_rule targets prereqs order is_pattern)
 

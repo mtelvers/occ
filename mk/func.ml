@@ -63,3 +63,18 @@ let subst from into s =
     done;
     Buffer.contents b
   end
+
+(* GNU make holds a file name without any leading "./": a rule for
+   `runtime/sak' and a prerequisite written `./runtime/sak' name the same
+   file, and a pattern-specific variable for `runtime/%' has to apply to
+   both. *)
+let normalise name =
+  let n = String.length name in
+  let rec skip i =
+    if i + 2 <= n && name.[i] = '.' && name.[i + 1] = '/' then begin
+      let j = ref (i + 2) in
+      while !j < n && name.[!j] = '/' do incr j done;
+      if !j < n then skip !j else i
+    end else i in
+  let start = skip 0 in
+  if start = 0 then name else String.sub name start (n - start)
