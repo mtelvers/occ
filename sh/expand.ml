@@ -66,7 +66,7 @@ let param_value st name =
       Some (joined st (if ifs = "" then "" else String.make 1 ifs.[0]))
   | "#" -> Some (string_of_int (List.length st.State.params))
   | "?" -> Some (string_of_int st.State.status)
-  | "$" -> Some (string_of_int (Unix.getpid ()))
+  | "$" -> Some (string_of_int st.State.pid)
   | "!" -> Some (string_of_int st.State.last_bg)
   | "0" -> Some st.State.arg0
   | "-" ->

@@ -14,7 +14,17 @@ for s in "$dir"/*.sh; do
   n=$((n+1))
   base=$(basename "$s")
   rm -rf "$work"; mkdir -p "$work/a" "$work/b"
-  ( cd "$work/a" && "$ref"  "$s" >out 2>err; echo $? > status )
+  # A script with a .expected file beside it is one where occsh is meant
+  # to differ from the reference shell: it is compared with that file
+  # instead.  $LINENO is the case: dash does not have it, and a shell
+  # that does saves configure from rewriting itself.
+  if [ -f "$s.expected" ]; then
+    cp "$s.expected" "$work/a/out"
+    : > "$work/a/err"
+    echo 0 > "$work/a/status"
+  else
+    ( cd "$work/a" && "$ref" "$s" >out 2>err; echo $? > status )
+  fi
   ( cd "$work/b" && "$OCSH" "$s" >out 2>err; echo $? > status )
   bad=""
   for f in out err status; do

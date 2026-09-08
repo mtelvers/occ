@@ -41,6 +41,7 @@ type t = {
   mutable last_bg : int;               (* $! *)
   mutable subshell : bool;
   mutable in_loop : int;
+  pid : int;                           (* $$: fixed for the life of the shell *)
 }
 
 exception Return of int
@@ -63,6 +64,7 @@ let create () = {
   last_bg = 0;
   subshell = false;
   in_loop = 0;
+  pid = Unix.getpid ();
 }
 
 (* ---------- variables ---------- *)

@@ -130,6 +130,10 @@ and parse src =
         let stop = Lex.skip_double src (!i + 1) n 0 in
         add (Double (dquoted (String.sub src (!i + 1) (stop - !i - 2))));
         i := stop
+    | '\\' when !i + 1 < n && src.[!i + 1] = '\n' ->
+        (* a backslash-newline is a line continuation: both characters
+           disappear, and the word goes on (2.2.1) *)
+        i := !i + 2
     | '\\' when !i + 1 < n -> add (Esc src.[!i + 1]); i := !i + 2
     | '\\' -> Buffer.add_char buf '\\'; incr i
     | '$' | '`' ->

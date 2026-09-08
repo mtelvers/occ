@@ -63,6 +63,12 @@ let test name args =
 (* ---------- the environment ---------- *)
 
 let cd st args =
+  (* -L and -P choose whether symbolic links are resolved; this shell
+     keeps the logical path, as PWD records it *)
+  let args = match args with
+    | "--" :: rest -> rest
+    | ("-L" | "-P") :: rest -> (match rest with "--" :: r -> r | r -> r)
+    | rest -> rest in
   let target =
     match args with
     | [] -> (match State.get st "HOME" with

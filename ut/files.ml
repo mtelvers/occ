@@ -61,8 +61,12 @@ let copy_file ~preserve src dst =
   | Unix.S_LNK -> Unix.symlink (Unix.readlink src) dst
   | _ ->
       let ic = open_in_bin src in
+      (* A new copy is created with the source's permission bits, which
+         the file mode creation mask then reduces, so an executable stays
+         executable; an existing destination keeps the mode it had.
+         Getting this wrong leaves a copied program unrunnable. *)
       let oc = open_out_gen [ Open_wronly; Open_creat; Open_trunc; Open_binary ]
-          (if preserve then st.Unix.st_perm else 0o666) dst in
+          st.Unix.st_perm dst in
       let chunk = Bytes.create 65536 in
       let rec go () =
         let k = input ic chunk 0 65536 in

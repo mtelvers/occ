@@ -17,6 +17,11 @@ for pair in cc:occ gcc:occ as:occas ar:occar ld:occld make:occmake sh:occsh; do
   name=${pair%%:*}; target=${pair#*:}
   ln -sf "$target" "$out/$name"
 done
+# occ looks for its own headers beside the binary, in the layout an
+# installation would have
+mkdir -p "$out/../share/occ"
+ln -sfn "$HERE/include" "$out/../share/occ/include"
+
 # every utility occutils holds, as a link named after it
 for u in $("$out/occutils" 2>&1 | sed -n 's/^utilities://p'); do
   ln -sf occutils "$out/$u"

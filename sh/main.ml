@@ -32,12 +32,18 @@ let apply_option st on letters =
     letters
 
 let leave st status =
-  (* the EXIT trap runs once, in the environment as it stands (2.11) *)
-  (match State.trap_of st "EXIT" with
-   | Some action when action <> "" ->
-       State.clear_trap st "EXIT";
-       ignore (Exec.run_text st action)
-   | _ -> ());
+  (* The EXIT trap runs once, in the environment as it stands (2.11).  It
+     may itself call exit, and then its status is the shell's: that is
+     how configure's trap reports the error it was cleaning up after. *)
+  let status =
+    match State.trap_of st "EXIT" with
+    | Some action when action <> "" ->
+        State.clear_trap st "EXIT";
+        (match Exec.run_text st action with
+         | _ -> status
+         | exception State.Exit_shell s -> s
+         | exception State.Error msg -> Printf.eprintf "sh: %s\n" msg; status)
+    | _ -> status in
   flush_all ();
   exit status
 

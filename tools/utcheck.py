@@ -244,6 +244,9 @@ CASES = [
     ("mkdir", ["-p", "d1"], ""),
     ("rmdir", ["d1/sub"], ""),
     ("cp", ["f1", "copy"], ""),
+    ("cp", ["prog", "copy"], ""),
+    ("cp", ["-p", "prog", "copy"], ""),
+    ("cp", ["prog", "f1"], ""),
     ("cp", ["f1", "f2", "d1"], ""),
     ("cp", ["-r", "d1", "d2"], ""),
     ("mv", ["f1", "moved"], ""),
@@ -295,6 +298,11 @@ def setup(d):
     os.mkdir(os.path.join(d, "d1", "sub"))
     with open(os.path.join(d, "d1", "inner.txt"), "w") as f:
         f.write("inner\n")
+    # an executable source, to see that a copy stays executable
+    prog = os.path.join(d, "prog")
+    with open(prog, "w") as f:
+        f.write("#!/bin/sh\necho hi\n")
+    os.chmod(prog, 0o755)
 
 
 def listing(d):
