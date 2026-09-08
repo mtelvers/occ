@@ -1,13 +1,17 @@
 (* occld: a static linker with the parts of ld's command line that gcc
    and the OCaml build use. *)
 
-let usage = "usage: occld [-o output] [-L dir] [-l lib] [-e entry] files...\n"
+let usage = "usage: occld [-r] [-o output] [-L dir] [-l lib] [-e entry] files...\n"
 
 let () =
   let output = ref "a.out" and entry = ref "_start" and search = ref [] and items = ref [] in
+  (* -r asks for another relocatable object rather than an executable,
+     which is a different job: see src/linker/partial.ml *)
+  let relocatable = ref false in
   let rec go = function
     | [] -> ()
     | "-o" :: f :: rest -> output := f; go rest
+    | ("-r" | "-i" | "--relocatable") :: rest -> relocatable := true; go rest
     | "-e" :: e :: rest -> entry := e; go rest
     | "-L" :: d :: rest -> search := !search @ [ d ]; go rest
     | "-l" :: l :: rest -> items := Occ.Link.Library l :: !items; go rest
@@ -22,5 +26,7 @@ let () =
     | a :: rest -> items := (if Filename.check_suffix a ".a" then Occ.Link.Archive a else Occ.Link.Object a) :: !items; go rest in
   go (List.tl (Array.to_list Sys.argv));
   if !items = [] then begin prerr_string usage; exit 2 end;
-  try Occ.Link.link ~output:!output ~entry:!entry ~search:!search (List.rev !items)
+  try
+    if !relocatable then Occ.Partial.link ~output:!output ~search:!search (List.rev !items)
+    else Occ.Link.link ~output:!output ~entry:!entry ~search:!search (List.rev !items)
   with Failure msg -> prerr_endline ("occld: " ^ msg); exit 1
