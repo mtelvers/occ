@@ -124,6 +124,20 @@ debuggers. It links glibc's `libc.a`, `libgcc_eh.a` and Ubuntu's
 linker-script `libm.a`; statically linked `ocamlrun` and ocamlopt
 programs run, and gdb finds their source lines.
 
+`occld -r` is the other job: a partial link, whose output is another
+relocatable object. Sections of the same name are concatenated, the
+symbol tables merged, and every relocation rewritten to its new place
+and symbol; a relocation against a section symbol has its addend moved
+by the offset its piece was placed at. OCaml needs it for
+`ocamlopt -pack` and for `-output-complete-obj`.
+
+    tools/ldrcheck.sh dir [group] [suffix]   # occld -r vs ld -r
+
+compares the two on the same objects by what a later link reads: every
+section's size, the bytes of each, the symbol table, and every
+relocation's place, type, symbol and addend. Over the OCaml runtime's
+objects, four builds' worth, they agree.
+
 ## C library
 
 occ builds musl (1.2.5) entirely on its own: `./configure --target=x86_64
