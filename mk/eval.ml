@@ -266,6 +266,7 @@ and parse_rule_body st line =
            let prereqs = Expand.words (expand st prereqs_s) and order = Expand.words (expand st order_s) in
            let is_pattern = List.exists (fun t -> String.contains t '%') targets in
            if List.mem ".PHONY" targets then List.iter (Rule.mark_phony st.rules) prereqs;
+           if List.mem ".SECONDEXPANSION" targets then st.rules.Rule.second_expansion <- true;
            make_rule targets prereqs order is_pattern)
 
 and top_colon line =

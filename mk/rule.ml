@@ -25,11 +25,12 @@ type t = {
   mutable explicit : rule list;     (* in file order *)
   mutable patterns : rule list;     (* pattern rules, in file order *)
   mutable tsvs : tsv list;          (* in file order *)
+  mutable second_expansion : bool;  (* .SECONDEXPANSION: re-expand prerequisites at build time *)
   phony : (string, unit) Hashtbl.t;
   by_target : (string, rule) Hashtbl.t;   (* first explicit rule defining each target *)
 }
 
-let create () = { explicit = []; patterns = []; tsvs = []; phony = Hashtbl.create 64; by_target = Hashtbl.create 256 }
+let create () = { explicit = []; patterns = []; tsvs = []; second_expansion = false; phony = Hashtbl.create 64; by_target = Hashtbl.create 256 }
 
 let add db (r : rule) =
   if r.is_pattern then db.patterns <- db.patterns @ [ r ]

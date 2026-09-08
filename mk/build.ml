@@ -84,15 +84,23 @@ let apply_tsv b t =
         | Some v -> Hashtbl.replace b.db.Value.vars name v
         | None -> Hashtbl.remove b.db.Value.vars name) (List.rev saved)
 
-(* set the automatic variables for a recipe (10.5.3) *)
+(* the directory and file halves of an automatic variable (10.5.3) *)
+let dirpart s = match String.rindex_opt s '/' with Some i -> String.sub s 0 i | None -> "."
+let filepart s = match String.rindex_opt s '/' with Some i -> String.sub s (i + 1) (String.length s - i - 1) | None -> s
+let each f s = String.concat " " (List.map f (String.split_on_char ' ' s))
+
+(* set the automatic variables for a recipe (10.5.3), including the D/F
+   directory and file variants *)
 let set_automatic b ~target ~prereqs ~newer ~stem =
   let set n v = Value.set b.db ~flavour:Value.Simple ~origin:Value.Automatic n v in
-  set "@" target;
-  set "<" (match prereqs with p :: _ -> p | [] -> "");
-  set "^" (String.concat " " prereqs);
-  set "+" (String.concat " " prereqs);
+  let first = match prereqs with p :: _ -> p | [] -> "" in
+  let all = String.concat " " prereqs in
+  set "@" target; set "@D" (dirpart target); set "@F" (filepart target);
+  set "<" first; set "<D" (dirpart first); set "<F" (filepart first);
+  set "^" all; set "^D" (each dirpart all); set "^F" (each filepart all);
+  set "+" all;
   set "?" (String.concat " " newer);
-  set "*" stem
+  set "*" stem; set "*D" (dirpart stem); set "*F" (filepart stem)
 
 let run_recipe b ~target ~lines =
   let rec go = function
@@ -153,6 +161,15 @@ and update_uncached b t =
       (* how already substituted the stem into a combined rule's prerequisites *)
       let prereqs = r.prereqs in
       let order = r.order_only in
+      (* .SECONDEXPANSION: prerequisites are expanded again now, with the
+         target's automatic variables available (e.g. .dep/$(@D)) *)
+      let prereqs, order =
+        if b.rules.Rule.second_expansion then begin
+          set_automatic b ~target:t ~prereqs ~newer:[] ~stem;
+          let reexp lst = List.concat_map (fun p ->
+              Expand.words (Expand.expand { Expand.db = b.db; call_stack = []; expanding = Hashtbl.create 4 } p)) lst in
+          reexp prereqs, reexp order
+        end else prereqs, order in
       (* build prerequisites first *)
       let prereq_rebuilt = List.map (fun p -> let rb = update b p in (p, rb)) (prereqs @ order) in
       if b.failed && not b.keep_going then false
