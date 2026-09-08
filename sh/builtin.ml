@@ -254,20 +254,32 @@ let read_builtin st args =
   let raw = List.mem "-r" args in
   let names = List.filter (fun a -> a <> "-r") args in
   let names = if names = [] then [ "REPLY" ] else names in
-  (* one line, honouring the backslash continuation unless -r *)
+  (* One line, honouring the backslash continuation unless -r.  The
+     bytes are taken one at a time from the descriptor rather than
+     through a buffered channel: `read' must leave everything after the
+     newline where it is, because the next command in the script reads
+     the same input -- a `while read' loop over a pipe would otherwise
+     swallow what the commands inside it were to be given. *)
   let b = Buffer.create 128 in
   let eof = ref false in
+  let byte = Bytes.create 1 in
+  let next () =
+    match Unix.read Unix.stdin byte 0 1 with
+    | 1 -> Some (Bytes.get byte 0)
+    | _ -> None
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> Some '\000'
+    | exception _ -> None in
   let finished = ref false in
   while not !finished do
-    match input_char stdin with
-    | '\n' -> finished := true
-    | '\\' when not raw ->
-        (match input_char stdin with
-         | '\n' -> ()                         (* a continuation: read on *)
-         | c -> Buffer.add_char b c
-         | exception End_of_file -> Buffer.add_char b '\\'; eof := true; finished := true)
-    | c -> Buffer.add_char b c
-    | exception End_of_file -> eof := true; finished := true
+    match next () with
+    | Some '\n' -> finished := true
+    | Some '\\' when not raw ->
+        (match next () with
+         | Some '\n' -> ()                    (* a continuation: read on *)
+         | Some c -> Buffer.add_char b c
+         | None -> Buffer.add_char b '\\'; eof := true; finished := true)
+    | Some c -> Buffer.add_char b c
+    | None -> eof := true; finished := true
   done;
   let line = Buffer.contents b in
   (* split into as many fields as there are names, the last taking the rest *)

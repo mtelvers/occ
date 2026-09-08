@@ -10,10 +10,15 @@ before code generation sees it. There is one intermediate representation,
 a one-page linear-scan register allocator, a few peepholes, and no
 dependency outside the OCaml standard library. The occ-built OCaml
 bytecode interpreter runs about 2.5 times slower than gcc's `-O2` build,
-down from 6 times with everything in frame slots. x86-64 Linux, System V ABI. The assembler
-(`occas`, byte-identical to GNU as on everything occ and ocamlopt
-produce), the archiver (`occar`) and a static linker (`occld`) are ours
-too, so a C program goes from source to executable without binutils.
+down from 6 times with everything in frame slots. x86-64 Linux, System V ABI.
+
+Everything the build runs is now ours as well: the assembler (`occas`,
+byte-identical to GNU as on everything occ and ocamlopt produce), the
+archiver (`occar`), a static linker (`occld`), a make (`occmake`), a
+POSIX shell (`occsh`) and the utilities the build calls (`occutils`:
+sed, awk, grep, diff, sort, tr, cp, rm and twenty-odd more). With a
+PATH holding only those, `./configure && make world.opt` builds the
+OCaml compiler with no program written in C on it.
 
 ## Layout
 
@@ -21,6 +26,9 @@ too, so a C program goes from source to executable without binutils.
     bin/occas.ml         entry point of occas, the assembler (GNU as command line)
     bin/occar.ml         entry point of occar, the archiver (ar command line)
     bin/occld.ml         entry point of occld, the static linker (ld command line)
+    bin/occmake.ml       entry point of occmake, the make
+    bin/occsh.ml         entry point of occsh, the shell
+    bin/occutils.ml      entry point of occutils, every utility in one binary
     src/
       loc, diag          positions, diagnostics (first error stops)
       token, lexer       6.4, phases 1–3 and 7
@@ -41,8 +49,10 @@ too, so a C program goes from source to executable without binutils.
     include/             stdarg.h, stdatomic.h, stddef.h, ... (7.15–7.23)
     test/programs/       whole-program tests: // expect: N
     tools/mkcorpus.sh    preprocess the OCaml runtime into corpus/
+    tools/toolbin.sh     stage the whole toolchain in one directory
     doc/phases.md        phase map, budgets, order of work
     doc/extensions.md    everything the runtime needs beyond C11
+    doc/shell.md         what the OCaml build asks of a shell, measured
 
 ## Building and testing
 
@@ -147,6 +157,54 @@ executables produced with no GNU component anywhere in the toolchain, and
 `make tests` reports 1563 passed, 115 skipped (shared-library and dynlink
 tests under `--disable-shared`) and the one `native-debugger` failure the
 glibc build also has.
+
+## Shell, utilities and make
+
+`occsh` is a POSIX shell (IEEE Std 1003.1-2017, XCU chapter 2): quoting,
+the word expansions in the order 2.6 sets out, the grammar of 2.10,
+redirection including here-documents and descriptor duplication, traps,
+the built-in utilities, and the `-e` exemptions of 2.8.1. `occutils`
+holds the utilities in one binary, chosen by the name it is called
+under, among them the whole of `sed` and of `awk` and a `diff` that
+finds a shortest edit script by Myers' algorithm. `occmake` is a make in
+the GNU dialect, sized by the OCaml build's own Makefiles. See
+`sh/README.md`, `ut/README.md`, `mk/README.md`, and `doc/shell.md` for
+what the build was measured to need.
+
+Each is held to the same test as the assembler and the archiver: run the
+reference implementation and ours on the same input and compare the
+bytes.
+
+    tools/regexcheck.py                     # the regex engine vs GNU grep
+    tools/shcheck.sh                        # occsh vs /bin/sh, per clause group
+    tools/utcheck.py                        # occutils vs the GNU utilities
+    tools/mkcheck.sh                        # occmake vs GNU make (-n plans)
+
+    7740 regex cases, identical
+      17 shell scripts, identical output, error output, status and files
+     228 utility cases, identical but for four named differences
+       7 makefiles, identical plans
+
+## A build with no C
+
+`tools/toolbin.sh` stages the whole toolchain in one directory, with a
+link per utility named as the scripts call it, and the compiler's
+headers beside it in the layout an installation would have.
+
+    tools/toolbin.sh                        # stages ./toolbin
+    cd /path/to/ocaml
+    env -i PATH=~/occ/toolbin HOME=$HOME TERM=dumb \
+      CONFIG_SHELL=~/occ/toolbin/sh ~/occ/toolbin/sh \
+      ./configure --disable-shared --without-zstd
+    env -i PATH=~/occ/toolbin HOME=$HOME TERM=dumb \
+      ~/occ/toolbin/make SHELL=~/occ/toolbin/sh world.opt
+
+`configure` under that PATH finishes with status 0 and writes `m.h`,
+`s.h`, `exec.h`, `config.common.ml` and `ld.conf` identical to a run
+with dash and the GNU utilities; the rest of its output differs only in
+the names of the tools it found, which is what should differ. It never
+re-executes itself under another shell, which it does when the shell it
+was started in lacks something it needs.
 
 ## Definition of done
 

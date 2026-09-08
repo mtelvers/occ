@@ -186,14 +186,14 @@ and run_pipeline st ~final p =
   let status =
     match p.parts with
     | [ c ] -> if p.negate then in_condition (fun () -> run_command st c) else run_command st c
-    | cmds -> run_pipe st p.negate cmds in
+    | cmds -> run_pipe st cmds in
   let status = if p.negate then (if status = 0 then 1 else 0) else status in
   st.status <- status;
   if final && status <> 0 && st.opts.errexit && !condition_depth = 0 && not p.negate then
     raise (Exit_shell status);
   status
 
-and run_pipe st negate cmds =
+and run_pipe st cmds =
   let n = List.length cmds in
   let pids = ref [] in
   let carry = ref None in
@@ -220,7 +220,6 @@ and run_pipe st negate cmds =
           (match !carry with Some fd -> Unix.close fd | None -> ());
           (match wr with Some fd -> Unix.close fd | None -> ());
           carry := rd) cmds;
-  ignore negate;
   (* the status of a pipeline is that of its last command *)
   let statuses = List.rev_map (fun pid -> wait_for pid) !pids in
   match List.rev statuses with last :: _ -> last | [] -> 0

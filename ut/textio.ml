@@ -465,16 +465,22 @@ let sort _argv opts operands =
     if ordered lines then 0 else (warn "disorder"; 1)
   end else begin
     let sorted = List.stable_sort compare_lines lines in
-    let rec write previous = function
-      | [] -> ()
+    let rec keep previous acc = function
+      | [] -> List.rev acc
       | l :: rest ->
           let same = match previous with
             | Some p -> compare_lines p l = 0
             | None -> false in
-          if not (unique && same) then emit_line l;
-          write (Some l) rest in
-    write None sorted;
-    flush_out ();
+          keep (Some l) (if unique && same then acc else l :: acc) rest in
+    let result = keep None [] sorted in
+    (* -o names a file to write, which may be one of the inputs, so the
+       whole result is in hand before it is opened *)
+    (match Posix.Getopt.arg opts "o" with
+     | Some name ->
+         let oc = open_out_bin name in
+         List.iter (fun l -> output_string oc l; output_char oc '\n') result;
+         close_out oc
+     | None -> List.iter emit_line result; flush_out ());
     0
   end
 
