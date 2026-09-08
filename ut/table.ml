@@ -25,8 +25,11 @@ let utilities : entry list = [
   (* text *)
   e "cat" "uvetA" Textio.cat;
   e "tee" "ai" Textio.tee;
-  e "head" "n:c:qv" Textio.head;
-  e "tail" "n:c:qvf" Textio.tail;
+  (* the digits are the obsolete `head -5' form, which the utility itself
+     turns into -n 5; they have to be in the spec or option parsing
+     rejects them first *)
+  e "head" "n:c:qv0123456789" Textio.head;
+  e "tail" "n:c:qvf0123456789" Textio.tail;
   e "wc" "clmwL" Textio.wc;
   e "cut" "b:c:f:d:sn" Textio.cut;
   e "tr" "cCdst" Textio.tr;

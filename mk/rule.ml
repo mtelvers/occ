@@ -47,7 +47,16 @@ let create () = { explicit = []; patterns = []; tsvs = []; second_expansion = fa
    less than it was asked to.  Double-colon rules are the exception:
    each is independent and has its own recipe. *)
 let add db (r : rule) =
-  if r.is_pattern then db.patterns <- db.patterns @ [ r ]
+  if r.is_pattern then begin
+    (* A pattern rule with the same target and prerequisite patterns as
+       one already given replaces it, and one with no recipe cancels it
+       and is not kept (10.5.6).  Makefile.common opens with a recipeless
+       `%.o: %.c' to cancel make's own built-in rule, and a real one is
+       given later; a make that kept the first would find no recipe. *)
+    let same (x : rule) = x.targets = r.targets && x.prereqs = r.prereqs in
+    db.patterns <- List.filter (fun x -> not (same x)) db.patterns;
+    if r.recipe <> [] then db.patterns <- db.patterns @ [ r ]
+  end
   else begin
     db.explicit <- db.explicit @ [ r ];
     List.iter (fun t ->

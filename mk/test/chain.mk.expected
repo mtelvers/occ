@@ -1,0 +1,8 @@
+echo "mkdir gen"
+echo "GEN gen/one.c stem=one"
+echo "CC gen/one.c.o from gen/one.c stem=one"
+echo "touch gen/one.t from gen/one.c.o"
+echo "GEN gen/two.c stem=two"
+echo "CC gen/two.c.o from gen/two.c stem=two"
+echo "touch gen/two.t from gen/two.c.o"
+rm gen/one.c gen/one.c.o gen/two.c gen/two.c.o

@@ -240,6 +240,9 @@ and update_uncached b t =
 
 and update_body b t =
   let phony = Rule.is_phony b.rules t in
+  (* OCCMAKE_DEBUG names, for each target, how it was chosen and with
+     which prerequisites; the fastest way to see why a build differs *)
+  let debug = Sys.getenv_opt "OCCMAKE_DEBUG" <> None in
   match how b t with
   | Source ->
       if exists t then false
@@ -252,6 +255,11 @@ and update_body b t =
       (* A file that only a pattern rule knows about, that no rule names
          and that was not asked for, exists only as a link in a chain and
          is removed once the build is done (10.4). *)
+      if debug then
+        Printf.eprintf "occmake: %s: %s prereqs=[%s] order=[%s] recipe=%d\n" t
+          (match h with Implicit (_, s) -> "implicit stem=" ^ s | _ -> "explicit")
+          (String.concat " " r.prereqs) (String.concat " " r.order_only)
+          (List.length r.recipe);
       (match h with
        | Implicit _ when not (Hashtbl.mem b.mentioned t) && not (Hashtbl.mem b.goals t)
                          && not (Rule.is_precious b.rules t) && not (exists t) ->
@@ -298,7 +306,13 @@ and update_body b t =
            nothing is newer it is up to date where it was found (4.5.3). *)
         let must = phony || locate b t = None || newer <> [] || any_prereq_rebuilt in
         if must && r.recipe <> [] then begin
+          if debug then
+            Printf.eprintf "occmake: %s: running with prereqs=[%s]\n  recipe: %s\n" t
+              (String.concat " " prereqs) (String.concat "\n  recipe: " r.recipe);
           set_automatic b ~target:t ~prereqs ~newer:(if newer = [] then prereqs else newer) ~stem;
+          if debug then
+            Printf.eprintf "occmake: %s: automatics @=[%s] <=[%s] ^=[%s]\n" t
+              (Value.get b.db "@") (Value.get b.db "<") (Value.get b.db "^");
           let ok = if b.question then false else run_recipe b ~target:t ~lines:r.recipe in
           if b.question then (b.failed <- true; true)
           else if ok then true

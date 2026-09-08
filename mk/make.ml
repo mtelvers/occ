@@ -150,7 +150,12 @@ let run argv =
    | None -> ());
   let db = Value.create () in
   default_variables db;
-  List.iter (fun (n, v) -> Value.set db ~origin:Value.Command_line ~flavour:Value.Simple n v) o.overrides;
+  (* A variable given on the command line is recursively expanded, like
+     one written with '=': the build passes
+     OCAMLRUN='$(ROOTDIR)/boot/ocamlrun' down to a sub-make and expects
+     the sub-make to expand it there (9.5). *)
+  List.iter (fun (n, v) ->
+      Value.set db ~origin:Value.Command_line ~flavour:Value.Recursive n v) o.overrides;
   (* MAKEFLAGS/goal export for recursion *)
   (* A sub-make sees one more level and the flags in force; both go into
      the environment, since the recipe that starts it is a child. *)
