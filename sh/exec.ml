@@ -159,7 +159,13 @@ and run_stmt st stmt =
     | 0 ->
         st.subshell <- true;
         st.traps <- [];
-        let status = try run_and_or st stmt.ao with Exit_shell k -> k in
+        (* Without job control, a command run asynchronously has SIGINT
+           and SIGQUIT ignored (2.11), so that an interrupt meant for the
+           script does not also stop what it started; a program that
+           wants them installs its own handler and overrides this. *)
+        (try Sys.set_signal Sys.sigint Sys.Signal_ignore with _ -> ());
+        (try Sys.set_signal Sys.sigquit Sys.Signal_ignore with _ -> ());
+        let status = try run_replaceable st stmt.ao with Exit_shell k -> k in
         exit status
     | pid -> st.last_bg <- pid; st.status <- 0; 0
   end else begin
@@ -185,7 +191,9 @@ and run_and_or st ao =
 and run_pipeline st ~final p =
   let status =
     match p.parts with
-    | [ c ] -> if p.negate then in_condition (fun () -> run_command st c) else run_command st c
+    | [ c ] ->
+        if p.negate then in_condition (fun () -> run_command ~replace:false st c)
+        else run_command ~replace:false st c
     | cmds -> run_pipe st cmds in
   let status = if p.negate then (if status = 0 then 1 else 0) else status in
   st.status <- status;
@@ -213,7 +221,7 @@ and run_pipe st cmds =
           (match rd with Some fd -> Unix.close fd | None -> ());
           st.subshell <- true;
           st.traps <- [];
-          let status = try run_command st c with Exit_shell k -> k in
+          let status = try run_command ~replace:true st c with Exit_shell k -> k in
           exit status
       | pid ->
           pids := pid :: !pids;
@@ -232,9 +240,18 @@ and wait_for pid =
   | exception Unix.Unix_error (Unix.EINTR, _, _) -> wait_for pid
   | exception _ -> 127
 
-and run_command st cmd =
+(* A process that exists only to run one command lets that command
+   replace it, rather than forking again: that is what makes $! the pid
+   of `prog &' rather than of an intervening shell, which a script that
+   signals the job it started depends on. *)
+and run_replaceable st ao =
+  match ao.rest, ao.first with
+  | [], { negate = false; parts = [ c ] } -> run_command ~replace:true st c
+  | _ -> run_and_or st ao
+
+and run_command ~replace st cmd =
   match cmd with
-  | Simple s -> run_simple st s
+  | Simple s -> run_simple ~replace st s
   | Group (prog, redirs) -> with_redirs st redirs (fun () -> run_program st prog)
   | Subshell (prog, redirs) -> run_subshell st prog redirs
   | Funcdef (name, body) ->
@@ -307,13 +324,20 @@ and run_subshell st prog redirs =
       st.subshell <- true;
       st.traps <- [];
       let status =
-        try ignore (apply st redirs); run_program st prog with
+        try
+          ignore (apply st redirs);
+          (* a subshell holding one plain command also lets it replace
+             the process *)
+          match prog with
+          | [ { ao; async = false } ] -> run_replaceable st ao
+          | _ -> run_program st prog
+        with
         | Exit_shell k -> k
         | State.Error msg -> Printf.eprintf "%s: %s\n" st.arg0 msg; 2 in
       exit status
   | pid -> wait_for pid
 
-and run_simple st s =
+and run_simple ~replace st (s : simple) =
   State.set st "LINENO" (string_of_int s.line);
   let fields =
     match Expand.words st s.words with
@@ -343,7 +367,7 @@ and run_simple st s =
       | None ->
           match Builtin.find name with
           | Some (kind, f) -> run_builtin st kind f name args s.assigns s.redirs
-          | None -> run_external st name fields s.assigns s.redirs
+          | None -> run_external ~replace st name fields s.assigns s.redirs
   end
 
 (* `exec': the redirections stay in force, and with a command the shell
@@ -418,14 +442,15 @@ and run_function st body args assigns redirs =
             | None -> Hashtbl.remove st.vars n) snapshot)
     (fun () ->
        List.iter (fun (n, v) -> State.set st n v) values;
-       match run_command st body with
+       match run_command ~replace:false st body with
        | s -> s
        | exception Return k -> k)
 
-and run_external st name fields assigns redirs =
+and run_external ~replace st name fields assigns redirs =
   let values = List.map (fun (n, w) -> (n, Expand.to_string st w)) assigns in
   flush_all ();
-  match Unix.fork () with
+  (* [replace] means this process was made for this command alone *)
+  match (if replace then 0 else Unix.fork ()) with
   | 0 ->
       (try
          List.iter (fun (n, v) -> State.set st ~export:true n v) values;
@@ -512,4 +537,4 @@ let () =
       | name :: args ->
           (match Builtin.find name with
            | Some (_, f) -> f st args
-           | None -> run_external st name argv [] []))
+           | None -> run_external ~replace:false st name argv [] []))

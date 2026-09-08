@@ -443,16 +443,16 @@ let wait_builtin _st args =
     | exception _ -> 127 in
   match args with
   | [] ->
-      (* every child, and the status of the last one *)
-      let last = ref 0 in
+      (* Every child, and then zero whatever they returned: XCU wait
+         gives a status only for the process it was asked about.  A hook
+         script that ends in `wait' would otherwise report the status of
+         the job it was waiting for as its own. *)
       let rec go () =
         match Unix.waitpid [] (-1) with
-        | (_, Unix.WEXITED c) -> last := c; go ()
-        | (_, Unix.WSIGNALED s) -> last := 128 + s; go ()
-        | (_, Unix.WSTOPPED s) -> last := 128 + s; go ()
+        | _ -> go ()
         | exception _ -> () in
       go ();
-      !last
+      0
   | pids ->
       List.fold_left (fun _ p ->
           match int_of_string_opt (if p <> "" && p.[0] = '%' then String.sub p 1 (String.length p - 1) else p) with
