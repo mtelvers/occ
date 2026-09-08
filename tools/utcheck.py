@@ -195,6 +195,15 @@ CASES = [
     ("awk", ["BEGIN {print 1/3}"], ""),
     ("awk", ["BEGIN {print 100000 * 100000}"], ""),
     ("awk", ["BEGIN {print -3 % 2}"], ""),
+    ("awk", ["BEGIN {printf \"%c|%c|%c\\n\", 65, \"65\", \"A\"}"], ""),
+    ("awk", ["{printf \"%c|%c\\n\", $1, $1+0}"], "65\n"),
+    ("awk", ["BEGIN {printf \"%5.2f|%-8s|%03d\\n\", 3.14159, \"ab\", 7}"], ""),
+    ("awk", ["{while ((getline line) > 0) n++} END {print NR, n}"], TEXT),
+    ("awk", ["BEGIN {x = \"10\"; y = 9; print (x < y), (x+0 < y)}"], ""),
+    ("awk", ["BEGIN {print length()}"], ""),
+    ("awk", ["{print; nextfile}"], TEXT),
+    ("awk", ["END {print $0}"], TEXT),
+    ("awk", ["BEGIN {SUBSEP=\":\"; a[1,2]=3; for (k in a) print k, a[k]}"], ""),
 
     # cmp and diff
     ("cmp", ["f1", "f1"], ""),

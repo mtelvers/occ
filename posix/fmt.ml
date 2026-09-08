@@ -115,13 +115,24 @@ let pad ~left ~zero ~width s =
 
 (* printf: the output, and any diagnostics.  The format is used again from
    the start while arguments remain, and a conversion with no argument
-   left behaves as if given an empty string or zero (XCU printf). *)
-let printf format args =
+   left behaves as if given an empty string or zero (XCU printf).
+
+   [numeric] says, for the argument at that position, whether it is a
+   number rather than a string, which changes one conversion: %c takes
+   the first character of a string but the character of that code from a
+   number.  The shell's printf has only strings, so it leaves this out;
+   awk, whose values carry a type, supplies it. *)
+let printf ?(numeric = fun _ -> false) format args =
   let b = Buffer.create 256 in
   let errors = ref [] in
   let queue = ref args in
   let used = ref false in
-  let next () = match !queue with [] -> "" | a :: t -> queue := t; used := true; a in
+  let taken = ref 0 in
+  let next () =
+    match !queue with
+    | [] -> ""
+    | a :: t -> queue := t; used := true; incr taken; a in
+  let last_was_numeric () = numeric (!taken - 1) in
   let n = String.length format in
   let rec pass () =
     let i = ref 0 in
@@ -183,7 +194,12 @@ let printf format args =
               | 'X' ->
                   let s = Printf.sprintf "%X" (number (next ())) in
                   if !alt then "0X" ^ s else s
-              | 'c' -> let a = next () in if a = "" then "" else String.make 1 a.[0]
+              | 'c' ->
+                  let a = next () in
+                  if last_was_numeric () then
+                    (let v = number a in
+                     if v = 0 then "" else String.make 1 (Char.chr (v land 255)))
+                  else if a = "" then "" else String.make 1 a.[0]
               | 's' ->
                   let a = next () in
                   if prec >= 0 && prec < String.length a then String.sub a 0 prec else a

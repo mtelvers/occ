@@ -939,10 +939,14 @@ let output m redirect text =
 
 (* ---------- evaluating ---------- *)
 
+(* An array subscript is the arguments joined by SUBSEP, whose default is
+   the separator of XCU awk; a program may set it. *)
 let subscript m subs values =
-  ignore m;
   ignore subs;
-  String.concat "\028" values          (* SUBSEP's default *)
+  let sep = match get_var m "SUBSEP" with
+    | Uninit -> "\028"
+    | v -> to_text m v in
+  String.concat sep values
 
 let rec eval m e : value =
   match e with
@@ -1169,7 +1173,11 @@ and builtin m name args =
   | "sprintf" ->
       let format = text 0 in
       let rest = List.filteri (fun i _ -> i > 0) args in
-      let (out, errors) = Posix.Fmt.printf format (List.map (fun e -> to_text m (eval m e)) rest) in
+      let values = List.map (fun e -> eval m e) rest in
+      let numbers = Array.of_list (List.map (fun v -> match v with Num _ | Numeric_string _ -> true | _ -> false) values) in
+      let (out, errors) =
+        Posix.Fmt.printf ~numeric:(fun i -> i >= 0 && i < Array.length numbers && numbers.(i))
+          format (List.map (to_text m) values) in
       List.iter (fun msg -> warn "%s" msg) errors;
       Str out
   | "sin" -> Num (sin (number 0))
@@ -1340,7 +1348,13 @@ and run m s =
        | [] -> bad "printf: no format"
        | format :: rest ->
            let f = to_text m (eval m format) in
-           let (text, errors) = Posix.Fmt.printf f (List.map (fun e -> to_text m (eval m e)) rest) in
+           let values = List.map (fun e -> eval m e) rest in
+           (* %c gives the character of a number's code, and the first
+              character of a string's text *)
+           let numbers = Array.of_list (List.map (fun v -> match v with Num _ | Numeric_string _ -> true | _ -> false) values) in
+           let (text, errors) =
+             Posix.Fmt.printf ~numeric:(fun i -> i >= 0 && i < Array.length numbers && numbers.(i))
+               f (List.map (to_text m) values) in
            List.iter (fun msg -> warn "%s" msg) errors;
            output m (redirect_of m redirect) text)
   | Sif (c, a, b) ->
