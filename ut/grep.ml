@@ -57,18 +57,11 @@ let find ?(from = 0) ~whole ~word (m : matcher) line =
           else Some (a, b) in
   go from
 
-let main argv =
-  let sp = Posix.Getopt.spec "EFce:f:HhilnoqsvwxaG" in
-  let opts, operands =
-    match Posix.Getopt.parse sp (Array.sub argv 1 (Array.length argv - 1)) with
-    | r -> r
-    | exception Posix.Getopt.Error msg ->
-        Printf.eprintf "%s: %s\nusage: %s [-EFcHhilnoqsvwx] [-e pattern] [-f file] [pattern] [file...]\n"
-          !prog msg !prog;
-        raise (Fail 2) in
+let main_opts _argv opts operands =
   let has = Posix.Getopt.has opts in
   let kind = if has "F" then Fixed else if has "E" then Ere else Bre in
-  let icase = has "i" and invert = has "v" and quiet = has "q" in
+  let icase = has "i" and invert = has "v" in
+  let quiet = has "q" || has "quiet" || has "silent" in
   let count_only = has "c" and list_only = has "l" and number = has "n" in
   let only = has "o" and whole = has "x" and word = has "w" in
   let silent = has "s" in

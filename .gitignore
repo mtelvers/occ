@@ -5,3 +5,4 @@ corpus/
 doc/
 # test binaries the runner leaves if interrupted
 occtest*
+toolbin/

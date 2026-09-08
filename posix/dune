@@ -2,4 +2,5 @@
 ; syntaxes, the pattern-matching notation, and option parsing.
 (library
  (name posix)
- (flags (:standard -w +a-4-9-40-41-42-44-45-70 -strict-sequence)))
+ (flags (:standard -w +a-4-9-40-41-42-44-45-70 -strict-sequence))
+ (libraries unix))

@@ -17,18 +17,25 @@
 
 exception Error of string
 
+(* Whether an option takes an argument.  A few of these utilities have
+   one whose argument is optional and must be joined to it, as sed's -i
+   is: `sed -i' and `sed -i.bak' are both valid, and `sed -i script' is
+   not the script being given to -i. *)
+type arg_kind = No_arg | Required | Optional
+
 type spec = {
-  short : (char * bool) list;          (* option letter, takes an argument *)
+  short : (char * arg_kind) list;
   long : (string * bool) list;
 }
 
-(* "n" or "e:" style: a letter followed by ':' takes an argument *)
+(* "n" for no argument, "e:" for one, "i::" for an optional one *)
 let short_spec s =
   let n = String.length s in
   let rec go i acc =
     if i >= n then List.rev acc
-    else if i + 1 < n && s.[i + 1] = ':' then go (i + 2) ((s.[i], true) :: acc)
-    else go (i + 1) ((s.[i], false) :: acc) in
+    else if i + 2 < n && s.[i + 1] = ':' && s.[i + 2] = ':' then go (i + 3) ((s.[i], Optional) :: acc)
+    else if i + 1 < n && s.[i + 1] = ':' then go (i + 2) ((s.[i], Required) :: acc)
+    else go (i + 1) ((s.[i], No_arg) :: acc) in
   go 0 []
 
 let spec ?(long = []) shorts = { short = short_spec shorts; long }
@@ -75,8 +82,14 @@ let parse ?(permute = true) sp argv =
         let c = a.[!j] in
         match List.assoc_opt c sp.short with
         | None -> raise (Error (Printf.sprintf "invalid option -- '%c'" c))
-        | Some false -> opts := (String.make 1 c, None) :: !opts; incr j
-        | Some true ->
+        | Some No_arg -> opts := (String.make 1 c, None) :: !opts; incr j
+        | Some Optional ->
+            (* only text joined to the letter counts as its argument *)
+            if !j + 1 < len then begin
+              opts := (String.make 1 c, Some (String.sub a (!j + 1) (len - !j - 1))) :: !opts;
+              j := len
+            end else (opts := (String.make 1 c, Some "") :: !opts; incr j)
+        | Some Required ->
             if !j + 1 < len then begin
               (* the rest of this argument is the option's argument *)
               opts := (String.make 1 c, Some (String.sub a (!j + 1) (len - !j - 1))) :: !opts;
