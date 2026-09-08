@@ -140,6 +140,14 @@ for crt1.o, crti.o, crtn.o and libc.a, with no gcc or glibc files. C
 programs using stdio, malloc, pthreads with thread-local storage and libm
 build and run this way.
 
+OCaml itself then builds against the occ-built musl
+(`./configure --disable-shared --without-zstd CC=occ AR=occar` with the
+sysroot): `ocamlrun` and `ocamlopt.opt` come out as statically linked musl
+executables produced with no GNU component anywhere in the toolchain, and
+`make tests` reports 1563 passed, 115 skipped (shared-library and dynlink
+tests under `--disable-shared`) and the one `native-debugger` failure the
+glibc build also has.
+
 ## Definition of done
 
     ./configure CC=$PWD/_build/default/bin/main.exe   # in the OCaml tree
