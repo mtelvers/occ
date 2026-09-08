@@ -209,9 +209,11 @@ type state = {
 
 let same_tokens a b =
   List.length a = List.length b
-  && List.for_all2 (fun x y -> x.text = y.text && x.kind = y.kind && (x.ws = y.ws)) a b
+  && List.for_all2 (fun x y -> x.text = y.text && x.kind = y.kind) a b
 
-(* 6.10.3p2: a redefinition must be identical, spelling and whitespace. *)
+(* 6.10.3p2 also requires whitespace separation to match token for token;
+   like gcc and clang, the redefinition warning ignores that, so a header
+   spelling of NULL with or without a space before the star does not clash. *)
 let define st loc name (m : macro) =
   (match Hashtbl.find_opt st.macros name, m with
    | Some (Object a), Object b when same_tokens a b -> ()
