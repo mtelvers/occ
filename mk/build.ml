@@ -47,17 +47,24 @@ let search_dirs b name =
   from_vpath @ general
 
 (* Where [name] can be found: itself if it is there, else the first
-   directory of the search path that holds it.  4.5.3: a file found this
-   way is used as a prerequisite, but a target that has to be rebuilt is
-   rebuilt in the current directory, so this is only ever consulted for
-   files that already exist. *)
+   directory of the search path that holds it.  A directory counts as
+   holding the file if the file is there or if a rule names it there,
+   which is what makes the OCaml build work: it asks for `ocamlprof.cmo'
+   while its .depend names `tools/ocamlprof.cmo', and tools is on VPATH,
+   so that is the file meant. *)
 let locate b name =
   if exists name then Some name
   else if not (Filename.is_relative name) then None
   else
     List.find_map (fun d ->
         let p = Filename.concat d name in
-        if exists p then Some p else None) (search_dirs b name)
+        if exists p || Hashtbl.mem b.rules.Rule.by_target p then Some p else None)
+      (search_dirs b name)
+
+(* the name a prerequisite or a goal really stands for *)
+let resolve b p =
+  if exists p || Hashtbl.mem b.rules.Rule.by_target p || Rule.is_phony b.rules p then p
+  else match locate b p with Some found -> found | None -> p
 
 (* how a target will be built: an explicit rule, a matched pattern rule
    (with its stem), or nothing *)
@@ -281,12 +288,8 @@ and update_body b t =
          rule of its own may be somewhere on the search path; if it is,
          that is the name the recipe and the automatic variables see
          (4.5.3). *)
-      let resolve p =
-        if exists p || Hashtbl.mem b.rules.Rule.by_target p
-           || Rule.is_phony b.rules p then p
-        else match locate b p with Some found -> found | None -> p in
-      let prereqs = List.map resolve prereqs in
-      let order = List.map resolve order in
+      let prereqs = List.map (resolve b) prereqs in
+      let order = List.map (resolve b) order in
       (* build prerequisites first *)
       let prereq_rebuilt = List.map (fun p -> let rb = update b p in (p, rb)) (prereqs @ order) in
       if b.failed && not b.keep_going then false
@@ -323,8 +326,12 @@ and update_body b t =
 
 let build ~db ~rules ~keep_going ~dry_run ~silent ~question ~name goals =
   let mentioned = Hashtbl.create 512 in
+  (* A file the makefile writes out by name -- as a target or as a
+     prerequisite -- is not an intermediate, however it came to be built:
+     only a file that just a pattern rule knows about is (10.4). *)
   List.iter (fun (r : Rule.rule) ->
-      List.iter (fun p -> Hashtbl.replace mentioned p ()) (r.prereqs @ r.order_only))
+      List.iter (fun p -> Hashtbl.replace mentioned p ())
+        (r.targets @ r.prereqs @ r.order_only))
     rules.Rule.explicit;
   let goal_set = Hashtbl.create 8 in
   List.iter (fun g -> Hashtbl.replace goal_set g ()) goals;
@@ -332,7 +339,7 @@ let build ~db ~rules ~keep_going ~dry_run ~silent ~question ~name goals =
             keep_going; dry_run; silent; question; name;
             intermediates = Hashtbl.create 64; mentioned; goals = goal_set;
             failed = false } in
-  List.iter (fun g -> ignore (update b g)) goals;
+  List.iter (fun g -> ignore (update b (resolve b g))) goals;
   (* The intermediates go last, in one report, as make does.  Their order
      here is settled rather than the reference's, which is its own
      internal one. *)
