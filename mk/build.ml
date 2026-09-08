@@ -258,7 +258,11 @@ and update_body b t =
         b.failed <- true; false
       end
   | Explicit r | Implicit (r, _) as h ->
-      let stem = match h with Implicit (_, s) -> s | _ -> "" in
+      (* the stem: the pattern rule's, or the one a static pattern rule
+         recorded when it was expanded into explicit rules *)
+      let stem = match h with
+        | Implicit (_, s) -> s
+        | _ -> r.stem in
       (* A file that only a pattern rule knows about, that no rule names
          and that was not asked for, exists only as a link in a chain and
          is removed once the build is done (10.4). *)

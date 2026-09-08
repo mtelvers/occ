@@ -131,7 +131,8 @@ let finish_recipe st =
            match Func.pattern_match tpat t with
            | Some stem ->
                let prereqs = List.map (fun p -> Func.pattern_subst p stem) ppats in
-               Rule.add st.rules { r with Rule.targets = [ t ]; prereqs; is_pattern = false }
+               Rule.add st.rules
+                 { r with Rule.targets = [ t ]; prereqs; is_pattern = false; stem }
            | None -> ()) targets
    | Some r, None -> Rule.add st.rules r
    | None, _ -> ());
@@ -324,7 +325,7 @@ and parse_rule_body st line =
         let order = List.map Func.normalise order in
         finish_recipe st;
         let r = { Rule.targets; prereqs; order_only = order; recipe = (match inline_recipe with Some c -> [ c ] | None -> []); is_pattern;
-                  is_double_colon = is_double; phony = false } in
+                  is_double_colon = is_double; phony = false; stem = "" } in
         st.current <- Some r;
         if st.default_goal = None && not is_pattern then
           (match List.find_opt (fun t -> not (starts_with "." t)) targets with Some g -> st.default_goal <- Some g | None -> ()) in
@@ -334,7 +335,7 @@ and parse_rule_body st line =
            let ppats = Expand.words (expand st ppat) in
            finish_recipe st;
            (* the shared recipe is collected next and applied per target in finish_recipe *)
-           st.current <- Some { Rule.targets; prereqs = []; order_only = []; recipe = []; is_pattern = false; is_double_colon = is_double; phony = false };
+           st.current <- Some { Rule.targets; prereqs = []; order_only = []; recipe = []; is_pattern = false; is_double_colon = is_double; phony = false; stem = "" };
            st.static <- Some (tpat, ppats, targets)
        | None ->
            let prereqs = Expand.words (expand st prereqs_s) and order = Expand.words (expand st order_s) in

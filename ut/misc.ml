@@ -257,17 +257,11 @@ let expr _argv _opts operands =
     while peek () = Some ":" do
       incr pos;
       let pattern = primary () in
-      let re = Posix.Regex.compile ("^" ^ pattern) in
-      left := (match Posix.Regex.search re !left 0 with
-          | Some groups ->
-              if Array.length groups > 1 then
-                (match groups.(1) with
-                 | (a, b) when a >= 0 -> String.sub !left a (b - a)
-                 | _ -> "")
-              else string_of_int (snd groups.(0) - fst groups.(0))
-          | None -> if Posix.Regex.ngroups re > 0 then "" else "0")
+      left := matched !left pattern
     done;
     !left
+  (* The four string functions of XCU expr, whose names are keywords
+     rather than operators. *)
   and primary () =
     match peek () with
     | None -> raise (Expr_error "syntax error")
@@ -276,7 +270,44 @@ let expr _argv _opts operands =
         let v = disjunction () in
         if not (eat ")") then raise (Expr_error "syntax error: expected )");
         v
-    | Some v -> incr pos; v in
+    | Some "length" -> incr pos; string_of_int (String.length (primary ()))
+    | Some "substr" ->
+        incr pos;
+        let s = primary () in
+        let m = expr_num (primary ()) in
+        let n = expr_num (primary ()) in
+        let len = String.length s in
+        if m < 1 || m > len || n < 1 then ""
+        else String.sub s (m - 1) (min n (len - m + 1))
+    | Some "index" ->
+        incr pos;
+        let s = primary () in
+        let chars = primary () in
+        let rec go i =
+          if i >= String.length s then 0
+          else if String.contains chars s.[i] then i + 1
+          else go (i + 1) in
+        string_of_int (go 0)
+    | Some "match" ->
+        incr pos;
+        let s = primary () in
+        let pattern = primary () in
+        matched s pattern
+    | Some v -> incr pos; v
+
+  (* `s : re' and `match s re' are the same thing: the expression is
+     anchored at the start of the string, and gives the first
+     subexpression if there is one, or the length matched if not. *)
+  and matched subject pattern =
+    let re = Posix.Regex.compile ("^" ^ pattern) in
+    match Posix.Regex.search re subject 0 with
+    | Some groups ->
+        if Posix.Regex.ngroups re > 0 then
+          (match groups.(1) with
+           | (a, b) when a >= 0 -> String.sub subject a (b - a)
+           | _ -> "")
+        else string_of_int (snd groups.(0) - fst groups.(0))
+    | None -> if Posix.Regex.ngroups re > 0 then "" else "0" in
   match operands with
   | [] -> die 2 "usage: expr expression"
   | _ ->

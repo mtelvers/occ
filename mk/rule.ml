@@ -14,6 +14,10 @@ type rule = {
   is_pattern : bool;
   is_double_colon : bool;
   phony : bool;                 (* named in .PHONY *)
+  (* The stem, for the explicit rules a static pattern rule is expanded
+     into (4.12): they are ordinary rules, but $* in the recipe still
+     means the part the pattern matched. *)
+  stem : string;
 }
 
 (* a target-specific variable (6.11) or pattern-specific one (6.12):
@@ -75,6 +79,7 @@ let add db (r : rule) =
                 prereqs = first.prereqs @ second.prereqs;
                 order_only = first.order_only @ second.order_only;
                 recipe = (if r.recipe <> [] then r.recipe else existing.recipe);
+                stem = (if first.stem <> "" then first.stem else second.stem);
                 phony = existing.phony || r.phony })
       r.targets
   end
