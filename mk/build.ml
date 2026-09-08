@@ -171,7 +171,7 @@ let each f s = String.concat " " (List.map f (String.split_on_char ' ' s))
 
 (* set the automatic variables for a recipe (10.5.3), including the D/F
    directory and file variants *)
-let set_automatic b ~target ~prereqs ~newer ~stem =
+let set_automatic b ~target ~prereqs ~order ~newer ~stem =
   let set n v = Value.set b.db ~flavour:Value.Simple ~origin:Value.Automatic n v in
   let first = match prereqs with p :: _ -> p | [] -> "" in
   let all = String.concat " " prereqs in
@@ -179,6 +179,7 @@ let set_automatic b ~target ~prereqs ~newer ~stem =
   set "<" first; set "<D" (dirpart first); set "<F" (filepart first);
   set "^" all; set "^D" (each dirpart all); set "^F" (each filepart all);
   set "+" all;
+  set "|" (String.concat " " order);      (* the order-only prerequisites *)
   set "?" (String.concat " " newer);
   set "*" stem; set "*D" (dirpart stem); set "*F" (filepart stem)
 
@@ -283,7 +284,7 @@ and update_body b t =
          target's automatic variables available (e.g. .dep/$(@D)) *)
       let prereqs, order =
         if b.rules.Rule.second_expansion then begin
-          set_automatic b ~target:t ~prereqs ~newer:[] ~stem;
+          set_automatic b ~target:t ~prereqs ~order ~newer:[] ~stem;
           let reexp lst = List.concat_map (fun p ->
               Expand.words (Expand.expand { Expand.db = b.db; call_stack = []; expanding = Hashtbl.create 4 } p)) lst in
           reexp prereqs, reexp order
@@ -316,7 +317,8 @@ and update_body b t =
           if debug then
             Printf.eprintf "occmake: %s: running with prereqs=[%s]\n  recipe: %s\n" t
               (String.concat " " prereqs) (String.concat "\n  recipe: " r.recipe);
-          set_automatic b ~target:t ~prereqs ~newer:(if newer = [] then prereqs else newer) ~stem;
+          set_automatic b ~target:t ~prereqs ~order
+            ~newer:(if newer = [] then prereqs else newer) ~stem;
           if debug then
             Printf.eprintf "occmake: %s: automatics @=[%s] <=[%s] ^=[%s]\n" t
               (Value.get b.db "@") (Value.get b.db "<") (Value.get b.db "^");

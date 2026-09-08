@@ -25,6 +25,16 @@ type rule = {
    the unexpanded value *)
 type tsv = { pat : string; var : string; op : string; rhs : string }
 
+(* a static pattern rule while its recipe is being collected: the target
+   pattern, the prerequisite patterns and the order-only ones, and the
+   targets it names (4.12) *)
+type static = {
+  tpat : string;
+  ppats : string list;
+  opats : string list;
+  stargets : string list;
+}
+
 type t = {
   mutable explicit : rule list;     (* in file order *)
   mutable patterns : rule list;     (* pattern rules, in file order *)

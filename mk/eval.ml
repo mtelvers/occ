@@ -14,7 +14,7 @@ type state = {
   mutable current : Rule.rule option;   (* the rule whose recipe is being collected *)
   mutable include_dirs : string list;
   mutable default_goal : string option;
-  mutable static : (string * string list * string list) option;  (* static pattern: tpat, ppats, targets *)
+  mutable static : Rule.static option;  (* the static pattern rule whose recipe is being collected *)
 }
 
 let ctx st = { Expand.db = st.db; call_stack = []; expanding = Hashtbl.create 16 }
@@ -124,16 +124,19 @@ let assignment_op line =
 
 let finish_recipe st =
   (match st.current, st.static with
-   | Some r, Some (tpat, ppats, targets) ->
+   | Some r, Some sp ->
        (* a static pattern rule: the collected recipe applies to each named
           target, with prerequisites derived from its stem (4.12) *)
        List.iter (fun t ->
-           match Func.pattern_match tpat t with
+           match Func.pattern_match sp.Rule.tpat t with
            | Some stem ->
-               let prereqs = List.map (fun p -> Func.pattern_subst p stem) ppats in
+               let subst = List.map (fun p -> Func.pattern_subst p stem) in
                Rule.add st.rules
-                 { r with Rule.targets = [ t ]; prereqs; is_pattern = false; stem }
-           | None -> ()) targets
+                 { r with Rule.targets = [ t ];
+                          prereqs = subst sp.Rule.ppats;
+                          order_only = subst sp.Rule.opats;
+                          is_pattern = false; stem }
+           | None -> ()) sp.Rule.stargets
    | Some r, None -> Rule.add st.rules r
    | None, _ -> ());
   st.current <- None;
@@ -332,11 +335,18 @@ and parse_rule_body st line =
       (match static with
        | Some (tpat, ppat) ->
            let tpat = String.trim (expand st tpat) in
-           let ppats = Expand.words (expand st ppat) in
+           (* the prerequisite patterns may themselves be followed by
+              order-only ones after a bare '|' *)
+           let words = Expand.words (expand st ppat) in
+           let rec split before = function
+             | "|" :: after -> (List.rev before, after)
+             | w :: rest -> split (w :: before) rest
+             | [] -> (List.rev before, []) in
+           let (ppats, opats) = split [] words in
            finish_recipe st;
            (* the shared recipe is collected next and applied per target in finish_recipe *)
            st.current <- Some { Rule.targets; prereqs = []; order_only = []; recipe = []; is_pattern = false; is_double_colon = is_double; phony = false; stem = "" };
-           st.static <- Some (tpat, ppats, targets)
+           st.static <- Some { Rule.tpat; ppats; opats; stargets = targets }
        | None ->
            let prereqs = Expand.words (expand st prereqs_s) and order = Expand.words (expand st order_s) in
            let is_pattern = List.exists (fun t -> String.contains t '%') targets in
