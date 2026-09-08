@@ -1,13 +1,13 @@
 type stage = Preprocess | Compile | Assemble | Link
 type mode = Native | Delegate
 
-(* Preprocessing, compilation and assembly are native by default; linking
-   is left to gcc's driver, which knows where the C runtime files live.
-   OCC_NATIVE overrides the set ("none" delegates everything, for use as a
-   pure wrapper). *)
+(* Every stage is native by default: preprocessing, compilation, assembly
+   and (static) linking; shared objects are still gcc's job.  OCC_NATIVE
+   overrides the set ("none" delegates everything, for use as a pure
+   wrapper). *)
 let native_stages =
   match Sys.getenv_opt "OCC_NATIVE" with
-  | None | Some "" -> [ "pp"; "cc"; "as" ]
+  | None | Some "" -> [ "pp"; "cc"; "as"; "ld" ]
   | Some "none" -> []
   | Some s -> String.split_on_char ',' s
 
@@ -57,7 +57,7 @@ type options = {
 }
 
 let usage = "usage: occ [gcc-compatible options] files...\n\
-             environment: OCC_NATIVE=pp,cc,as,ld selects native stages (default pp,cc,as; \"none\" delegates all); OCC_CC=gcc\n"
+             environment: OCC_NATIVE=pp,cc,as,ld selects native stages (default all; \"none\" delegates all); OCC_CC=gcc\n"
 
 let parse_args argv =
   let o = {
@@ -216,10 +216,41 @@ let assemble o input output =
       if o.verbose then Printf.eprintf "occas %s -o %s\n" input output;
       Assemble.files [ input ] output
 
+(* Where the C runtime's start files and static libraries live.  The
+   native linker is static, so it links crt1.o, crti.o, crtbeginT.o, the
+   objects, then libgcc, libgcc_eh and libc, and crtend.o, crtn.o, the way
+   gcc -static does.  Shared objects are still gcc's job. *)
+let system_lib_dirs () =
+  let gcc_dirs =
+    let root = "/usr/lib/gcc/x86_64-linux-gnu" in
+    if Sys.file_exists root && Sys.is_directory root then
+      List.map (Filename.concat root) (List.sort (fun a b -> compare (int_of_string_opt b) (int_of_string_opt a)) (Array.to_list (Sys.readdir root)))
+    else [] in
+  gcc_dirs @ [ "/usr/lib/x86_64-linux-gnu"; "/lib/x86_64-linux-gnu"; "/usr/lib64"; "/usr/lib" ]
+
+let find_file dirs name =
+  match List.find_opt (fun d -> Sys.file_exists (Filename.concat d name)) dirs with
+  | Some d -> Filename.concat d name
+  | None -> failwith ("cannot find " ^ name)
+
 let link o objects output =
   match mode Link with
   | Delegate -> run o delegate_cc (o.passthrough @ objects @ o.link_args @ [ "-o"; output ])
-  | Native -> failwith "native link: not implemented (and probably never: ld does this)"
+  | Native when List.mem "-shared" o.passthrough -> run o delegate_cc (o.passthrough @ objects @ o.link_args @ [ "-o"; output ])
+  | Native ->
+      let user_dirs = List.filter_map (fun a ->
+          if String.length a > 2 && String.sub a 0 2 = "-L" then Some (String.sub a 2 (String.length a - 2)) else None) o.link_args in
+      let search = user_dirs @ system_lib_dirs () in
+      let items = List.filter_map (fun a ->
+          if String.length a > 2 && String.sub a 0 2 = "-l" then Some (Link.Library (String.sub a 2 (String.length a - 2)))
+          else if Filename.check_suffix a ".a" then Some (Link.Archive a)
+          else if Filename.check_suffix a ".o" then Some (Link.Object a)
+          else None) (objects @ o.link_args) in
+      let crt name = Link.Object (find_file search name) in
+      let items = [ crt "crt1.o"; crt "crti.o"; crt "crtbeginT.o" ] @ items
+                  @ [ Link.Library "gcc"; Link.Library "gcc_eh"; Link.Library "c"; crt "crtend.o"; crt "crtn.o" ] in
+      if o.verbose then prerr_endline ("occld -o " ^ output);
+      Link.link ~output ~entry:"_start" ~search items
 
 (* ---- Main --------------------------------------------------------------- *)
 

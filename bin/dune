@@ -15,3 +15,9 @@
  (modules occar)
  (public_name occar)
  (libraries occ))
+
+(executable
+ (name occld)
+ (modules occld)
+ (public_name occld)
+ (libraries occ))

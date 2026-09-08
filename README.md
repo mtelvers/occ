@@ -11,14 +11,16 @@ a one-page linear-scan register allocator, a few peepholes, and no
 dependency outside the OCaml standard library. The occ-built OCaml
 bytecode interpreter runs about 2.5 times slower than gcc's `-O2` build,
 down from 6 times with everything in frame slots. x86-64 Linux, System V ABI. The assembler
-is ours too (`occas`, GNU as syntax to ELF, byte-identical to gas on
-everything occ and ocamlopt produce); linking is left to binutils.
+(`occas`, byte-identical to GNU as on everything occ and ocamlopt
+produce), the archiver (`occar`) and a static linker (`occld`) are ours
+too, so a C program goes from source to executable without binutils.
 
 ## Layout
 
     bin/main.ml          entry point of occ, the compiler driver
     bin/occas.ml         entry point of occas, the assembler (GNU as command line)
     bin/occar.ml         entry point of occar, the archiver (ar command line)
+    bin/occld.ml         entry point of occld, the static linker (ld command line)
     src/
       loc, diag          positions, diagnostics (first error stops)
       token, lexer       6.4, phases 1–3 and 7
@@ -34,6 +36,8 @@ everything occ and ocamlopt produce); linking is left to binutils.
                          layout and relaxation, .eh_frame, .debug_line,
                          ELF relocatable output
       archiver/          ar archives with a symbol index; ELF symbol reading
+      linker/            ELF object reading; loading, symbol resolution,
+                         placement, relocation, executable output
     include/             stdarg.h, stdatomic.h, stddef.h, ... (7.15–7.23)
     test/programs/       whole-program tests: // expect: N
     tools/mkcorpus.sh    preprocess the OCaml runtime into corpus/
@@ -52,11 +56,13 @@ everything occ and ocamlopt produce); linking is left to binutils.
 
 ## Staging
 
-`occ` is a gcc-compatible driver. Preprocessing, compilation and
-assembly are native (the last through the `Assemble` module, the same
-code as `occas`); linking is delegated to gcc's driver, which knows
-where the C runtime files live. `OCC_NATIVE=pp,cc,as,ld` overrides the
-set of native stages and `OCC_NATIVE=none` makes occ a pure gcc wrapper,
+`occ` is a gcc-compatible driver. All four stages are native:
+preprocessing, compilation, assembly (the `Assemble` module, the same
+code as `occas`) and static linking (`Link`, the same code as `occld`),
+which finds the C runtime's start files and static libraries where gcc
+installs them and links them the way `gcc -static` does. Shared objects
+(`-shared`) are still handed to gcc. `OCC_NATIVE=pp,cc,as,ld` selects
+the native stages and `OCC_NATIVE=none` makes occ a pure gcc wrapper,
 which is how the project was bootstrapped: `./configure CC=occ` on the
 OCaml tree worked from day one and stages turned native one at a time.
 
@@ -93,6 +99,21 @@ rebuilds every static library in the OCaml tree from its members and
 gets the original file back byte for byte (34 of 34). Configure with
 `AR=occar` to use it.
 
+## Linker
+
+`occld` links relocatable objects and archives into a statically linked
+ELF executable in five steps: loading (archive members pulled in while
+they define undefined symbols, COMDAT groups deduplicated), symbol
+resolution (strong over weak over common), placement (input sections
+grouped by name into output sections, output sections into read-only,
+executable and writable segments; GOT, PLT and TLS sized from a scan of
+the relocations), relocation (the ABI's formulas, general-dynamic TLS
+rewritten to local-exec, IFUNC symbols given PLT entries with IRELATIVE
+relocations for glibc's startup code), and output with a symbol table for
+debuggers. It links glibc's `libc.a`, `libgcc_eh.a` and Ubuntu's
+linker-script `libm.a`; statically linked `ocamlrun` and ocamlopt
+programs run, and gdb finds their source lines.
+
 ## Definition of done
 
     ./configure CC=$PWD/_build/default/bin/main.exe   # in the OCaml tree
@@ -106,6 +127,12 @@ gdb reports as an extra frame; occ's DWARF gives gdb file, line and
 parameter information, but occ does not inline. Bytecode produced by the occ-built
 compiler is byte-identical to the gcc-built compiler's. The same result,
 1621 passed and the same one failure, holds on 2026-09-07 with every
-object in the tree assembled by occas rather than GNU as. See
+object in the tree assembled by occas rather than GNU as. With all four
+stages native (`./configure --disable-shared CC=occ AR=occar`, so that
+occld links everything statically and no shared stubs are needed), the
+clean build passes and the testsuite reports 1562 passed, 116 skipped
+(the 59 extra skips are the shared-library and dynlink tests) and the
+same one failure; `ocamlrun` and `ocamlopt.opt` are then static
+executables that binutils never touched. See
 `doc/phases.md` for what remains and `doc/extensions.md` for everything
 the runtime needed beyond C11.
