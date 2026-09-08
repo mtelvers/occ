@@ -21,3 +21,9 @@
  (modules occld)
  (public_name occld)
  (libraries occ))
+
+(executable
+ (name occmake)
+ (modules occmake)
+ (public_name occmake)
+ (libraries mk))
