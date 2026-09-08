@@ -193,12 +193,15 @@ let merge_symbols st =
         | Some at -> at
         | None -> 0 in
       Array.iteri (fun i (s : symbol) ->
-          if s.stype = stt_section then
+          if i = 0 then ()                    (* the null entry, which stays entry 0 *)
+          else if s.stype = stt_section then
             (match where s.shndx with
              | Some o -> map.(i) <- o.osym
              | None -> ())
           else if s.bind = stb_local then begin
-            if s.sname <> "" then begin
+            begin
+              (* every local is kept, named or not: a relocation may
+                 refer to an unnamed one *)
               let shndx, value =
                 if s.stype = stt_file then (shn_abs, 0)
                 else match where s.shndx with
@@ -308,8 +311,10 @@ let link ~output ~search items =
                | None -> ()
                | Some entries ->
                    Array.iter (fun (r : reloc) ->
-                       let target = map.(r.sym) in
-                       match target with
+                       match (if r.sym = 0 then None else map.(r.sym)) with
+                       | None when r.sym = 0 ->
+                           (* a relocation against no symbol keeps entry 0 *)
+                           out := (p.poffset + r.offset, None, r.rtype, r.addend) :: !out
                        | None -> error "%s: relocation against a dropped symbol" p.pobj.file
                        | Some sym ->
                            (* A relocation against a section symbol counts
@@ -323,7 +328,7 @@ let link ~output ~search items =
                                 | Some at -> at
                                 | None -> 0)
                              else 0 in
-                           out := (p.poffset + r.offset, sym, r.rtype, r.addend + extra) :: !out)
+                           out := (p.poffset + r.offset, Some sym, r.rtype, r.addend + extra) :: !out)
                      entries)) (List.rev o.opieces);
       (o, List.rev !out)) sections in
   let relocs = List.filter (fun (_, l) -> l <> []) relocs in
@@ -379,7 +384,7 @@ let link ~output ~search items =
       List.iter (fun (offset, sym, rtype, addend) ->
           u64 b offset;
           u32 b rtype;
-          u32 b sym.syindex;
+          u32 b (match sym with Some s -> s.syindex | None -> 0);
           u64 b addend) l;
       place (".rela" ^ o.oname) (Buffer.contents b) 8) rela_shndx;
   place ".symtab" (Buffer.contents symtab) 8;
