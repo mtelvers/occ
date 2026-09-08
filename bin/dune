@@ -27,3 +27,15 @@
  (modules occmake)
  (public_name occmake)
  (libraries mk))
+
+(executable
+ (name occutils)
+ (modules occutils)
+ (public_name occutils)
+ (libraries ut))
+
+(executable
+ (name occsh)
+ (modules occsh)
+ (public_name occsh)
+ (libraries sh))
