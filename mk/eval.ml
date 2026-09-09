@@ -9,6 +9,7 @@
    resolved as the file is read, so a variable's value can steer them. *)
 
 type state = {
+  mutable file : string;                (* the makefile being read, for diagnostics *)
   db : Value.t;
   rules : Rule.t;
   mutable current : Rule.rule option;   (* the rule whose recipe is being collected *)
@@ -29,7 +30,11 @@ let logical_lines text =
   let lines = String.split_on_char '\n' text in
   let out = ref [] and buf = Buffer.create 128 in
   let joining = ref false and recipe = ref false and in_define = ref false in
+  (* the physical line each logical one started on, for diagnostics *)
+  let lineno = ref 0 and started = ref 1 in
   List.iter (fun line ->
+      incr lineno;
+      if not !joining then started := !lineno;
       let line = if String.length line > 0 && line.[String.length line - 1] = '\r' then String.sub line 0 (String.length line - 1) else line in
       let cont = String.length line > 0 && line.[String.length line - 1] = '\\'
                  && not (String.length line >= 2 && line.[String.length line - 2] = '\\') in
@@ -77,10 +82,10 @@ let logical_lines text =
               && (match trimmed.[5] with ' ' | '\t' | '#' -> true | _ -> false)) in
         if !in_define then (if closes then in_define := false)
         else if opens then in_define := true;
-        out := complete :: !out; Buffer.clear buf; joining := false
+        out := (complete, !started) :: !out; Buffer.clear buf; joining := false
       end)
     lines;
-  if Buffer.length buf > 0 then out := Buffer.contents buf :: !out;
+  if Buffer.length buf > 0 then out := (Buffer.contents buf, !started) :: !out;
   List.rev !out
 
 (* strip an unescaped '#' comment (3.1) *)
@@ -152,10 +157,15 @@ and eval_lines st lines =
   let live () = List.for_all (fun (b, _) -> b) !active in
   let rec loop = function
     | [] -> ()
-    | raw :: rest ->
+    | (raw, lineno) :: rest ->
+        let where = Printf.sprintf "%s:%d" st.file lineno in
         let is_recipe = String.length raw > 0 && raw.[0] = '\t' in
         if is_recipe && st.current <> None && live () then begin
-          (match st.current with Some r -> st.current <- Some { r with recipe = r.recipe @ [ String.sub raw 1 (String.length raw - 1) ] } | None -> ());
+          (match st.current with
+           | Some r ->
+               st.current <- Some { r with recipe = r.recipe @ [ String.sub raw 1 (String.length raw - 1) ];
+                                           recipe_loc = r.recipe_loc @ [ where ] }
+           | None -> ());
           loop rest
         end else begin
           let line = ltrim (strip_comment raw) in
@@ -214,7 +224,7 @@ and eval_lines st lines =
                      (* a rule if there is a top-level colon; otherwise a bare
                         expression evaluated for its side effects, such as
                         $(eval ...), $(info ...) or a $(foreach ...) of them *)
-                     if top_colon line <> None then parse_rule st line
+                     if top_colon line <> None then parse_rule st ~where line
                      else ignore (expand st line));
                 loop rest
           end
@@ -276,8 +286,8 @@ and do_assignment ?origin st line =
             | _ -> Value.append st.db name rhs)
        | _ -> ())
 
-and parse_rule st line = try parse_rule_body st line with Exit -> ()
-and parse_rule_body st line =
+and parse_rule st ~where line = try parse_rule_body st ~where line with Exit -> ()
+and parse_rule_body st ~where line =
   (* split targets ':' prereqs (':=' already excluded), a target-specific
      variable, or a static pattern rule *)
   let colon = top_colon line in
@@ -327,8 +337,10 @@ and parse_rule_body st line =
         let prereqs = List.map Func.normalise prereqs in
         let order = List.map Func.normalise order in
         finish_recipe st;
-        let r = { Rule.targets; prereqs; order_only = order; recipe = (match inline_recipe with Some c -> [ c ] | None -> []); is_pattern;
-                  is_double_colon = is_double; phony = false; stem = "" } in
+        let r = { Rule.targets; prereqs; order_only = order;
+                  recipe = (match inline_recipe with Some c -> [ c ] | None -> []);
+                  recipe_loc = (match inline_recipe with Some _ -> [ where ] | None -> []);
+                  is_pattern; is_double_colon = is_double; phony = false; stem = "" } in
         st.current <- Some r;
         if st.default_goal = None && not is_pattern then
           (match List.find_opt (fun t -> not (starts_with "." t)) targets with Some g -> st.default_goal <- Some g | None -> ()) in
@@ -345,7 +357,9 @@ and parse_rule_body st line =
            let (ppats, opats) = split [] words in
            finish_recipe st;
            (* the shared recipe is collected next and applied per target in finish_recipe *)
-           st.current <- Some { Rule.targets; prereqs = []; order_only = []; recipe = []; is_pattern = false; is_double_colon = is_double; phony = false; stem = "" };
+           st.current <- Some { Rule.targets; prereqs = []; order_only = []; recipe = [];
+                                recipe_loc = []; is_pattern = false;
+                                is_double_colon = is_double; phony = false; stem = "" };
            st.static <- Some { Rule.tpat; ppats; opats; stargets = targets }
        | None ->
            let prereqs = Expand.words (expand st prereqs_s) and order = Expand.words (expand st order_s) in
@@ -383,8 +397,8 @@ and collect_define st line rest =
   let first = ref true in
   let rec take = function
     | [] -> []
-    | l :: tl when (let t = String.trim (strip_comment l) in t = "endef") -> tl
-    | l :: tl ->
+    | (l, _) :: tl when (let t = String.trim (strip_comment l) in t = "endef") -> tl
+    | (l, _) :: tl ->
         if !first then first := false else Buffer.add_char body '\n';
         Buffer.add_string body l;
         take tl in
@@ -396,5 +410,10 @@ and include_file st ~optional f =
   let path = if Sys.file_exists f then Some f
     else List.find_map (fun d -> let p = Filename.concat d f in if Sys.file_exists p then Some p else None) st.include_dirs in
   match path with
-  | Some p -> eval_text st (In_channel.with_open_bin p In_channel.input_all)
+  | Some p ->
+      (* an included file's lines are named by that file *)
+      let outer = st.file in
+      st.file <- p;
+      Fun.protect ~finally:(fun () -> st.file <- outer)
+        (fun () -> eval_text st (In_channel.with_open_bin p In_channel.input_all))
   | None -> if not optional then raise (Expand.Make_error (Printf.sprintf "%s: no such file" f))

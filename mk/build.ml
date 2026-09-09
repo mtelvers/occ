@@ -56,6 +56,7 @@ type t = {
 and job = {
   jtarget : string;
   jlines : string list;
+  jlocs : string list;
   jstem : string;
   jprereqs : string list;
   jorder : string list;
@@ -249,10 +250,13 @@ let mentions_make raw =
     go 0 in
   has "$(MAKE)" || has "${MAKE}"
 
-let run_recipe b ~target ~lines =
+let run_recipe b ~target ~lines ~locs =
+  (* each line with where it was written, for the message a failure gives *)
+  let located = List.mapi (fun i l ->
+      (l, match List.nth_opt locs i with Some w -> w | None -> target)) lines in
   let rec go = function
     | [] -> true
-    | raw :: rest ->
+    | (raw, where) :: rest ->
         let recursive = mentions_make raw in
         let line = Expand.expand { Expand.db = b.db; call_stack = []; expanding = Hashtbl.create 16 } raw in
         (* recipe-line prefixes: @ silent, - ignore errors, + always run *)
@@ -276,12 +280,12 @@ let run_recipe b ~target ~lines =
             if code = 0 then go rest
             else if !ignore_err then go rest
             else begin
-              Printf.eprintf "%s: *** [%s] Error %d\n" b.name target code;
+              Printf.eprintf "%s: *** [%s: %s] Error %d\n" b.name where target code;
               false
             end
           end
         end in
-  go lines
+  go located
 
 (* update one target; returns true if it (or a prerequisite) was rebuilt *)
 let rec update b (t : string) : bool =
@@ -400,7 +404,8 @@ and update_one b t ~was h =
                since a target's rules run in the order they were written *)
             let deps = needs_of b t (prereqs @ order) in
             let index = List.length b.jobs in
-            b.jobs <- { jtarget = t; jlines = r.recipe; jstem = stem; jprereqs = prereqs;
+            b.jobs <- { jtarget = t; jlines = r.recipe; jlocs = r.recipe_loc;
+                        jstem = stem; jprereqs = prereqs;
                         jorder = order; jnewer = (if newer = [] then prereqs else newer);
                         jpath = List.rev b.path; jdeps = deps } :: b.jobs;
             Hashtbl.replace b.planned t index;
@@ -412,7 +417,8 @@ and update_one b t ~was h =
             if debug then
               Printf.eprintf "occmake: %s: automatics @=[%s] <=[%s] ^=[%s]\n" t
                 (Value.get b.db "@") (Value.get b.db "<") (Value.get b.db "^");
-            let ok = if b.question then false else run_recipe b ~target:t ~lines:r.recipe in
+            let ok = if b.question then false
+              else run_recipe b ~target:t ~lines:r.recipe ~locs:r.recipe_loc in
             if b.question then (b.failed <- true; true)
             else if ok then true
             else (b.failed <- true; false)
@@ -449,7 +455,7 @@ let run_jobs b (jobs : job array) ~limit =
         List.iter (fun p -> let _restore = apply_tsv b p in ()) j.jpath;
         set_automatic b ~target:j.jtarget ~prereqs:j.jprereqs ~order:j.jorder
           ~newer:j.jnewer ~stem:j.jstem;
-        let ok = run_recipe b ~target:j.jtarget ~lines:j.jlines in
+        let ok = run_recipe b ~target:j.jtarget ~lines:j.jlines ~locs:j.jlocs in
         exit (if ok then 0 else 1)
     | pid ->
         Hashtbl.replace pids pid i;

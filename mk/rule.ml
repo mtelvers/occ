@@ -11,6 +11,9 @@ type rule = {
   prereqs : string list;
   order_only : string list;
   recipe : string list;         (* command lines, unexpanded *)
+  (* where each recipe line was written, "file:line", as make names it
+     when a recipe fails *)
+  recipe_loc : string list;
   is_pattern : bool;
   is_double_colon : bool;
   phony : bool;                 (* named in .PHONY *)

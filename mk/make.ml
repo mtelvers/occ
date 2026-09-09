@@ -165,7 +165,8 @@ let run argv =
   Value.set db ~origin:Value.Command_line "MAKEFLAGS" flags;
   (try Unix.putenv "MAKEFLAGS" flags with _ -> ());
   let rules = Rule.create () in
-  let st = { Eval.db; rules; current = None; include_dirs = []; default_goal = None; static = None } in
+  let st = { Eval.db; file = "Makefile"; rules; current = None; include_dirs = [];
+             default_goal = None; static = None } in
   (* $(eval TEXT) evaluates into the same databases, so rules and the
      default goal it defines are visible to the rest of the build *)
   Expand.eval_hook := (fun _db text -> Eval.eval_text st text);
@@ -174,7 +175,7 @@ let run argv =
   (match mf with
    | Some f ->
        (match In_channel.with_open_bin f In_channel.input_all with
-        | text -> Eval.eval_text st text
+        | text -> st.Eval.file <- f; Eval.eval_text st text
         | exception Sys_error msg ->
             Printf.eprintf "%s: %s\n" me msg; exit 2)
    | None ->
