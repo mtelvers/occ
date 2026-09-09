@@ -250,6 +250,25 @@ let mentions_make raw =
     go 0 in
   has "$(MAKE)" || has "${MAKE}"
 
+(* .DELETE_ON_ERROR: what a failed recipe left of the target is not the
+   file the rule promised, and a later run would take it for finished
+   because it is newer than its prerequisites.  So it goes, unless it is
+   a name make must not delete or not a file at all. *)
+let delete_on_error b ~target =
+  if b.rules.Rule.delete_on_error
+     && not (Rule.is_phony b.rules target)
+     && not (Rule.is_precious b.rules target)
+     && Sys.file_exists target
+     && (match Unix.stat target with
+         | { Unix.st_kind = Unix.S_REG; _ } -> true
+         | _ -> false
+         | exception _ -> false)
+  then begin
+    Printf.eprintf "%s: *** Deleting file '%s'\n" b.name target;
+    flush stderr;
+    try Sys.remove target with _ -> ()
+  end
+
 let run_recipe b ~target ~lines ~locs =
   (* each line with where it was written, for the message a failure gives *)
   let located = List.mapi (fun i l ->
@@ -278,9 +297,17 @@ let run_recipe b ~target ~lines ~locs =
             let shell = if shell = "" then "/bin/sh" else shell in
             let code = Sys.command (Printf.sprintf "%s -c %s" (Filename.quote shell) (Filename.quote cmd)) in
             if code = 0 then go rest
-            else if !ignore_err then go rest
+            else if !ignore_err then begin
+              (* a recipe line written with `-' does not stop the build,
+                 but the failure is still reported, without the three
+                 stars that mark one that does *)
+              Printf.eprintf "%s: [%s: %s] Error %d (ignored)\n" b.name where target code;
+              flush stderr;
+              go rest
+            end
             else begin
               Printf.eprintf "%s: *** [%s: %s] Error %d\n" b.name where target code;
+              delete_on_error b ~target;
               false
             end
           end
@@ -480,6 +507,15 @@ let run_jobs b (jobs : job array) ~limit ~server =
       match server with Some s -> Jobserver.release s | None -> ()
     end in
   let stopping () = b.failed && not b.keep_going in
+  (* said once, when a failure has stopped new jobs from starting and
+     the ones already running are still to be waited for *)
+  let announced = ref false in
+  let announce_wait () =
+    if not !announced && !running > 0 && not b.keep_going then begin
+      announced := true;
+      Printf.eprintf "%s: *** Waiting for unfinished jobs....\n" b.name;
+      flush stderr
+    end in
   let progress = ref true in
   while !left > 0 && !progress do
     progress := false;
@@ -513,7 +549,7 @@ let run_jobs b (jobs : job array) ~limit ~server =
                give_back i;
                (match st with
                 | Unix.WEXITED 0 -> state.(i) <- `Done
-                | _ -> state.(i) <- `Failed; b.failed <- true)
+                | _ -> state.(i) <- `Failed; b.failed <- true; announce_wait ())
            | None -> ())
       | exception Unix.Unix_error (Unix.EINTR, _, _) -> progress := true
       | exception _ -> progress := true

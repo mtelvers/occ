@@ -203,7 +203,8 @@ build had running at once.
     7740 regex cases, identical
       22 shell scripts, identical output, error output, status and files
      256 utility cases, identical but for four named differences
-      13 makefiles, identical plans
+      22 makefiles, identical plans, and identical output, status and
+         files left behind for the four that are run for real
        8 parallel runs, the same peak number of recipes at once
       14 cases of when a utility passes its output on or stops
          reading, one named difference

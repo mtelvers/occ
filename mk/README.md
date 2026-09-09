@@ -87,6 +87,25 @@ with the makefile and line its command was written on, since in a
 recursive build over a 4500-line Makefile that is the only part of the
 message that helps.
 
+## When a recipe fails
+
+The plan a `-n` run prints cannot show what happens then, so
+`tools/mkcheck.sh` also runs the makefiles whose names end in
+`.run.mk` for real, in a scratch directory each, and compares what the
+two makes did: the output, the error output, the exit status and the
+files left behind. Four behaviours come from that:
+
+- `.DELETE_ON_ERROR` removes the target of a failed recipe, since what
+  is left of it is not the file the rule promised and a later run would
+  take it for finished. A phony target and one named in `.PRECIOUS` are
+  left alone.
+- A recipe line written with `-` does not stop the build, and the
+  failure is still reported -- without the three stars that mark one
+  that does, and with `(ignored)` at the end.
+- Under `-j`, a failure stops new jobs from starting and make says it
+  is waiting for the ones already running.
+- Under `-k`, a failure stops what depended on it and nothing else.
+
 ## Known differences
 
 `tools/mkcheck.sh` compares occmake's `-n` plan with GNU make's, except

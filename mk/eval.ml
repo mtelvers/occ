@@ -369,6 +369,8 @@ and parse_rule_body st ~where line =
              List.iter (Rule.mark_precious st.rules) prereqs;
            if List.mem ".SECONDEXPANSION" targets then st.rules.Rule.second_expansion <- true;
            if List.mem ".NOTPARALLEL" targets then st.rules.Rule.notparallel <- true;
+           if List.mem ".DELETE_ON_ERROR" targets then
+             st.rules.Rule.delete_on_error <- true;
            make_rule targets prereqs order is_pattern)
 
 and top_colon line =

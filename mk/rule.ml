@@ -51,6 +51,9 @@ type t = {
      an intermediate in a chain or when a recipe fails (10.4, 10.5.5) *)
   mutable precious : string list;
   mutable notparallel : bool;              (* .NOTPARALLEL: run one job at a time *)
+  (* .DELETE_ON_ERROR: a target whose recipe failed is removed, since
+     what is left of it is not the file the rule promised *)
+  mutable delete_on_error : bool;
   (* The rules that make each target.  A target written with one colon
      has exactly one entry, its rules merged; a target written with two
      has one entry per rule, since 4.13 makes each of those independent
@@ -60,6 +63,7 @@ type t = {
 
 let create () = { explicit = []; patterns = []; tsvs = []; second_expansion = false;
                   vpaths = []; precious = []; notparallel = false;
+                  delete_on_error = false;
                   phony = Hashtbl.create 64;
                   by_target = Hashtbl.create 256 }
 
