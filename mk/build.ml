@@ -58,12 +58,12 @@ let locate b name =
   else
     List.find_map (fun d ->
         let p = Filename.concat d name in
-        if exists p || Hashtbl.mem b.rules.Rule.by_target p then Some p else None)
+        if exists p || Rule.has_rule b.rules p then Some p else None)
       (search_dirs b name)
 
 (* the name a prerequisite or a goal really stands for *)
 let resolve b p =
-  if exists p || Hashtbl.mem b.rules.Rule.by_target p || Rule.is_phony b.rules p then p
+  if exists p || Rule.has_rule b.rules p || Rule.is_phony b.rules p then p
   else match locate b p with Some found -> found | None -> p
 
 (* how a target will be built: an explicit rule, a matched pattern rule
@@ -95,7 +95,7 @@ let matching_patterns b t =
    be followed for ever. *)
 let rec provided b depth t =
   exists t
-  || Hashtbl.mem b.rules.Rule.by_target t
+  || Rule.has_rule b.rules t
   || Rule.is_phony b.rules t
   || locate b t <> None
   || (depth > 0
@@ -116,10 +116,13 @@ let find_implicit b t =
           List.for_all (fun p -> provided b 3 (Func.pattern_subst p stem)) r.prereqs) candidates
 
 
-let how b t =
-  match Hashtbl.find_opt b.rules.Rule.by_target t with
-  | Some r when r.recipe <> [] -> Explicit r
-  | Some r ->
+(* How one of a target's rules will be run.  A target written with two
+   colons has several, each independent (4.13), and every one of them is
+   run in turn; the build's install target is written that way, with
+   `common-install::' appearing several times over. *)
+let how_rule b t (r : Rule.rule) =
+  if r.recipe <> [] then Explicit r
+  else
       (* a rule with prerequisites but no recipe (as the .dep files give
          each object): take the recipe from a matching pattern rule and
          keep the explicit prerequisites (2.4, 4.14, 10.5.5) *)
@@ -131,10 +134,15 @@ let how b t =
            Implicit ({ pr with prereqs = stemmed @ r.prereqs;
                                order_only = pr.order_only @ r.order_only }, stem)
        | None -> Explicit r)
-  | None ->
+
+let how b t =
+  match Rule.rules_for b.rules t with
+  | [] ->
       (match find_implicit b t with
-       | Some (pr, stem) -> Implicit ({ pr with prereqs = List.map (fun p -> Func.pattern_subst p stem) pr.prereqs }, stem)
-       | None -> Source)
+       | Some (pr, stem) ->
+           [ Implicit ({ pr with prereqs = List.map (fun p -> Func.pattern_subst p stem) pr.prereqs }, stem) ]
+       | None -> [ Source ])
+  | rules -> List.map (how_rule b t) rules
 
 (* Bind the target- and pattern-specific variables that apply to [t]
    (6.11, 6.12), returning a closure that restores the previous values.
@@ -247,18 +255,26 @@ and update_uncached b t =
   Fun.protect ~finally:restore (fun () -> update_body b t)
 
 and update_body b t =
+  (* Each of the target's rules in turn: one, unless it was written with
+     two colons (4.13).  The target counts as rebuilt if any of them
+     rebuilt it. *)
+  List.fold_left (fun rebuilt h ->
+      if b.failed && not b.keep_going then rebuilt
+      else update_one b t h || rebuilt) false (how b t)
+
+and update_one b t h =
   let phony = Rule.is_phony b.rules t in
   (* OCCMAKE_DEBUG names, for each target, how it was chosen and with
      which prerequisites; the fastest way to see why a build differs *)
   let debug = Sys.getenv_opt "OCCMAKE_DEBUG" <> None in
-  match how b t with
+  match h with
   | Source ->
       if exists t then false
       else begin
         Printf.eprintf "%s: *** No rule to make target '%s'.  Stop.\n" b.name t;
         b.failed <- true; false
       end
-  | Explicit r | Implicit (r, _) as h ->
+  | Explicit r | Implicit (r, _) ->
       (* the stem: the pattern rule's, or the one a static pattern rule
          recorded when it was expanded into explicit rules *)
       let stem = match h with

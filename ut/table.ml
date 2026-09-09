@@ -57,6 +57,7 @@ let utilities : entry list = [
   e "touch" "acmr:t:d:" Files.touch;
   e "chmod" "Rfv" Files.chmod;
   e "mktemp" "dqup:t" Files.mktemp;
+  e "install" "cpvdsSm:o:g:t:T" Files.install;
 
   (* names and the machine *)
   e "basename" ~permute:false "as:z" Paths.basename;

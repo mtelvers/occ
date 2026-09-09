@@ -330,6 +330,57 @@ let chmod argv opts operands =
       List.iter change files;
       !status
 
+(* ---------- install ---------- *)
+
+(* install is not in XCU, but every build system uses it and configure
+   looks for it: it copies a file to its place with a mode given on the
+   command line, and with -d it makes directories instead.  It differs
+   from cp in removing the destination first, so that a program being
+   replaced while it runs is unlinked rather than written through. *)
+let install _argv opts operands =
+  let make_dirs = Posix.Getopt.has opts "d" in
+  let preserve = Posix.Getopt.has opts "p" in
+  let mode = match Posix.Getopt.arg opts "m" with
+    | Some m ->
+        (match int_of_string_opt ("0o" ^ m) with
+         | Some v -> Some v
+         | None -> die 1 "invalid mode: '%s'" m)
+    | None -> None in
+  let status = ref 0 in
+  let rec make_dir path =
+    if path = "" || path = "/" || is_dir path then ()
+    else begin
+      make_dir (Filename.dirname path);
+      match Unix.mkdir path (match mode with Some m -> m | None -> 0o755) with
+      | () -> ()
+      | exception Unix.Unix_error (Unix.EEXIST, _, _) -> ()
+      | exception e -> warn "%s" (sys_message e); status := 1
+    end in
+  if make_dirs then (List.iter make_dir operands; !status)
+  else
+    match List.rev operands with
+    | [] | [ _ ] -> die 1 "usage: install [-cpv] [-m mode] source... target"
+    | dst :: sources_rev ->
+        let sources = List.rev sources_rev in
+        if List.length sources > 1 && not (is_dir dst) then
+          die 1 "target '%s' is not a directory" dst;
+        List.iter (fun src ->
+            let target = destination dst src in
+            (* the destination goes first, so a running program is
+               unlinked rather than written into *)
+            if exists target && not (is_dir target) then
+              (try Unix.unlink target with _ -> ());
+            match copy_file ~preserve src target with
+            | () ->
+                (* -p preserves the times, not the mode: without -m the
+                   mode is install's own default whatever the source's
+                   was, so a program installed from a tree built under a
+                   loose umask is still 755 *)
+                let m = match mode with Some m -> m | None -> 0o755 in
+                (try Unix.chmod target m with _ -> ())
+            | exception e -> warn "%s" (sys_message e); status := 1) sources;
+        !status
+
 (* ---------- mktemp ---------- *)
 
 let mktemp _argv opts operands =

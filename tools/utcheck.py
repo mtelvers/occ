@@ -268,6 +268,18 @@ CASES = [
     ("chmod", ["+x", "f1"], ""),
     ("chmod", ["u-w", "f1"], ""),
 
+    # install
+    ("install", ["-c", "-p", "prog", "copy"], ""),
+    # -p preserves the times, not the mode: f1 is 0644 in the scratch
+    # directory and install's own default is 0755
+    ("install", ["-c", "-p", "f1", "copy"], ""),
+    ("install", ["-c", "-p", "-m", "644", "f1", "copy"], ""),
+    ("install", ["-m", "600", "f1", "d1"], ""),
+    ("install", ["f1", "copy"], ""),
+    ("install", ["-d", "newdir/sub"], ""),
+    ("install", ["-d", "-m", "700", "newdir2"], ""),
+    ("install", ["f1", "f2", "d1"], ""),
+
     # find and xargs
     ("find", ["."], ""),
     ("find", [".", "-name", "f1"], ""),

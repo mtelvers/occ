@@ -375,10 +375,18 @@ and collect_define st line rest =
     | Some (s, v) -> String.trim (String.sub header 0 s), (if String.sub header s (v - s) = ":=" then Value.Simple else Value.Recursive)
     | None -> header, Value.Recursive in
   let body = Buffer.create 128 in
+  (* The value is the lines of the body joined by newlines, empty lines
+     included: `define NEWLINE' with a blank body is how a makefile gets
+     hold of a newline, and the OCaml build uses one to break its
+     install commands into shell lines. *)
+  let first = ref true in
   let rec take = function
     | [] -> []
     | l :: tl when (let t = String.trim (strip_comment l) in t = "endef") -> tl
-    | l :: tl -> if Buffer.length body > 0 then Buffer.add_char body '\n'; Buffer.add_string body l; take tl in
+    | l :: tl ->
+        if !first then first := false else Buffer.add_char body '\n';
+        Buffer.add_string body l;
+        take tl in
   let rest = take rest in
   Value.set st.db ~flavour (expand st name) (if flavour = Value.Simple then expand st (Buffer.contents body) else Buffer.contents body);
   rest

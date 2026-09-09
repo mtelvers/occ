@@ -82,11 +82,40 @@ and scan_ref s start openc closec =
   done;
   Buffer.contents b, !i
 
+(* Inside a function's arguments a backslash-newline stands for a single
+   space, and the whitespace around it goes with it -- even in a recipe,
+   where a backslash-newline is otherwise kept for the shell.  The
+   OCaml build's install rules are written that way: a $(call) whose
+   arguments run over four lines of a recipe. *)
+and collapse_continuations text =
+  if not (String.contains text '\\') then text
+  else begin
+    let n = String.length text in
+    let b = buf_create () in
+    let i = ref 0 in
+    let rtrim () =
+      let s = Buffer.contents b in
+      let k = ref (String.length s) in
+      while !k > 0 && (s.[!k - 1] = ' ' || s.[!k - 1] = '\t') do decr k done;
+      Buffer.clear b;
+      Buffer.add_string b (String.sub s 0 !k) in
+    while !i < n do
+      if text.[!i] = '\\' && !i + 1 < n && text.[!i + 1] = '\n' then begin
+        rtrim ();
+        Buffer.add_char b ' ';
+        i := !i + 2;
+        while !i < n && (text.[!i] = ' ' || text.[!i] = '\t') do incr i done
+      end else (Buffer.add_char b text.[!i]; incr i)
+    done;
+    Buffer.contents b
+  end
+
 (* A reference body: a function call "name args", or a variable name
    possibly with a substitution "$(VAR:a=b)". *)
 and reference ctx body =
   match split_function body with
-  | Some (name, args) when is_function name -> call_function ctx name args
+  | Some (name, args) when is_function name ->
+      call_function ctx name (collapse_continuations args)
   | _ ->
       (* $(VAR) or $(VAR:pat=repl) or $(VAR:suffix=repl) *)
       (match String.index_opt body ':' with
@@ -203,7 +232,10 @@ and call_function ctx name argstr =
   | "if" ->
       (match raw () with
        | cond :: rest ->
-           if String.trim (expand ctx cond) <> "" then (match rest with t :: _ -> expand ctx t | [] -> "")
+           (* The condition's own text is stripped before it is expanded,
+              so that `$(if  x,...)' works; the *expansion* is not, so a
+              value of one newline is true. *)
+           if expand ctx (String.trim cond) <> "" then (match rest with t :: _ -> expand ctx t | [] -> "")
            else (match rest with _ :: e :: _ -> expand ctx e | _ -> "")
        | [] -> "")
   | "or" -> or_and ctx (raw ()) ~stop_nonempty:true
@@ -230,7 +262,16 @@ and call_function ctx name argstr =
        | [] -> "")
   | "value" -> (match Value.find ctx.db (String.trim (one ())) with Some v -> v.value | None -> "")
   | "origin" ->
-      (match Value.find ctx.db (String.trim (one ())) with
+      let name = String.trim (one ()) in
+      (* an argument of the $(call) in progress is "automatic", as $@ and
+         its like are; the build asks $(origin 3) to tell an omitted
+         argument from an empty one *)
+      (match int_of_string_opt name with
+       | Some k when ctx.call_stack <> [] ->
+           let _, args = List.hd ctx.call_stack in
+           if k >= 1 && k <= Array.length args then "automatic" else "undefined"
+       | _ ->
+      match Value.find ctx.db name with
        | None -> "undefined"
        | Some v -> (match v.origin with
            | Value.Default -> "default" | Value.Environment -> "environment" | Value.File -> "file"

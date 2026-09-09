@@ -47,7 +47,11 @@ type t = {
   (* .PRECIOUS and .SECONDARY name files make must not delete, either as
      an intermediate in a chain or when a recipe fails (10.4, 10.5.5) *)
   mutable precious : string list;
-  by_target : (string, rule) Hashtbl.t;   (* first explicit rule defining each target *)
+  (* The rules that make each target.  A target written with one colon
+     has exactly one entry, its rules merged; a target written with two
+     has one entry per rule, since 4.13 makes each of those independent
+     and runs every one of them. *)
+  by_target : (string, rule list) Hashtbl.t;
 }
 
 let create () = { explicit = []; patterns = []; tsvs = []; second_expansion = false;
@@ -74,25 +78,38 @@ let add db (r : rule) =
   else begin
     db.explicit <- db.explicit @ [ r ];
     List.iter (fun t ->
-        match Hashtbl.find_opt db.by_target t with
-        | None -> Hashtbl.replace db.by_target t r
-        | Some existing when existing.is_double_colon || r.is_double_colon -> ignore existing
-        | Some existing ->
-            if existing.recipe <> [] && r.recipe <> [] then
-              Printf.eprintf "warning: overriding recipe for target '%s'\n" t;
-            (* The rule that carries the recipe contributes its
-               prerequisites first, so that $< is the one it names. *)
-            let first, second =
-              if r.recipe <> [] && existing.recipe = [] then r, existing else existing, r in
-            Hashtbl.replace db.by_target t
-              { existing with
-                prereqs = first.prereqs @ second.prereqs;
-                order_only = first.order_only @ second.order_only;
-                recipe = (if r.recipe <> [] then r.recipe else existing.recipe);
-                stem = (if first.stem <> "" then first.stem else second.stem);
-                phony = existing.phony || r.phony })
+        let existing = match Hashtbl.find_opt db.by_target t with Some l -> l | None -> [] in
+        if r.is_double_colon || List.exists (fun (x : rule) -> x.is_double_colon) existing
+        then Hashtbl.replace db.by_target t (existing @ [ r ])
+        else
+          (* A file may be named by several one-colon rules: the
+             prerequisites add up, and at most one of the rules may carry
+             a recipe (4.11).  The build's `runtime-all' is written that
+             way, gathering its prerequisites over three rules, and a make
+             that kept only the first would silently build less than it
+             was asked to.  The rule with the recipe contributes its
+             prerequisites first, so that $< is the one it names. *)
+          match existing with
+          | [] -> Hashtbl.replace db.by_target t [ r ]
+          | [ e ] ->
+              if e.recipe <> [] && r.recipe <> [] then
+                Printf.eprintf "warning: overriding recipe for target '%s'\n" t;
+              let first, second = if r.recipe <> [] && e.recipe = [] then r, e else e, r in
+              Hashtbl.replace db.by_target t
+                [ { e with
+                    prereqs = first.prereqs @ second.prereqs;
+                    order_only = first.order_only @ second.order_only;
+                    recipe = (if r.recipe <> [] then r.recipe else e.recipe);
+                    stem = (if first.stem <> "" then first.stem else second.stem);
+                    phony = e.phony || r.phony } ]
+          | l -> Hashtbl.replace db.by_target t (l @ [ r ]))
       r.targets
   end
+
+(* the rules that make [t], in the order they were written *)
+let rules_for db t = match Hashtbl.find_opt db.by_target t with Some l -> l | None -> []
+
+let has_rule db t = Hashtbl.mem db.by_target t
 
 let mark_phony db name = Hashtbl.replace db.phony name ()
 let is_phony db name = Hashtbl.mem db.phony name
