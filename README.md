@@ -201,8 +201,8 @@ build had running at once.
     tools/ldrcheck.sh                       # occld -r vs GNU ld -r
 
     7740 regex cases, identical
-      21 shell scripts, identical output, error output, status and files
-     248 utility cases, identical but for four named differences
+      22 shell scripts, identical output, error output, status and files
+     256 utility cases, identical but for four named differences
       13 makefiles, identical plans
        8 parallel runs, the same peak number of recipes at once
       14 cases of when a utility passes its output on or stops

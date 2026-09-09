@@ -90,7 +90,7 @@ diff, and `-q`, which asks only whether they differ.
 
 ## Testing
 
-`tools/utcheck.py` runs 248 cases against the GNU utilities. Each case
+`tools/utcheck.py` runs 256 cases against the GNU utilities. Each case
 is an argument list and a standard input; the two run in identical
 scratch directories, and standard output, standard error, the exit
 status and the files left behind must all agree. They do, with four
