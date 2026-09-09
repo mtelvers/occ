@@ -116,7 +116,9 @@ make that was given `-j` and named in MAKEFLAGS
 (`--jobserver-auth=fifo:PATH`, the spelling of GNU make 4.4 and later).
 Every make may run one recipe for free, since it is itself occupying a
 token of the make that started it, and takes a token from the pool
-before starting a second. `tools/jscheck.sh` checks this by measuring:
+before starting a second. The make that made the pool removes it on the
+way out; a make killed outright leaves the pipe behind, as GNU make
+does, and it is an empty file in the temporary directory. `tools/jscheck.sh` checks this by measuring:
 it runs a recursive tree under both makes and compares the largest
 number of recipes either had running at once, with the pool and with the
 pool taken away.
