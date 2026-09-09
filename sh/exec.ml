@@ -68,6 +68,21 @@ let heredoc_fd body =
   (try Unix.unlink name with _ -> ());
   fd
 
+(* A redirection that cannot be made (2.8.1).  It is an error of the
+   command, not of the shell, except with a special built-in: there the
+   shell exits, which is what the two callers below decide.  The wording
+   is the reference shell's, since a script that reads the message reads
+   that one. *)
+exception Redirect of string
+
+let cannot verb name e =
+  raise (Redirect (Printf.sprintf "cannot %s %s: %s" verb name (Unix.error_message e)))
+
+let open_for verb name flags =
+  match Unix.openfile name flags 0o666 with
+  | fd -> fd
+  | exception Unix.Unix_error (e, _, _) -> cannot verb name e
+
 let target_of st r =
   match r.rop with
   | Here _ -> Use (heredoc_fd (Expand.to_string st r.rword))
@@ -75,12 +90,16 @@ let target_of st r =
       let text = Expand.to_string st r.rword in
       if text = "-" then Close_fd
       else (match int_of_string_opt text with
-          | Some k -> Use (Unix.dup ~cloexec:false (fd_of_int k))
+          | Some k ->
+              (match Unix.dup ~cloexec:false (fd_of_int k) with
+               | fd -> Use fd
+               | exception Unix.Unix_error (e, _, _) ->
+                   raise (Redirect (text ^ ": " ^ Unix.error_message e)))
           | None ->
               (* a name, as in `>&file', which dash allows *)
               let flags = if r.rop = Dup_in then [ Unix.O_RDONLY ]
                 else [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC ] in
-              Use (Unix.openfile text flags 0o666))
+              Use (open_for (if r.rop = Dup_in then "open" else "create") text flags))
   | op ->
       let name = Expand.to_string st r.rword in
       let flags = match op with
@@ -90,8 +109,8 @@ let target_of st r =
         | In_out -> [ Unix.O_RDWR; Unix.O_CREAT ]
         | _ -> [ Unix.O_RDONLY ] in
       if op = Out && st.opts.noclobber && Sys.file_exists name then
-        raise (State.Error (name ^ ": cannot overwrite existing file"));
-      Use (Unix.openfile name flags 0o666)
+        raise (Redirect (Printf.sprintf "cannot create %s: File exists" name));
+      Use (open_for (if op = In then "open" else "create") name flags)
 
 let apply st redirs =
   let saved = ref [] in
@@ -118,9 +137,18 @@ let restore saved =
       | Some b -> Unix.dup2 ~cloexec:false b (fd_of_int s.fd); Unix.close b
       | None -> (try Unix.close (fd_of_int s.fd) with _ -> ())) saved
 
+(* A redirection error is the command's, not the shell's: the message,
+   a status of 2, and the shell carries on.  The exception is a special
+   built-in, and the callers that run one say so (2.8.1). *)
+let redirect_failed st msg =
+  Printf.eprintf "%s: %s\n" st.State.arg0 msg;
+  flush stderr;
+  2
+
 let with_redirs st redirs f =
-  let saved = apply st redirs in
-  Fun.protect ~finally:(fun () -> restore saved) f
+  match apply st redirs with
+  | saved -> Fun.protect ~finally:(fun () -> restore saved) f
+  | exception Redirect msg -> redirect_failed st msg
 
 (* ---------- traps (2.11) ---------- *)
 
@@ -348,14 +376,16 @@ and run_simple ~replace st (s : simple) =
   if fields = [] then begin
     (* only assignments and redirections: both act on this shell, and the
        redirections are undone afterwards *)
-    let saved = apply st s.redirs in
-    Fun.protect ~finally:(fun () -> restore saved)
-      (fun () ->
-         List.iter (fun (n, w) ->
-             let v = Expand.to_string st w in
-             trace st [ n ^ "=" ^ v ];
-             State.set st n v) s.assigns;
-         0)
+    match apply st s.redirs with
+    | exception Redirect msg -> redirect_failed st msg
+    | saved ->
+        Fun.protect ~finally:(fun () -> restore saved)
+          (fun () ->
+             List.iter (fun (n, w) ->
+                 let v = Expand.to_string st w in
+                 trace st [ n ^ "=" ^ v ];
+                 State.set st n v) s.assigns;
+             0)
   end else begin
     let name = List.hd fields in
     let args = List.tl fields in
@@ -373,9 +403,15 @@ and run_simple ~replace st (s : simple) =
 (* `exec': the redirections stay in force, and with a command the shell
    is replaced by it (XCU exec). *)
 and run_exec st args redirs =
-  if args = [] then (ignore (apply st redirs); 0)
+  (* exec is a special built-in, so a redirection it cannot make ends
+     the shell (2.8.1) *)
+  let redirect () =
+    match apply st redirs with
+    | saved -> ignore saved
+    | exception Redirect msg -> ignore (redirect_failed st msg); raise (Exit_shell 2) in
+  if args = [] then (redirect (); 0)
   else begin
-    ignore (apply st redirs);
+    redirect ();
     flush_all ();
     match search st (List.hd args) with
     | None -> Printf.eprintf "%s: %s: not found\n" st.arg0 (List.hd args); exit 127
@@ -397,7 +433,12 @@ and run_builtin st kind f name args assigns redirs =
         (n, match Hashtbl.find_opt st.vars n with
           | Some v -> Some { v with value = v.value }
           | None -> None)) values in
-  let saved = apply st redirs in
+  match apply st redirs with
+  | exception Redirect msg ->
+      let status = redirect_failed st msg in
+      (* with a special built-in the shell does not carry on *)
+      if kind = `Special then raise (Exit_shell 2) else status
+  | saved ->
   Fun.protect
     ~finally:(fun () ->
         restore saved;
@@ -409,7 +450,13 @@ and run_builtin st kind f name args assigns redirs =
        List.iter (fun (n, v) -> State.set st n v) values;
        match f st args with
        | status -> if name = "trap" then sync_traps st; status
-       | exception State.Error msg -> Printf.eprintf "%s: %s: %s\n" st.arg0 name msg; 1)
+       | exception State.Error msg ->
+           (* 2.8.1: an error in a special built-in ends a shell that is
+              not interactive; in a regular one the command fails and
+              the shell carries on *)
+           Printf.eprintf "%s: %s\n" st.arg0 msg;
+           flush stderr;
+           if kind = `Special then raise (Exit_shell 2) else 1)
 
 and run_function st body args assigns redirs =
   let values = List.map (fun (n, w) -> (n, Expand.to_string st w)) assigns in
@@ -419,7 +466,9 @@ and run_function st body args assigns redirs =
           | Some v -> Some { v with value = v.value }
           | None -> None)) values in
   let saved_params = st.params in
-  let saved = apply st redirs in
+  match apply st redirs with
+  | exception Redirect msg -> redirect_failed st msg
+  | saved ->
   st.locals <- [] :: st.locals;
   st.params <- args;
   Fun.protect
@@ -464,6 +513,7 @@ and run_external ~replace st name fields assigns redirs =
          | None -> Printf.eprintf "%s: %s: not found\n" st.arg0 name; exit 127
          | Some path -> Unix.execve path (Array.of_list fields) (State.environment st)
        with
+       | Redirect msg -> exit (redirect_failed st msg)
        | Unix.Unix_error (e, _, _) ->
            Printf.eprintf "%s: %s: %s\n" st.arg0 name (Unix.error_message e); exit 126
        | State.Error msg -> Printf.eprintf "%s: %s\n" st.arg0 msg; exit 1)

@@ -27,6 +27,21 @@ let search_hook : (State.t -> string -> string option) ref =
 let out s = print_string s
 let outl s = print_string s; print_char '\n'
 
+(* An error in a special built-in ends a shell that is not interactive
+   (2.8.1); one in a regular built-in only fails the command.  Which
+   happens is decided where the built-in is run, so the built-in raises
+   and does not choose. *)
+let fail name fmt =
+  Printf.ksprintf (fun msg -> raise (State.Error (name ^ ": " ^ msg))) fmt
+
+(* 2.5: a name is an underscore or a letter, then letters, digits and
+   underscores; anything else cannot be a variable and is an error
+   rather than something quietly ignored. *)
+let is_name s =
+  s <> ""
+  && (Posix.Regex.is_alpha s.[0] || s.[0] = '_')
+  && String.for_all (fun c -> Posix.Regex.is_alnum c || c = '_') s
+
 let error name fmt =
   Printf.ksprintf (fun s -> Printf.eprintf "%s: %s\n" name s; flush stderr) fmt
 
@@ -92,7 +107,7 @@ let cd st args =
         else [ dir ] in
       let rec attempt = function
         | [] ->
-            error "cd" "%s: %s" dir (Unix.error_message Unix.ENOENT); 1
+            error "cd" "%s: %s" dir (Unix.error_message Unix.ENOENT); 2
         | d :: rest ->
             (match Unix.chdir d with
              | () ->
@@ -102,7 +117,7 @@ let cd st args =
                  if rest <> [] && d <> dir then outl (Unix.getcwd ());
                  0
              | exception Unix.Unix_error (e, _, _) ->
-                 if rest = [] then (error "cd" "%s: %s" d (Unix.error_message e); 1)
+                 if rest = [] then (error "cd" "%s: %s" d (Unix.error_message e); 2)
                  else attempt rest) in
       attempt candidates
 
@@ -143,6 +158,7 @@ let export_or_readonly st which args =
         match String.index_opt a '=' with
         | Some i ->
             let name = String.sub a 0 i in
+            if not (is_name name) then fail which "%s: bad variable name" name;
             (match State.set st name (String.sub a (i + 1) (String.length a - i - 1)) with
              | () -> mark st name
              | exception State.Error msg -> error which "%s" msg; status := 1)
@@ -155,6 +171,12 @@ let export_or_readonly st which args =
 let unset_builtin st args =
   let functions = List.mem "-f" args and vars_only = List.mem "-v" args in
   let names = List.filter (fun a -> a <> "-f" && a <> "-v") args in
+  List.iter (fun a ->
+      if String.length a > 1 && a.[0] = '-' then fail "unset" "Illegal option %s" a)
+    names;
+  let names = List.filter (fun a -> a <> "--") names in
+  List.iter (fun name ->
+      if not (is_name name) then fail "unset" "%s: bad variable name" name) names;
   let status = ref 0 in
   List.iter (fun name ->
       if functions && not vars_only then st.funcs <- List.remove_assoc name st.funcs
@@ -168,9 +190,11 @@ let unset_builtin st args =
 
 let shift st args =
   let k = match args with [] -> 1 | a :: _ ->
-    (match int_of_string_opt a with Some v -> v | None -> error "shift" "%s: bad number" a; -1) in
-  if k < 0 then 1
-  else if k > List.length st.params then (error "shift" "can't shift that many"; 1)
+    (match int_of_string_opt a with
+     | Some v -> v
+     | None -> fail "shift" "Illegal number: %s" a) in
+  if k < 0 then fail "shift" "Illegal number: %d" k
+  else if k > List.length st.params then fail "shift" "can't shift that many"
   else begin
     let rec drop n l = if n = 0 then l else match l with [] -> [] | _ :: t -> drop (n - 1) t in
     st.params <- drop k st.params;
@@ -223,6 +247,8 @@ let set_builtin st args =
              | ' ' -> ()
              | c -> (List.assoc c option_letters) st.opts false);
             go rest
+        | ("-o" | "+o") :: name :: _ ->
+            fail "set" "Illegal option -o %s" name
         | [ "-o" ] ->
             List.iter (fun (name, c) ->
                 if c <> ' ' then
@@ -241,7 +267,7 @@ let set_builtin st args =
                 if c <> '-' && c <> '+' then
                   match List.assoc_opt c option_letters with
                   | Some f -> f st.opts on
-                  | None -> error "set" "%c: bad option" c; status := 1)
+                  | None -> fail "set" "Illegal option %c%c" (if on then '-' else '+') c)
               (String.sub a 1 (String.length a - 1));
             go rest
         | rest -> st.params <- rest in
@@ -253,7 +279,9 @@ let set_builtin st args =
 let read_builtin st args =
   let raw = List.mem "-r" args in
   let names = List.filter (fun a -> a <> "-r") args in
-  let names = if names = [] then [ "REPLY" ] else names in
+  (* XCU read wants at least one name, and the reference shell says so
+     rather than reading into a variable of its own choosing *)
+  if names = [] then (error "read" "arg count"; 2) else begin
   (* One line, honouring the backslash continuation unless -r.  The
      bytes are taken one at a time from the descriptor rather than
      through a buffered channel: `read' must leave everything after the
@@ -309,6 +337,7 @@ let read_builtin st args =
         assign rest !k in
   assign names 0;
   if !eof && line = "" then 1 else 0
+  end
 
 (* ---------- trap ---------- *)
 
@@ -349,7 +378,7 @@ let eval_builtin st args =
 
 let dot st args =
   match args with
-  | [] -> error "." "filename argument required"; 2
+  | [] -> fail "." "filename argument required"
   | file :: params ->
       let path =
         if String.contains file '/' then Some file
@@ -357,7 +386,7 @@ let dot st args =
           | Some p -> Some p
           | None -> if Sys.file_exists file then Some file else None in
       (match path with
-       | None -> error "." "%s: not found" file; 1
+       | None -> fail "." "%s: not found" file
        | Some p ->
            (match In_channel.with_open_bin p In_channel.input_all with
             | text ->
@@ -369,7 +398,7 @@ let dot st args =
                 (match !eval_hook st text with
                  | s -> restore (); s
                  | exception e -> restore (); raise e)
-            | exception Sys_error msg -> error "." "%s" msg; 1))
+            | exception Sys_error msg -> fail "." "%s" msg))
 
 (* ---------- getopts ---------- *)
 
@@ -496,6 +525,22 @@ let unalias_builtin _st args =
     !status
   end
 
+(* Whether a name is one of the built-ins.  The tables at the end of
+   this file are the answer, and they are below because their entries
+   are the functions above; this is set from them there, so that a
+   built-in added to a table is one `type' and `command -v' know about
+   without a second list to keep in step. *)
+let is_builtin : (string -> [ `Special | `Regular ] option) ref = ref (fun _ -> None)
+
+(* 2.14 divides them, and `type' says which: an error in a special
+   built-in ends a non-interactive shell, and the assignments on its
+   command line stay in effect, so which one a name is matters. *)
+let builtin_kind name =
+  match !is_builtin name with
+  | Some `Special -> Some "special shell builtin"
+  | Some `Regular -> Some "shell builtin"
+  | None -> None
+
 let command_builtin st args =
   let rec strip = function
     | "-p" :: rest -> strip rest
@@ -511,16 +556,14 @@ let command_builtin st args =
       | None ->
       if List.mem_assoc name st.funcs then
         (outl (if verbose then name ^ " is a shell function" else name); flush stdout; 0)
-      else if List.mem name [ "cd"; "echo"; "printf"; "test"; "["; "read"; "pwd";
-                              "true"; "false"; "command"; "type"; "umask"; "wait"; "hash";
-                              "alias"; "unalias"; "getopts" ]
-              || List.mem name [ ":"; "."; "break"; "continue"; "eval"; "exec"; "exit";
-                                 "export"; "readonly"; "return"; "set"; "shift"; "times";
-                                 "trap"; "unset"; "local" ]
-      then (outl (if verbose then name ^ " is a shell builtin" else name); flush stdout; 0)
-      else (match !search_hook st name with
+      else (match builtin_kind name with
+      | Some what -> outl (if verbose then name ^ " is a " ^ what else name); flush stdout; 0
+      | None ->
+      match !search_hook st name with
           | Some p -> outl (if verbose then name ^ " is " ^ p else p); flush stdout; 0
-          | None -> if verbose then error "command" "%s: not found" name; 1))
+          | None ->
+              if verbose then (outl (name ^ ": not found"); flush stdout);
+              127))
   | [] -> 0
   | argv -> !exec_hook st argv
 
@@ -531,15 +574,17 @@ let type_builtin st args =
       | Some v -> outl (name ^ " is an alias for " ^ v)
       | None ->
       if List.mem_assoc name st.funcs then outl (name ^ " is a function")
-      else if List.mem name [ ":"; "."; "break"; "continue"; "eval"; "exec"; "exit";
-                              "export"; "readonly"; "return"; "set"; "shift"; "times";
-                              "trap"; "unset"; "local"; "cd"; "echo"; "printf"; "test";
-                              "["; "read"; "pwd"; "true"; "false"; "command"; "type";
-                              "umask"; "wait"; "hash" ]
-      then outl (name ^ " is a shell builtin")
-      else match !search_hook st name with
+      else match builtin_kind name with
+      | Some what -> outl (name ^ " is a " ^ what)
+      | None ->
+      match !search_hook st name with
         | Some p -> outl (name ^ " is " ^ p)
-        | None -> Printf.eprintf "type: %s: not found\n" name; status := 1) args;
+        | None ->
+            (* the reference shell names what was not found, not itself,
+               and says so on the standard output, since for `type' that
+               is the answer to the question and not a diagnostic *)
+            outl (name ^ ": not found");
+            status := 127) args;
   flush stdout;
   !status
 
@@ -554,7 +599,7 @@ let umask_builtin _st args =
   | a :: _ ->
       (match int_of_string_opt ("0o" ^ a) with
        | Some m -> ignore (Unix.umask m); 0
-       | None -> error "umask" "%s: bad mask" a; 1)
+       | None -> error "umask" "%s: bad mask" a; 2)
 
 let times_builtin _st _args =
   let t = Unix.times () in
@@ -567,7 +612,15 @@ let times_builtin _st _args =
   flush stdout;
   0
 
-let hash_builtin _st _args = 0
+(* hash keeps no table -- the search is cheap and a stale entry is
+   worse than none -- but it does answer for the names it is given, as
+   the reference shell does: one that cannot be found is an error. *)
+let hash_builtin st args =
+  let status = ref 0 in
+  List.iter (fun name ->
+      if name <> "-r" && !search_hook st name = None then
+        (error "hash" "%s: not found" name; status := 1)) args;
+  !status
 
 let wait_builtin _st args =
   let one pid =
@@ -596,7 +649,7 @@ let wait_builtin _st args =
 
 let local_builtin st args =
   match st.locals with
-  | [] -> error "local" "not in a function"; 1
+  | [] -> fail "local" "not in a function"
   | frame :: rest ->
       let frame = ref frame in
       List.iter (fun a ->
@@ -654,6 +707,9 @@ let special : (string * (State.t -> string list -> int)) list = [
   "times", times_builtin;
   "trap", trap_builtin;
   "unset", unset_builtin;
+  (* not in 2.14, which does not have local at all; the reference shell
+     makes it special, so an error in it ends the shell *)
+  "local", local_builtin;
 ]
 
 let regular : (string * (State.t -> string list -> int)) list = [
@@ -664,7 +720,6 @@ let regular : (string * (State.t -> string list -> int)) list = [
   "false", false_builtin;
   "getopts", getopts_builtin;
   "hash", hash_builtin;
-  "local", local_builtin;
   "printf", printf_builtin;
   "pwd", pwd;
   "read", read_builtin;
@@ -676,6 +731,11 @@ let regular : (string * (State.t -> string list -> int)) list = [
   "unalias", unalias_builtin;
   "wait", wait_builtin;
 ]
+
+let () = is_builtin := (fun name ->
+    if List.mem_assoc name special then Some `Special
+    else if List.mem_assoc name regular then Some `Regular
+    else None)
 
 let find name =
   match List.assoc_opt name special with
