@@ -237,6 +237,9 @@ and word_of st =
 and simple st =
   let ln = line st in
   let assigns = ref [] and words = ref [] and redirs = ref [] in
+  (* the command name has one chance at alias substitution, whether it
+     is the first word or follows assignments *)
+  let tried = ref false in
   let rec go () =
     if at_redirect st then (redirs := redirect st :: !redirs; go ())
     else
@@ -245,6 +248,11 @@ and simple st =
           (* an assignment only counts before the command name (2.9.1) *)
           (match (if !words = [] then Word.assignment raw else None) with
            | Some a -> advance st; assigns := a :: !assigns; go ()
+           | None when !words = [] && !assigns <> [] && not !tried && Alias.defined () ->
+               (* the word after the assignments is the command name --
+                  cmd_word in the grammar of 2.10.2 -- and an alias is
+                  looked for there as well as at the start *)
+               tried := true; alias_subst st; go ()
            | None -> advance st; words := Word.parse raw :: !words; go ())
       | _ -> () in
   go ();

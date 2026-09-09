@@ -52,3 +52,18 @@ echo "none left"
 # an alias is not looked for where a command name cannot go
 alias arg=replaced
 echo arg
+
+# the command name is where an alias is looked for, whether it is the
+# first word or follows assignments (cmd_word in the grammar of 2.10.2)
+alias show='echo alias ran'
+V=1 show
+# and in every other place a command may start
+if true; then show; fi
+! show
+{ show; }
+(show)
+for i in 1; do show; done
+case x in x) show;; esac
+# but not when the word is quoted
+'show' 2>/dev/null || echo "quoted: not an alias"
+\show 2>/dev/null || echo "escaped: not an alias"
