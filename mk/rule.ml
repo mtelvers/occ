@@ -47,6 +47,7 @@ type t = {
   (* .PRECIOUS and .SECONDARY name files make must not delete, either as
      an intermediate in a chain or when a recipe fails (10.4, 10.5.5) *)
   mutable precious : string list;
+  mutable notparallel : bool;              (* .NOTPARALLEL: run one job at a time *)
   (* The rules that make each target.  A target written with one colon
      has exactly one entry, its rules merged; a target written with two
      has one entry per rule, since 4.13 makes each of those independent
@@ -55,7 +56,8 @@ type t = {
 }
 
 let create () = { explicit = []; patterns = []; tsvs = []; second_expansion = false;
-                  vpaths = []; precious = []; phony = Hashtbl.create 64;
+                  vpaths = []; precious = []; notparallel = false;
+                  phony = Hashtbl.create 64;
                   by_target = Hashtbl.create 256 }
 
 (* A file may be named by several rules: the prerequisites add up, and at

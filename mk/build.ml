@@ -6,7 +6,18 @@
    (implicit rules, 10.5); the first pattern whose prerequisites can
    themselves be made is used.  The recipe runs one line per shell, with
    the automatic variables (target, first and all prerequisites,
-   the newer ones, and the stem) bound. *)
+   the newer ones, and the stem) bound.
+
+   With -j the same walk is made, but instead of running each recipe
+   where it is reached the walk records it as a job, with the jobs its
+   prerequisites need; a scheduler then runs the jobs, several at a
+   time, each in its own process.  Because the walk is depth-first, a
+   job's own jobs always come before it in the list, so the order the
+   walk produces is already a topological one.  The one thing this
+   changes is that whether a target must be rebuilt is decided before its
+   prerequisites' recipes have run, so a prerequisite that *will* be
+   rebuilt counts as newer -- which is the same conclusion make reaches,
+   since a recipe is assumed to change what it writes. *)
 
 type t = {
   db : Value.t;
@@ -22,7 +33,35 @@ type t = {
   intermediates : (string, unit) Hashtbl.t;
   mentioned : (string, unit) Hashtbl.t;          (* names a rule writes out *)
   goals : (string, unit) Hashtbl.t;
+  (* -j: the recipes to run, recorded by the walk instead of being run *)
+  parallel : bool;
+  mutable jobs : job list;                       (* reversed *)
+  planned : (string, int) Hashtbl.t;             (* target -> its job *)
+  (* The jobs that must finish before a target is current.  A target
+     with no recipe of its own still stands for its prerequisites' jobs,
+     so this is what makes the wait transitive: without it a recipe that
+     names a phony target as a prerequisite would start before the
+     program that target builds was finished. *)
+  needs : (string, int list) Hashtbl.t;
+  mutable path : string list;                    (* targets entered, innermost first *)
+  mutable ran : int;                             (* recipes run or recorded *)
   mutable failed : bool;
+}
+
+(* One recipe to run: everything its expansion needs, since it is
+   expanded in the child that runs it.  [jpath] is the targets whose
+   target-specific variables are in force, outermost first: those are
+   applied on the way into a target and reach its prerequisites (6.11),
+   so a job has to put them back. *)
+and job = {
+  jtarget : string;
+  jlines : string list;
+  jstem : string;
+  jprereqs : string list;
+  jorder : string list;
+  jnewer : string list;
+  jpath : string list;
+  jdeps : int list;
 }
 
 let mtime f = match Unix.stat f with s -> Some s.Unix.st_mtime | exception _ -> None
@@ -191,6 +230,15 @@ let set_automatic b ~target ~prereqs ~order ~newer ~stem =
   set "?" (String.concat " " newer);
   set "*" stem; set "*D" (dirpart stem); set "*F" (filepart stem)
 
+(* The jobs [t] must wait for: those of its prerequisites, taken
+   transitively through any prerequisite that has no job of its own, and
+   any job already recorded for [t] itself. *)
+let needs_of b t prereqs =
+  let out = List.concat_map (fun p ->
+      match Hashtbl.find_opt b.needs p with Some l -> l | None -> []) prereqs in
+  let own = match Hashtbl.find_opt b.needs t with Some l -> l | None -> [] in
+  List.sort_uniq compare (own @ out)
+
 (* Does the line start a sub-make?  Such a line is run even under -n, so
    that a dry run shows the whole recursive plan (9.3); -n reaches the
    sub-make through MAKEFLAGS instead. *)
@@ -252,7 +300,10 @@ let rec update b (t : string) : bool =
 
 and update_uncached b t =
   let restore = apply_tsv b t in
-  Fun.protect ~finally:restore (fun () -> update_body b t)
+  b.path <- t :: b.path;
+  Fun.protect
+    ~finally:(fun () -> b.path <- List.tl b.path; restore ())
+    (fun () -> update_body b t)
 
 and update_body b t =
   (* Each of the target's rules in turn: one, unless it was written with
@@ -342,20 +393,111 @@ and update_one b t ~was h =
           if debug then
             Printf.eprintf "occmake: %s: running with prereqs=[%s]\n  recipe: %s\n" t
               (String.concat " " prereqs) (String.concat "\n  recipe: " r.recipe);
-          set_automatic b ~target:t ~prereqs ~order
-            ~newer:(if newer = [] then prereqs else newer) ~stem;
-          if debug then
-            Printf.eprintf "occmake: %s: automatics @=[%s] <=[%s] ^=[%s]\n" t
-              (Value.get b.db "@") (Value.get b.db "<") (Value.get b.db "^");
-          let ok = if b.question then false else run_recipe b ~target:t ~lines:r.recipe in
-          if b.question then (b.failed <- true; true)
-          else if ok then true
-          else (b.failed <- true; false)
+          b.ran <- b.ran + 1;
+          if b.parallel then begin
+            (* record it, with every job it must wait for: those of its
+               prerequisites, and any earlier rule of this same target,
+               since a target's rules run in the order they were written *)
+            let deps = needs_of b t (prereqs @ order) in
+            let index = List.length b.jobs in
+            b.jobs <- { jtarget = t; jlines = r.recipe; jstem = stem; jprereqs = prereqs;
+                        jorder = order; jnewer = (if newer = [] then prereqs else newer);
+                        jpath = List.rev b.path; jdeps = deps } :: b.jobs;
+            Hashtbl.replace b.planned t index;
+            Hashtbl.replace b.needs t [ index ];
+            true
+          end else begin
+            set_automatic b ~target:t ~prereqs ~order
+              ~newer:(if newer = [] then prereqs else newer) ~stem;
+            if debug then
+              Printf.eprintf "occmake: %s: automatics @=[%s] <=[%s] ^=[%s]\n" t
+                (Value.get b.db "@") (Value.get b.db "<") (Value.get b.db "^");
+            let ok = if b.question then false else run_recipe b ~target:t ~lines:r.recipe in
+            if b.question then (b.failed <- true; true)
+            else if ok then true
+            else (b.failed <- true; false)
+          end
         end
-        else must
+        else begin
+          if b.parallel then begin
+            let deps = needs_of b t (prereqs @ order) in
+            if deps <> [] && not (Hashtbl.mem b.planned t) then
+              Hashtbl.replace b.needs t deps
+          end;
+          must
+        end
       end
 
-let build ~db ~rules ~keep_going ~dry_run ~silent ~question ~name goals =
+(* ---------- running the recorded jobs, several at a time ---------- *)
+
+(* Each job runs in its own process, which expands the recipe and hands
+   its lines to the shell.  A job starts once every job it waits for has
+   finished; when one fails, nothing that waited for it is started, and
+   without -k nothing new is started at all. *)
+let run_jobs b (jobs : job array) ~limit =
+  let n = Array.length jobs in
+  let state = Array.make n `Waiting in
+  let pids = Hashtbl.create 16 in
+  let running = ref 0 and left = ref n in
+  let start i =
+    let j = jobs.(i) in
+    flush_all ();
+    match Unix.fork () with
+    | 0 ->
+        (* the variables of the targets this one was reached through, then
+           its own automatic ones *)
+        List.iter (fun p -> let _restore = apply_tsv b p in ()) j.jpath;
+        set_automatic b ~target:j.jtarget ~prereqs:j.jprereqs ~order:j.jorder
+          ~newer:j.jnewer ~stem:j.jstem;
+        let ok = run_recipe b ~target:j.jtarget ~lines:j.jlines in
+        exit (if ok then 0 else 1)
+    | pid ->
+        Hashtbl.replace pids pid i;
+        state.(i) <- `Running;
+        incr running in
+  let stopping () = b.failed && not b.keep_going in
+  let progress = ref true in
+  while !left > 0 && !progress do
+    progress := false;
+    (* a job whose dependencies failed cannot run *)
+    for i = 0 to n - 1 do
+      if state.(i) = `Waiting
+         && List.exists (fun d -> state.(d) = `Failed) jobs.(i).jdeps then begin
+        state.(i) <- `Failed; decr left; progress := true
+      end
+    done;
+    if not (stopping ()) then begin
+      let i = ref 0 in
+      while !running < limit && !i < n do
+        if state.(!i) = `Waiting
+           && List.for_all (fun d -> state.(d) = `Done) jobs.(!i).jdeps
+        then (start !i; progress := true);
+        incr i
+      done
+    end;
+    if !running > 0 then begin
+      match Unix.waitpid [] (-1) with
+      | (pid, st) ->
+          (match Hashtbl.find_opt pids pid with
+           | Some i ->
+               Hashtbl.remove pids pid;
+               decr running; decr left; progress := true;
+               (match st with
+                | Unix.WEXITED 0 -> state.(i) <- `Done
+                | _ -> state.(i) <- `Failed; b.failed <- true)
+           | None -> ())
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> progress := true
+      | exception _ -> progress := true
+    end
+  done;
+  (* anything still running when a failure stopped the rest *)
+  while !running > 0 do
+    match Unix.waitpid [] (-1) with
+    | (pid, _) -> if Hashtbl.mem pids pid then (Hashtbl.remove pids pid; decr running)
+    | exception _ -> running := 0
+  done
+
+let build ~db ~rules ~keep_going ~dry_run ~silent ~question ~jobs ~name goals =
   let mentioned = Hashtbl.create 512 in
   (* A file the makefile writes out by name -- as a target or as a
      prerequisite -- is not an intermediate, however it came to be built:
@@ -366,11 +508,37 @@ let build ~db ~rules ~keep_going ~dry_run ~silent ~question ~name goals =
     rules.Rule.explicit;
   let goal_set = Hashtbl.create 8 in
   List.iter (fun g -> Hashtbl.replace goal_set g ()) goals;
+  (* -j runs the recipes from a recorded list; a dry run, a question and
+     .NOTPARALLEL all keep the walk running them where it reaches them *)
+  let limit =
+    if dry_run || question || rules.Rule.notparallel then 1
+    else if jobs = 0 then 1024 else jobs in
   let b = { db; rules; building = Hashtbl.create 64; done_ = Hashtbl.create 256;
             keep_going; dry_run; silent; question; name;
             intermediates = Hashtbl.create 64; mentioned; goals = goal_set;
-            failed = false } in
-  List.iter (fun g -> ignore (update b (resolve b g))) goals;
+            parallel = limit > 1; jobs = []; planned = Hashtbl.create 256;
+            needs = Hashtbl.create 256;
+            path = []; ran = 0; failed = false } in
+  (* Each goal in turn, then a word about the ones that needed nothing:
+     make says a goal it found and did not have to touch is up to date,
+     and one it could do nothing for at all has nothing to be done. *)
+  let idle = List.filter (fun g ->
+      let before = b.ran in
+      ignore (update b (resolve b g));
+      b.ran = before) goals in
+  if b.parallel then run_jobs b (Array.of_list (List.rev b.jobs)) ~limit;
+  if not question then
+    List.iter (fun g ->
+        let r = resolve b g in
+        if not b.failed then
+          if exists r || locate b r <> None then
+            Printf.printf "%s: '%s' is up to date.\n" name g
+          else Printf.printf "%s: Nothing to be done for '%s'.\n" name g) idle;
+  (* with -k, make says which goals it could not finish *)
+  if b.failed && keep_going then
+    List.iter (fun g ->
+        Printf.eprintf "%s: Target '%s' not remade because of errors.\n" name g) goals;
+  flush stdout;
   (* The intermediates go last, in one report, as make does.  Their order
      here is settled rather than the reference's, which is its own
      internal one. *)

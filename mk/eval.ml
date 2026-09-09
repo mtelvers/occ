@@ -354,6 +354,7 @@ and parse_rule_body st line =
            if List.mem ".PRECIOUS" targets || List.mem ".SECONDARY" targets then
              List.iter (Rule.mark_precious st.rules) prereqs;
            if List.mem ".SECONDEXPANSION" targets then st.rules.Rule.second_expansion <- true;
+           if List.mem ".NOTPARALLEL" targets then st.rules.Rule.notparallel <- true;
            make_rule targets prereqs order is_pattern)
 
 and top_colon line =

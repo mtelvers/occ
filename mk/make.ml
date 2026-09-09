@@ -183,6 +183,6 @@ let run argv =
   let goals = if o.goals <> [] then o.goals
     else match st.default_goal with Some g -> [ g ] | None -> (match rules.Rule.explicit with r :: _ -> [ List.hd r.targets ] | [] -> []) in
   let ok = Build.build ~db ~rules ~keep_going:o.keep_going ~dry_run:o.dry_run
-      ~silent:o.silent ~question:o.question ~name:me goals in
+      ~silent:o.silent ~question:o.question ~jobs:o.jobs ~name:me goals in
   announce "Leaving";
   if ok then 0 else if o.question then 1 else 2
