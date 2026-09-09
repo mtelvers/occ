@@ -613,11 +613,13 @@ let main argv opts operands =
   let quiet = Posix.Getopt.has opts "n" || Posix.Getopt.has opts "quiet"
               || Posix.Getopt.has opts "silent" in
   let in_place = Posix.Getopt.arg opts "i" in
-  (* -u writes each line as it is produced rather than in blocks, so
-     that a pipeline can be watched; without it the reference sed waits
-     for a block, whatever it is reading *)
-  if Posix.Getopt.has opts "u" || Posix.Getopt.has opts "unbuffered" then
-    streaming := true;
+  (* -u is accepted and changes nothing: it asks for each line to be
+     written as it is produced, and the output here is gathered until
+     the end because -i has to write the file back and whether the last
+     line keeps its newline is not known until then.  What is written is
+     the same either way; only when it appears differs, and
+     tools/streamcheck.sh names that difference. *)
+  ignore (Posix.Getopt.has opts "u");
   let scripts =
     Posix.Getopt.all opts "e" @ Posix.Getopt.all opts "expression"
     @ List.concat_map (fun f ->
