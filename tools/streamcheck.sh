@@ -78,6 +78,30 @@ check cut  cut -c1-3
 check tr   tr a-z A-Z
 check uniq uniq
 check head head -n 100
+# The other half of when: a utility that has its answer stops reading.
+# `yes | grep -q y' has to end, and so does `yes | head -n 1'; a
+# utility that read to the end of its input instead would never return.
+ends() {                       # ends command...: did it end in time?
+  if timeout 5 sh -c "yes 2>/dev/null | $* >/dev/null 2>&1"; then echo yes
+  else [ $? = 124 ] && echo no || echo yes; fi
+}
+
+check_end() {                  # check_end name arguments...
+  name=$1; shift
+  n=$((n+1))
+  binary=$(ref "$1"); shift
+  a=$(ends "$binary" "$@")
+  b=$(ends "$OCCUTILS" "$name" "$@")
+  if [ "$a" != "$b" ]; then
+    fail=$((fail+1))
+    echo "DIFF $name $*: reference ended: $a, occutils: $b"
+  fi
+}
+
+check_end grep grep -q y
+check_end head head -n 1
+check_end cmp  cmp -s /dev/null -
+
 rm -rf "$work"
 echo "$n cases, $fail differ, $known known differences"
 [ "$fail" = 0 ]

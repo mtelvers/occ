@@ -57,6 +57,12 @@ let find ?(from = 0) ~whole ~word (m : matcher) line =
           else Some (a, b) in
   go from
 
+(* -q asks only whether anything matched, so the answer is known at the
+   first match and the reference grep stops there: `yes | grep -q y' has
+   to end.  each_line has no way out, so the answer leaves by an
+   exception. *)
+exception Answered
+
 let main_opts _argv opts operands =
   let has = Posix.Getopt.has opts in
   let kind = if has "F" then Fixed else if has "E" then Ere else Bre in
@@ -97,13 +103,13 @@ let main_opts _argv opts operands =
         let prefix n =
           (if show_name then emit (name_of file ^ ":"));
           if number then emit (string_of_int n ^ ":") in
-        each_line (fun n line _nl ->
+        (try each_line (fun n line _nl ->
             if not !stop then begin
               let hit = List.exists (fun m -> find ~whole ~word m line <> None) matchers in
               if hit <> invert then begin
                 any := true;
                 incr count;
-                if quiet then stop := true
+                if quiet then raise Answered
                 else if list_only then (emit_line (name_of file); stop := true)
                 else if count_only then ()
                 else if only && not invert then
@@ -125,7 +131,8 @@ let main_opts _argv opts operands =
                       go 0) matchers
                 else (prefix n; emit_line line)
               end
-            end) ic;
+            end) ic
+         with Answered -> ());
         close_input ic;
         if count_only && not quiet && not list_only then begin
           if show_name then emit (name_of file ^ ":");

@@ -201,8 +201,8 @@ bytes.
      248 utility cases, identical but for four named differences
       13 makefiles, identical plans
        8 parallel runs, the same peak number of recipes at once
-      11 cases of when a utility passes its output on, one named
-         difference
+      14 cases of when a utility passes its output on or stops
+         reading, one named difference
 
 ## A build with no C
 

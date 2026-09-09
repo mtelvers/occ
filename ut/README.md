@@ -42,6 +42,11 @@ another here, and `tools/streamcheck.sh` measures the difference: it
 gives a utility a line, then two seconds of silence, and looks at
 whether the line has come out before the input ended.
 
+The other half of the question is when a utility stops reading: one
+that has its answer does not read the rest. `grep -q` stops at the
+first match, so `yes | grep -q y` ends; the same holds for `head` once
+it has its lines and for `cmp` at the first byte that differs.
+
 `cat` and `tee` write each block as they read it. `grep`, `sed`, `awk`
 and the rest wait for a block of output to gather, whatever they are
 reading, unless asked not to: `grep --line-buffered` passes a line on

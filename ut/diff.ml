@@ -179,14 +179,21 @@ let main _argv opts operands =
         | l -> l
         | exception e -> warn "%s" (sys_message e); raise (Fail 2) in
       let key = Array.map (normalise ~ignore_space ~ignore_case) in
-      let edits = script (key a) (key b) in
-      let differs = List.exists (fun e -> match e with Keep _ -> false | _ -> true) edits in
-      if not differs then 0
+      let ka = key a and kb = key b in
+      (* Two questions are answered by comparing the lines, and the
+         reference diff answers them that way before it looks for an
+         edit script: whether the files are the same at all, which they
+         usually are where the OCaml test suite uses diff, and -q, which
+         asks only whether they differ.  Looking for a shortest edit
+         script over a large file to answer either would cost a hundred
+         times as much. *)
+      if ka = kb then 0
       else if brief then begin
         emit_line (Printf.sprintf "Files %s and %s differ" left right);
         flush_out ();
         1
       end else begin
+        let edits = script ka kb in
         let groups = hunks ~context a b edits in
         if unified then begin
           emit_line (Printf.sprintf "--- %s\t%s" left (timestamp left));
