@@ -33,11 +33,12 @@ the full C operator set including the assignments; field splitting on
 IFS with the white-space rule; pathname expansion; the grammar of 2.10
 in full (pipelines, AND-OR lists, `if`, `while`, `until`, `for`, `case`,
 `{ }`, subshells, function definitions, `!`); every redirection operator
-of 2.7 including here-documents and descriptor duplication; the special
-and regular built-ins of 2.14; traps including EXIT; and the options
+of 2.7 including here-documents and descriptor duplication; alias
+substitution (2.3.1); the special and regular built-ins of 2.14,
+`getopts` and `alias` included; traps including EXIT; and the options
 `-e -u -x -f -v -n -C -a -m -o`, with the `-e` exemptions of 2.8.1.
 
-Two points that decide whether real scripts work:
+Four points that decide whether real scripts work:
 
 - **A field is text plus a mark per character.** Whether a `*` is a
   pattern or a literal, and whether a space splits a field, depends on
@@ -50,6 +51,17 @@ Two points that decide whether real scripts work:
   autoconf builds temporary file names from it in one process and reads
   them back in another; a `$$` that changed in a subshell would leave
   configure looking for a file that was never written.
+
+- **An error either ends the shell or fails one command, and 2.8.1
+  says which.** An error in a special built-in, and a redirection a
+  special built-in cannot make, end a shell that is not interactive
+  with status 2; the same error in a regular built-in, a function, an
+  external command or a compound command reports itself, fails that
+  command with status 2, and the shell goes on. So `: > /nowhere/f`
+  ends the shell and `echo hi > /nowhere/f` does not, and `. missing`
+  stops a script where `cd missing` does not. Built-ins raise their
+  errors rather than deciding what should follow, which keeps the rule
+  in one place.
 
 - **The input is read a line at a time, not all at once.** A shell reads
   a complete command, runs it, and only then reads more (2.10.2). Three
@@ -67,8 +79,10 @@ under occsh in matching scratch directories and compares standard
 output, standard error, the exit status and the files left behind. The
 scripts are one per clause group: quoting, parameters, splitting,
 arithmetic, redirection, control flow, functions, built-ins, `set -e`,
-patterns, command substitution, aliases, `getopts`, and reading the
-input a line at a time.
+patterns, command substitution, aliases, `getopts`, the shell errors
+of 2.8.1, and reading the input a line at a time. The error script
+compares what the shell does next rather than what it says: a
+diagnostic carries the shell's own name, so those can never match.
 
 A `.expected` file beside a script means the two are meant to differ
 there. `$LINENO` is one case, since the reference shell does not have
