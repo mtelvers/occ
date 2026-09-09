@@ -36,11 +36,13 @@ let utilities : entry list = [
   e "sort" ~long:[ "help", false ] "bcdfimnrusz:t:k:o:" Textio.sort;
   e "uniq" "cdiuf:s:w:" Textio.uniq;
   e "cmp" "ls" Textio.cmp;
-  e "grep" ~long:[ "quiet", false; "silent", false; "color", true ]
+  e "grep" ~long:[ "quiet", false; "silent", false; "color", true;
+                   "line-buffered", false ]
     "EFGce:f:HhilnoqsvwxaP" Grep.main_opts;
   e "sed" ~long:[ "expression", true; "quiet", false; "silent", false;
-                  "in-place", false; "regexp-extended", false; "separate", false ]
-    "nEre:f:i:sz" Sed.main;
+                  "in-place", false; "regexp-extended", false; "separate", false;
+                  "unbuffered", false ]
+    "nEre:f:i:suz" Sed.main;
   e "awk" "F:v:f:" Awk.main;
   e "diff" ~long:[ "quiet", false; "brief", false; "unified", false;
                    "ignore-all-space", false; "exit-code", false;

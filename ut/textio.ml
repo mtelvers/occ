@@ -20,10 +20,12 @@ let cat _argv opts operands =
       match open_input file with
       | exception e -> warn "%s" (sys_message e); status := 1
       | ic ->
+          (* cat writes each block as it reads it, so what it is copying
+             can be watched as it goes *)
           let chunk = Bytes.create 65536 in
           let rec copy () =
             let k = input ic chunk 0 65536 in
-            if k > 0 then (emit (Bytes.sub_string chunk 0 k); copy ()) in
+            if k > 0 then (emit (Bytes.sub_string chunk 0 k); flush_out (); copy ()) in
           copy ();
           close_input ic)
     (inputs operands);
@@ -40,12 +42,16 @@ let tee _argv opts operands =
       | oc -> Some oc
       | exception e -> warn "%s" (sys_message e); None) operands in
   let expected = List.length operands in
+  (* Each block goes to every output as soon as it is read: a tee
+     nobody can read until the input ends is no use, and the OCaml test
+     suite watches its progress through one. *)
   let chunk = Bytes.create 65536 in
   let rec copy () =
     let k = input stdin chunk 0 65536 in
     if k > 0 then begin
       print_string (Bytes.sub_string chunk 0 k);
-      List.iter (fun oc -> output_bytes oc (Bytes.sub chunk 0 k)) channels;
+      flush stdout;
+      List.iter (fun oc -> output_bytes oc (Bytes.sub chunk 0 k); flush oc) channels;
       copy ()
     end in
   copy ();

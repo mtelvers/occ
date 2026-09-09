@@ -613,6 +613,11 @@ let main argv opts operands =
   let quiet = Posix.Getopt.has opts "n" || Posix.Getopt.has opts "quiet"
               || Posix.Getopt.has opts "silent" in
   let in_place = Posix.Getopt.arg opts "i" in
+  (* -u writes each line as it is produced rather than in blocks, so
+     that a pipeline can be watched; without it the reference sed waits
+     for a block, whatever it is reading *)
+  if Posix.Getopt.has opts "u" || Posix.Getopt.has opts "unbuffered" then
+    streaming := true;
   let scripts =
     Posix.Getopt.all opts "e" @ Posix.Getopt.all opts "expression"
     @ List.concat_map (fun f ->

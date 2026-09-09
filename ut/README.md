@@ -26,9 +26,30 @@ shell's built-in and the utility of the same name cannot drift apart.
 
 The reference is IEEE Std 1003.1-2017 volume XCU for the behaviour, and
 the GNU utilities for the details the standard leaves open, since those
-are the ones the build's scripts were written against. Everything
+are the ones the build's scripts were written against. Name the
+reference by its path when measuring it: an interactive shell may have
+a function or an alias of the same name that answers differently, and
+one here does. Everything
 compares by byte value: the reference runs are made under `LC_ALL=C`,
 and nothing here consults a locale.
+
+## When the output goes out
+
+Not only what a utility writes but when it writes it, since a pipeline
+may be watched while it runs -- the OCaml test suite watches its own
+progress through `tee`. The reference implementations differ from one
+another here, and `tools/streamcheck.sh` measures the difference: it
+gives a utility a line, then two seconds of silence, and looks at
+whether the line has come out before the input ended.
+
+`cat` and `tee` write each block as they read it. `grep`, `sed`, `awk`
+and the rest wait for a block of output to gather, whatever they are
+reading, unless asked not to: `grep --line-buffered` passes a line on
+as soon as it matches. `sed -u` is accepted and its output is the same,
+but it arrives when the input ends, because sed gathers its output --
+`-i` has to write the file back, and whether the last line keeps its
+newline is not known until then. Nothing in the OCaml build passes
+`-u`.
 
 ## The three that are not small
 

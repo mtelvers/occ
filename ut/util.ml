@@ -89,9 +89,26 @@ let flush_out () =
   if Buffer.length out > 0 then (print_string (Buffer.contents out); Buffer.clear out);
   flush stdout
 
+(* Whether to push each piece of output out as it is written rather than
+   in blocks.  The reference implementations differ here in a way that is
+   worth following, because it is what someone watching a pipeline sees:
+   grep passes a line on as soon as it has it when what it is reading is
+   not a regular file, since a pipe or a terminal brings one line at a
+   time and something is waiting to see it, while sed and awk buffer
+   whatever they are reading.  A regular file arrives in whole blocks and
+   nothing is waiting, so the output goes out in blocks too. *)
+let streaming = ref false
+
+let watch ic =
+  streaming :=
+    (match Unix.fstat (Unix.descr_of_in_channel ic) with
+     | { Unix.st_kind = Unix.S_REG; _ } -> false
+     | _ -> true
+     | exception _ -> false)
+
 let emit s =
   Buffer.add_string out s;
-  if Buffer.length out > 32768 then flush_out ()
+  if !streaming || Buffer.length out > 32768 then flush_out ()
 
 let emit_line s = emit s; emit "\n"
 

@@ -65,6 +65,11 @@ let main_opts _argv opts operands =
   let count_only = has "c" and list_only = has "l" and number = has "n" in
   let only = has "o" and whole = has "x" and word = has "w" in
   let silent = has "s" in
+  (* --line-buffered passes a line on as soon as it matches, rather than
+     when a block of output has gathered.  The reference grep waits for
+     the block unless asked, whatever it is reading, and this follows
+     it: a script that wants to watch a pipeline says so. *)
+  if has "line-buffered" then streaming := true;
   (* patterns from -e and -f, else the first operand *)
   let from_e = Posix.Getopt.all opts "e" in
   let from_f = List.concat_map lines_of_file (Posix.Getopt.all opts "f") in

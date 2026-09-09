@@ -194,12 +194,15 @@ bytes.
     tools/utcheck.py                        # occutils vs the GNU utilities
     tools/mkcheck.sh                        # occmake vs GNU make (-n plans)
     tools/jscheck.sh                        # occmake -jN vs GNU make -jN
+    tools/streamcheck.sh                    # when the output goes out
 
     7740 regex cases, identical
       21 shell scripts, identical output, error output, status and files
      248 utility cases, identical but for four named differences
       13 makefiles, identical plans
        8 parallel runs, the same peak number of recipes at once
+      11 cases of when a utility passes its output on, one named
+         difference
 
 ## A build with no C
 
