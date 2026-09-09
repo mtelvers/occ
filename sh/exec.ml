@@ -481,17 +481,36 @@ and run_pending_traps st =
         | _ -> ()) names
   end
 
+(* Reading and running a program.
+
+   The text is not parsed in one piece.  A shell reads a line, runs what
+   the line says, and only then reads the next (2.10.2), and that is
+   what this does: the lines before one that will not parse have
+   already run, an alias or a function defined by one line is there for
+   the next, and a here-document's body is read as its line is crossed.
+
+   A syntax error ends a shell that is not interactive (2.8.1), so the
+   diagnostic is followed by an exit rather than by a return, and that
+   holds wherever the text came from -- the script, -c, eval, or dot. *)
 and run_text st text =
-  match Parse.parse text with
-  | prog -> run_program st prog
-  | exception Parse.Error (msg, line) ->
-      Printf.eprintf "%s: line %d: %s\n" st.arg0 line msg;
-      if not st.subshell then st.status <- 2;
-      2
-  | exception Lex.Error (msg, line) ->
-      Printf.eprintf "%s: line %d: %s\n" st.arg0 line msg; 2
-  | exception Word.Error msg ->
-      Printf.eprintf "%s: %s\n" st.arg0 msg; 2
+  let stream = Parse.open_text text in
+  let status = ref st.status in
+  let fatal msg line =
+    Printf.eprintf "%s: line %d: %s\n" st.arg0 line msg;
+    flush stderr;
+    raise (Exit_shell 2) in
+  let stop = ref false in
+  while not !stop do
+    match Parse.next_line stream with
+    | None -> stop := true
+    | Some stmts -> List.iter (fun stmt -> status := run_stmt st stmt) stmts
+    | exception Parse.Error (msg, line) -> fatal msg line
+    | exception Lex.Error (msg, line) -> fatal msg line
+    | exception Word.Error msg ->
+        Printf.eprintf "%s: %s\n" st.arg0 msg; flush stderr;
+        raise (Exit_shell 2)
+  done;
+  !status
 
 (* ---------- command substitution ---------- *)
 

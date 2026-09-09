@@ -371,6 +371,131 @@ let dot st args =
                  | exception e -> restore (); raise e)
             | exception Sys_error msg -> error "." "%s" msg; 1))
 
+(* ---------- getopts ---------- *)
+
+(* XCU getopts: one option per call, with where the scan has reached
+   kept between calls.  OPTIND counts arguments, and is left holding one
+   past the argument being read, so where a call stopped inside a
+   clustered argument such as -abc has to be kept here instead.  A
+   script restarts the scan by assigning OPTIND, which is noticed
+   because the value is then not the one the last call left.
+
+   An optstring beginning with a colon asks for errors to be reported
+   through the variables rather than by a message: an unknown option
+   sets the name to `?' and OPTARG to the letter, and an option missing
+   its argument sets the name to `:'. *)
+let opt_word = ref 1                  (* the argument being scanned *)
+let opt_offset = ref 1                (* the character within it *)
+let opt_index = ref 0                 (* OPTIND as this builtin left it *)
+
+let getopts_builtin st args =
+  match args with
+  | optstring :: name :: rest ->
+      let params = if rest = [] then st.params else rest in
+      let count = List.length params in
+      let arg i = match List.nth_opt params (i - 1) with Some a -> a | None -> "" in
+      let silent = optstring <> "" && optstring.[0] = ':' in
+      let spec = if silent then String.sub optstring 1 (String.length optstring - 1) else optstring in
+      let optind =
+        match int_of_string_opt (State.get_or st "OPTIND" "1") with
+        | Some v when v >= 1 -> v
+        | _ -> 1 in
+      if optind <> !opt_index then (opt_word := optind; opt_offset := 1);
+      let w = !opt_word and off = !opt_offset in
+      (* what the next call is to read, and what OPTIND is left as *)
+      let resume word offset index =
+        opt_word := word; opt_offset := offset;
+        State.set st "OPTIND" (string_of_int index);
+        opt_index := index in
+      let found c optarg word offset index =
+        resume word offset index;
+        State.set st name (String.make 1 c);
+        (match optarg with
+         | Some v -> State.set st "OPTARG" v
+         | None -> (try State.unset st "OPTARG" with _ -> ()));
+        0 in
+      let ended index =
+        resume index 1 index;
+        State.set st name "?";
+        (try State.unset st "OPTARG" with _ -> ());
+        1 in
+      let a = arg w in
+      if w > count || a = "" || a.[0] <> '-' || a = "-" then ended w
+      else if off = 1 && a = "--" then ended (w + 1)
+      else begin
+        let c = a.[off] in
+        let last = off + 1 >= String.length a in
+        (* where to go on if this option does not take an argument *)
+        let word = if last then w + 1 else w
+        and offset = if last then 1 else off + 1 in
+        match String.index_opt spec c with
+        | Some j when j + 1 < String.length spec && spec.[j + 1] = ':' ->
+            (* the option takes an argument: the rest of this word if
+               there is any, and otherwise the whole of the next *)
+            if not last then
+              found c (Some (String.sub a (off + 1) (String.length a - off - 1)))
+                (w + 1) 1 (w + 1)
+            else if w + 1 <= count then found c (Some (arg (w + 1))) (w + 2) 1 (w + 2)
+            else if silent then found ':' (Some (String.make 1 c)) (w + 1) 1 (w + 1)
+            else begin
+              Printf.eprintf "No arg for -%c option\n" c;
+              flush stderr;
+              resume (w + 1) 1 (w + 1);
+              State.set st name "?";
+              (try State.unset st "OPTARG" with _ -> ());
+              0
+            end
+        | Some _ -> found c (Some "") word offset (w + 1)
+        | None ->
+            if silent then found '?' (Some (String.make 1 c)) word offset (w + 1)
+            else begin
+              Printf.eprintf "Illegal option -%c\n" c;
+              flush stderr;
+              resume word offset (w + 1);
+              State.set st name "?";
+              (try State.unset st "OPTARG" with _ -> ());
+              0
+            end
+      end
+  | _ -> error "getopts" "usage: getopts optstring name [argument...]"; 2
+
+(* ---------- aliases ---------- *)
+
+(* XCU alias: with no operand, or with a name and no value, the
+   definitions are written in a form that could be read back; with
+   name=value, the alias is defined. *)
+let alias_builtin _st args =
+  let args = match args with "-p" :: rest -> rest | rest -> rest in
+  let show (name, value) = outl (name ^ "=" ^ Alias.quote value) in
+  if args = [] then (List.iter show (Alias.all ()); flush stdout; 0)
+  else begin
+    let status = ref 0 in
+    List.iter (fun a ->
+        match String.index_opt a '=' with
+        | Some i when i > 0 ->
+            let name = String.sub a 0 i in
+            if Alias.valid_name name then
+              Alias.define name (String.sub a (i + 1) (String.length a - i - 1))
+            else (error "alias" "%s: bad alias name" name; status := 1)
+        | _ ->
+            (match Alias.value a with
+             | Some v -> show (a, v)
+             | None -> error "alias" "%s not found" a; status := 1)) args;
+    flush stdout;
+    !status
+  end
+
+let unalias_builtin _st args =
+  if List.mem "-a" args then (Alias.clear (); 0)
+  else begin
+    let status = ref 0 in
+    List.iter (fun name ->
+        match Alias.value name with
+        | Some _ -> Alias.remove name
+        | None -> error "unalias" "%s not found" name; status := 1) args;
+    !status
+  end
+
 let command_builtin st args =
   let rec strip = function
     | "-p" :: rest -> strip rest
@@ -378,23 +503,33 @@ let command_builtin st args =
   match strip args with
   | "-v" :: name :: _ | "-V" :: name :: _ ->
       let verbose = List.mem "-V" args in
+      (match Alias.value name with
+      | Some v ->
+          outl (if verbose then name ^ " is an alias for " ^ v
+                else "alias " ^ name ^ "=" ^ Alias.quote v);
+          flush stdout; 0
+      | None ->
       if List.mem_assoc name st.funcs then
         (outl (if verbose then name ^ " is a shell function" else name); flush stdout; 0)
       else if List.mem name [ "cd"; "echo"; "printf"; "test"; "["; "read"; "pwd";
-                              "true"; "false"; "command"; "type"; "umask"; "wait"; "hash" ]
+                              "true"; "false"; "command"; "type"; "umask"; "wait"; "hash";
+                              "alias"; "unalias"; "getopts" ]
               || List.mem name [ ":"; "."; "break"; "continue"; "eval"; "exec"; "exit";
                                  "export"; "readonly"; "return"; "set"; "shift"; "times";
                                  "trap"; "unset"; "local" ]
       then (outl (if verbose then name ^ " is a shell builtin" else name); flush stdout; 0)
       else (match !search_hook st name with
           | Some p -> outl (if verbose then name ^ " is " ^ p else p); flush stdout; 0
-          | None -> if verbose then error "command" "%s: not found" name; 1)
+          | None -> if verbose then error "command" "%s: not found" name; 1))
   | [] -> 0
   | argv -> !exec_hook st argv
 
 let type_builtin st args =
   let status = ref 0 in
   List.iter (fun name ->
+      match Alias.value name with
+      | Some v -> outl (name ^ " is an alias for " ^ v)
+      | None ->
       if List.mem_assoc name st.funcs then outl (name ^ " is a function")
       else if List.mem name [ ":"; "."; "break"; "continue"; "eval"; "exec"; "exit";
                               "export"; "readonly"; "return"; "set"; "shift"; "times";
@@ -522,10 +657,12 @@ let special : (string * (State.t -> string list -> int)) list = [
 ]
 
 let regular : (string * (State.t -> string list -> int)) list = [
+  "alias", alias_builtin;
   "cd", cd;
   "command", command_builtin;
   "echo", echo;
   "false", false_builtin;
+  "getopts", getopts_builtin;
   "hash", hash_builtin;
   "local", local_builtin;
   "printf", printf_builtin;
@@ -536,6 +673,7 @@ let regular : (string * (State.t -> string list -> int)) list = [
   "true", true_builtin;
   "type", type_builtin;
   "umask", umask_builtin;
+  "unalias", unalias_builtin;
   "wait", wait_builtin;
 ]
 

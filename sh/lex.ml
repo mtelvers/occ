@@ -109,6 +109,7 @@ type state = {
      leading tabs are stripped, and where the body token goes *)
   mutable pending : (string * bool * int) list;
   mutable expect_heredoc : bool option;   (* Some strip, once << is seen *)
+  mutable finished : bool;                (* the end of input has been reached *)
 }
 
 let emit st tok =
@@ -171,11 +172,30 @@ let read_heredocs st =
     (List.rev st.pending);
   st.pending <- []
 
-let scan src =
-  let st = { src; i = 0; line = 1; toks = Array.make 64 { tok = Eof; line = 0 };
-             ntok = 0; pending = []; expect_heredoc = None } in
+(* ---------- reading a line at a time ---------- *)
+
+(* The scanner is asked for one line at a time rather than for the whole
+   input at once.  That is how a shell reads (2.10.2 complete_command):
+   it reads a line, runs what the line says, and only then reads the
+   next, so a command early in a file runs even though a later line will
+   not lex or parse.  A line's tokens are complete when [feed] returns,
+   here-document bodies included, because a body is read as the newline
+   after its redirection is crossed. *)
+
+type t = state
+
+let open_text src =
+  { src; i = 0; line = 1; toks = Array.make 64 { tok = Eof; line = 0 };
+    ntok = 0; pending = []; expect_heredoc = None; finished = false }
+
+let count st = st.ntok
+let nth st k = st.toks.(k)
+let at_end st = st.finished
+
+let feed st =
+  let src = st.src in
   let n = String.length src in
-  let finished = ref false in
+  let finished = ref st.finished in
   while not !finished do
     (* blanks and comments separate tokens but are not tokens (2.3) *)
     let rec skip_blanks () =
@@ -188,12 +208,21 @@ let scan src =
         skip_blanks ()
       end in
     skip_blanks ();
-    if st.i >= n then (ignore (emit st Eof); finished := true)
+    if st.i >= n then begin
+      (* input that ends without a newline still owes its
+         here-document bodies *)
+      if st.pending <> [] then read_heredocs st;
+      ignore (emit st Eof);
+      st.finished <- true;
+      finished := true
+    end
     else if src.[st.i] = '\n' then begin
       st.i <- st.i + 1;
       ignore (emit st Newline);
       st.line <- st.line + 1;
-      if st.pending <> [] then read_heredocs st
+      if st.pending <> [] then read_heredocs st;
+      (* one line of tokens is enough for now *)
+      finished := true
     end
     else if is_op_start src.[st.i] then begin
       let op = List.find (fun o ->
@@ -236,7 +265,22 @@ let scan src =
           then ignore (emit st (Io_number (int_of_string raw)))
           else ignore (emit st (Word raw))
     end
-  done;
-  (* input that ends without a newline still owes its here-document bodies *)
-  if st.pending <> [] then read_heredocs st;
+  done
+
+(* the whole input at once, for the -n option, which reads a program to
+   check it and runs none of it *)
+let scan src =
+  let st = open_text src in
+  while not st.finished do feed st done;
   Array.sub st.toks 0 st.ntok
+
+(* The tokens of a fragment of text, without the Eof that ends it: an
+   alias's value, which is spliced into the stream where the alias name
+   stood.  Every token is given the line the name was on, so that a
+   diagnostic points at the line the script wrote rather than into the
+   alias. *)
+let scan_fragment ~line:ln text =
+  let toks = scan text in
+  let out = ref [] in
+  Array.iter (fun t -> if t.tok <> Eof then out := { t with line = ln } :: !out) toks;
+  List.rev !out

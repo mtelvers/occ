@@ -15,12 +15,40 @@ exception Error of string * int
 
 let err line fmt = Printf.ksprintf (fun s -> raise (Error (s, line))) fmt
 
-type state = { toks : Lex.lexed array; mutable k : int }
+(* The token stream the parser reads.  Tokens come from the scanner a
+   line at a time, and [ins] holds any that were spliced in front of it
+   by alias substitution (2.3.1); [used] remembers the alias names
+   already replaced at the command position being parsed, which is what
+   stops a name that stands for itself. *)
+type state = {
+  lx : Lex.t;
+  mutable k : int;                      (* how far into the scanner's tokens *)
+  mutable ins : Lex.lexed list;         (* spliced tokens, read before those *)
+  mutable used : string list;
+}
 
-let peek st = st.toks.(st.k).Lex.tok
-let peek_at st d = if st.k + d < Array.length st.toks then st.toks.(st.k + d).Lex.tok else Lex.Eof
-let line st = st.toks.(st.k).Lex.line
-let advance st = if st.k < Array.length st.toks - 1 then st.k <- st.k + 1
+(* read from the scanner until the token [d] places ahead is there, or
+   the input has ended *)
+let ensure st d =
+  while st.k + d >= Lex.count st.lx && not (Lex.at_end st.lx) do Lex.feed st.lx done
+
+let at st d =
+  let rec go l d = match l, d with
+    | t :: _, 0 -> Some t
+    | _ :: rest, d -> go rest (d - 1)
+    | [], d ->
+        ensure st d;
+        if st.k + d < Lex.count st.lx then Some (Lex.nth st.lx (st.k + d)) else None in
+  go st.ins d
+
+let peek st = match at st 0 with Some t -> t.Lex.tok | None -> Lex.Eof
+let peek_at st d = match at st d with Some t -> t.Lex.tok | None -> Lex.Eof
+let line st = match at st 0 with Some t -> t.Lex.line | None -> 0
+
+let advance st =
+  match st.ins with
+  | _ :: rest -> st.ins <- rest
+  | [] -> if peek st <> Lex.Eof then st.k <- st.k + 1
 
 let at_word st w = match peek st with Lex.Word x -> x = w | _ -> false
 let at_op st o = match peek st with Lex.Op x -> x = o | _ -> false
@@ -106,7 +134,39 @@ and pipeline st =
   done;
   { negate; parts = List.rev !parts }
 
+(* 2.3.1: where a reserved word could be recognised -- that is, at the
+   start of a command -- a word that is an alias name is replaced by the
+   alias's text.  The text is lexed and its tokens are read before the
+   rest of the input, so what it holds may be anything a command could
+   be, operators included.  Three rules keep it from running away or
+   surprising: a name already replaced here is left alone, the first
+   word of the replacement is itself checked (so one alias may stand for
+   another), and only a text ending in a blank lets the word after it be
+   checked as well. *)
+and alias_subst st =
+  if Alias.defined () then begin
+    st.used <- [];
+    let rec go () =
+      match peek st with
+      | Lex.Word w when not (List.mem w st.used) ->
+          (match Alias.value w with
+           | None -> ()
+           | Some v ->
+               let ln = line st in
+               advance st;
+               st.used <- w :: st.used;
+               (* a text ending in a blank leaves the following word in
+                  a position where an alias is looked for too *)
+               if v <> "" && (v.[String.length v - 1] = ' ' || v.[String.length v - 1] = '\t')
+               then go ();
+               st.ins <- Lex.scan_fragment ~line:ln v @ st.ins;
+               go ())
+      | _ -> () in
+    go ()
+  end
+
 and command st =
+  alias_subst st;
   match peek st with
   | Lex.Word "{" ->
       advance st;
@@ -278,9 +338,39 @@ and loop_clause st until =
 
 (* ---------- entry point ---------- *)
 
+let open_text text = { lx = Lex.open_text text; k = 0; ins = []; used = [] }
+
+(* One complete command (2.10.2): the statements up to and including the
+   next newline.  This is the unit a shell reads and runs before reading
+   any more, so `alias' on one line reaches the next, and the lines
+   before one that will not parse have already run. *)
+let next_line st =
+  skip_newlines st;
+  match peek st with
+  | Lex.Eof -> None
+  | Lex.Op (")" | ";;") -> err (line st) "unexpected %s" (describe (peek st))
+  | _ ->
+      let out = ref [] in
+      let rec go () =
+        let ao = and_or st in
+        let async = ref false in
+        let more = ref true in
+        (match peek st with
+         | Lex.Op "&" -> async := true; advance st
+         | Lex.Op ";" -> advance st
+         | Lex.Newline -> advance st; more := false
+         | _ -> more := false);
+        out := { ao; async = !async } :: !out;
+        if !more then
+          match peek st with
+          | Lex.Eof | Lex.Newline -> ()
+          | _ -> go () in
+      go ();
+      Some (List.rev !out)
+
+(* the whole program at once, for -n and for the text inside $( ) *)
 let parse text =
-  let toks = Lex.scan text in
-  let st = { toks; k = 0 } in
+  let st = open_text text in
   let p = program st [] in
   (match peek st with
    | Lex.Eof -> ()

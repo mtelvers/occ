@@ -10,7 +10,9 @@ its 28,000-line `configure`.
                here-document bodies read at the next newline
     word       taking a raw word apart into its parts, and the ${...}
                operators of 2.6.2
-    parse      the grammar of 2.10, by recursive descent
+    parse      the grammar of 2.10, by recursive descent, reading the
+               input a line at a time
+    alias      alias definitions and their substitution (2.3.1)
     state      the execution environment of 2.12: variables, functions,
                options, traps, positional parameters
     arith      arithmetic expansion (2.6.4), which is C11 6.5 on integers
@@ -49,6 +51,15 @@ Two points that decide whether real scripts work:
   them back in another; a `$$` that changed in a subshell would leave
   configure looking for a file that was never written.
 
+- **The input is read a line at a time, not all at once.** A shell reads
+  a complete command, runs it, and only then reads more (2.10.2). Three
+  things follow, and all three are what the reference shell does: an
+  alias or a function defined by one line is there for the next but not
+  for the rest of its own line; the lines before one that will not parse
+  have already run; and a syntax error ends the shell there, with status
+  2, wherever the text came from -- the script, `-c`, `eval` or `.`
+  (2.8.1).
+
 ## Testing
 
 `tools/shcheck.sh` runs every script in `sh/test/` under `/bin/sh` and
@@ -56,7 +67,13 @@ under occsh in matching scratch directories and compares standard
 output, standard error, the exit status and the files left behind. The
 scripts are one per clause group: quoting, parameters, splitting,
 arithmetic, redirection, control flow, functions, built-ins, `set -e`,
-patterns, command substitution.
+patterns, command substitution, aliases, `getopts`, and reading the
+input a line at a time.
+
+A `.expected` file beside a script means the two are meant to differ
+there. `$LINENO` is one case, since the reference shell does not have
+it; a listing of every alias is the other, since occsh lists them by
+name and the reference shell in the order of its hash table.
 
 Three larger tests, in increasing order of demand:
 
@@ -74,7 +91,8 @@ Three larger tests, in increasing order of demand:
 
 No job control, no command-line editing, no history: those are for an
 interactive shell, and this one is only ever started to run a script.
-`-m` is accepted and does nothing. `$'...'` and `[[ ]]` are bash
+`-m` is accepted and does nothing, and there is no `jobs`, `fg` or `bg`
+-- without job control there would be nothing for them to report. `$'...'` and `[[ ]]` are bash
 extensions and are not accepted, deliberately: the build's scripts use
 neither, and accepting them would let a script that is not portable
 appear to work.
