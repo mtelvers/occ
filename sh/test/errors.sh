@@ -47,3 +47,9 @@ try 'readonly r=1; r=2'
 try 'cd /nosuchdir'
 try 'umask nonsense'
 try 'read x < /dev/null'
+
+# A redirection that fails undoes the ones before it: the command does
+# not run, and what the script prints afterwards must still go where it
+# was going.
+( echo A > redirected 2> /nosuchdir/f; echo "after a failed redirection" ) 2>/dev/null
+echo "the file holds: [$(cat redirected 2>/dev/null)]"

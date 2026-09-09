@@ -70,7 +70,7 @@ let heredoc_fd body =
 
 (* A redirection that cannot be made (2.8.1).  It is an error of the
    command, not of the shell, except with a special built-in: there the
-   shell exits, which is what the two callers below decide.  The wording
+   shell exits, which is what each caller below decides.  The wording
    is the reference shell's, since a script that reads the message reads
    that one. *)
 exception Redirect of string
@@ -112,30 +112,37 @@ let target_of st r =
         raise (Redirect (Printf.sprintf "cannot create %s: File exists" name));
       Use (open_for (if op = In then "open" else "create") name flags)
 
-let apply st redirs =
-  let saved = ref [] in
-  if redirs <> [] then flush_all ();
-  List.iter (fun r ->
-      let t = target_of st r in
-      let backup = match Unix.dup ~cloexec:true (fd_of_int r.rfd) with
-        | fd -> Some fd
-        | exception _ -> None in
-      saved := { fd = r.rfd; backup } :: !saved;
-      match t with
-      | Close_fd -> (try Unix.close (fd_of_int r.rfd) with _ -> ())
-      | Use fd ->
-          if int_of_fd fd <> r.rfd then begin
-            Unix.dup2 ~cloexec:false fd (fd_of_int r.rfd);
-            Unix.close fd
-          end) redirs;
-  !saved
-
 let restore saved =
   if saved <> [] then flush_all ();
   List.iter (fun s ->
       match s.backup with
       | Some b -> Unix.dup2 ~cloexec:false b (fd_of_int s.fd); Unix.close b
       | None -> (try Unix.close (fd_of_int s.fd) with _ -> ())) saved
+
+let apply st redirs =
+  let saved = ref [] in
+  if redirs <> [] then flush_all ();
+  let one r =
+    let t = target_of st r in
+    let backup = match Unix.dup ~cloexec:true (fd_of_int r.rfd) with
+      | fd -> Some fd
+      | exception _ -> None in
+    saved := { fd = r.rfd; backup } :: !saved;
+    match t with
+    | Close_fd -> (try Unix.close (fd_of_int r.rfd) with _ -> ())
+    | Use fd ->
+        if int_of_fd fd <> r.rfd then begin
+          Unix.dup2 ~cloexec:false fd (fd_of_int r.rfd);
+          Unix.close fd
+        end in
+  (* One of them failing undoes the ones before it.  The command will
+     not run, so the shell's own descriptors have to be as they were:
+     otherwise `echo a > file 2> /nowhere' would leave everything the
+     script printed afterwards going into the file. *)
+  (match List.iter one redirs with
+   | () -> ()
+   | exception e -> restore !saved; raise e);
+  !saved
 
 (* A redirection error is the command's, not the shell's: the message,
    a status of 2, and the shell carries on.  The exception is a special
