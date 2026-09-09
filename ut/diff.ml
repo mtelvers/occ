@@ -20,9 +20,14 @@ type edit = Keep of int * int | Add of int | Remove of int
 let script (a : string array) (b : string array) =
   let n = Array.length a and m = Array.length b in
   let max_d = n + m in
-  let offset = max_d in
+  (* The furthest point reached on each diagonal k, which runs from -d
+     to d, held in an array indexed by k + offset.  The room for one
+     diagonal either side matters: the step for k looks at k-1 and k+1,
+     so with two empty inputs -- d and k both zero -- a table of just
+     the diagonals in play would be read past its end. *)
+  let offset = max_d + 1 in
   let trace = ref [] in
-  let v = Array.make (2 * max_d + 1) 0 in
+  let v = Array.make (2 * max_d + 3) 0 in
   let finished = ref false in
   let steps = ref 0 in
   let d = ref 0 in
@@ -160,6 +165,20 @@ let main _argv opts operands =
   let unified = Posix.Getopt.has opts "u" || Posix.Getopt.has opts "unified" in
   let ignore_space = Posix.Getopt.has opts "w" || Posix.Getopt.has opts "ignore-all-space" in
   let ignore_case = Posix.Getopt.has opts "i" in
+  (* --color=WHEN (GNU): the added and removed lines in green and red,
+     the command or hunk line in cyan, the file headers in bold, and
+     nothing else touched.  `auto' means only when the output is a
+     terminal, which in a build it is not. *)
+  let colour =
+    match Posix.Getopt.arg opts "color" with
+    | Some ("always" | "") -> true
+    | Some "auto" -> (try Unix.isatty Unix.stdout with _ -> false)
+    | _ -> false in
+  let paint code text = if colour then "\027[" ^ code ^ "m" ^ text ^ "\027[0m" else text in
+  let removed_line text = paint "31" text
+  and added_line text = paint "32" text
+  and command_line text = paint "36" text
+  and header_line text = paint "1" text in
   let context = match Posix.Getopt.arg opts "U" with
     | Some s -> (match int_of_string_opt s with Some v -> v | None -> 3)
     | None -> 3 in
@@ -196,15 +215,20 @@ let main _argv opts operands =
         let edits = script ka kb in
         let groups = hunks ~context a b edits in
         if unified then begin
-          emit_line (Printf.sprintf "--- %s\t%s" left (timestamp left));
-          emit_line (Printf.sprintf "+++ %s\t%s" right (timestamp right));
+          emit_line (header_line (Printf.sprintf "--- %s\t%s" left (timestamp left)));
+          emit_line (header_line (Printf.sprintf "+++ %s\t%s" right (timestamp right)));
           List.iter (fun h ->
               let count start len = if len = 0 then Printf.sprintf "%d,0" start
                 else if len = 1 then string_of_int (start + 1)
                 else Printf.sprintf "%d,%d" (start + 1) len in
-              emit_line (Printf.sprintf "@@ -%s +%s @@"
-                           (count h.a_start h.a_len) (count h.b_start h.b_len));
-              List.iter (fun (c, text) -> emit_line (String.make 1 c ^ text)) h.body)
+              emit_line (command_line (Printf.sprintf "@@ -%s +%s @@"
+                           (count h.a_start h.a_len) (count h.b_start h.b_len)));
+              List.iter (fun (c, text) ->
+                  let line = String.make 1 c ^ text in
+                  emit_line (match c with
+                      | '-' -> removed_line line
+                      | '+' -> added_line line
+                      | _ -> line)) h.body)
             groups
         end else begin
           (* the default output: a command and the lines it applies to *)
@@ -231,10 +255,10 @@ let main _argv opts operands =
                   Printf.sprintf "%sd%d" (range !a_from nr) !b_from
                 else
                   Printf.sprintf "%da%s" !a_from (range !b_from na) in
-              emit_line command;
-              List.iter (fun (_, text) -> emit_line ("< " ^ text)) removed;
+              emit_line (command_line command);
+              List.iter (fun (_, text) -> emit_line (removed_line ("< " ^ text))) removed;
               if nr > 0 && na > 0 then emit_line "---";
-              List.iter (fun (_, text) -> emit_line ("> " ^ text)) added)
+              List.iter (fun (_, text) -> emit_line (added_line ("> " ^ text))) added)
             groups
         end;
         flush_out ();

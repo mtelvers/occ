@@ -213,6 +213,14 @@ CASES = [
     ("diff", ["-q", "f1", "f2"], ""),
     ("diff", ["-u", "f1", "f2"], ""),
     ("diff", ["f1", "f2"], ""),
+    ("diff", ["--color=always", "f1", "f2"], ""),
+    ("diff", ["--color=never", "f1", "f2"], ""),
+    ("diff", ["--color=auto", "f1", "f2"], ""),
+    ("diff", ["--color=always", "-q", "f1", "f2"], ""),
+    ("diff", ["/dev/null", "/dev/null"], ""),
+    ("diff", ["empty", "f1"], ""),
+    ("diff", ["f1", "empty"], ""),
+    ("diff", ["-q", "empty", "empty"], ""),
 
     # names
     ("basename", ["/a/b/c"], ""),
@@ -319,6 +327,9 @@ def setup(d):
         f.write("alpha beta\ngamma delta\n")
     with open(os.path.join(d, "f2"), "w") as f:
         f.write("alpha beta\ngamma DELTA\nextra line\n")
+    # a file with nothing in it: two of those once made diff read its
+    # table of diagonals past the end
+    open(os.path.join(d, "empty"), "w").close()
     os.mkdir(os.path.join(d, "d1"))
     os.mkdir(os.path.join(d, "d1", "sub"))
     with open(os.path.join(d, "d1", "inner.txt"), "w") as f:
