@@ -138,7 +138,16 @@ let pwd st args =
 
 let export_or_readonly st which args =
   let mark = if which = "export" then State.export else State.readonly in
-  let args = List.filter (fun a -> a <> "-p") args in
+  (* -p asks for the listing, `--' ends the options, and any other one
+     is an error; export and readonly are special built-ins, so it ends
+     the shell *)
+  let rec options = function
+    | "-p" :: rest -> options rest
+    | "--" :: rest -> rest
+    | (a :: _) as rest when not (String.length a > 1 && a.[0] = '-') -> rest
+    | a :: _ -> fail which "Illegal option %s" a
+    | [] -> [] in
+  let args = options args in
   if args = [] then begin
     (* print what is marked, in a form that can be read back *)
     let names = ref [] in
@@ -162,19 +171,28 @@ let export_or_readonly st which args =
             (match State.set st name (String.sub a (i + 1) (String.length a - i - 1)) with
              | () -> mark st name
              | exception State.Error msg -> error which "%s" msg; status := 1)
-        | None -> (match mark st a with
-            | () -> ()
-            | exception State.Error msg -> error which "%s" msg; status := 1)) args;
+        | None ->
+            if not (is_name a) then fail which "%s: bad variable name" a;
+            (match mark st a with
+             | () -> ()
+             | exception State.Error msg -> error which "%s" msg; status := 1)) args;
     !status
   end
 
 let unset_builtin st args =
-  let functions = List.mem "-f" args and vars_only = List.mem "-v" args in
-  let names = List.filter (fun a -> a <> "-f" && a <> "-v") args in
-  List.iter (fun a ->
-      if String.length a > 1 && a.[0] = '-' then fail "unset" "Illegal option %s" a)
-    names;
-  let names = List.filter (fun a -> a <> "--") names in
+  (* the options come first and stop at `--' or at the first name; one
+     that is not -f or -v is an error, and unset is special, so it ends
+     the shell *)
+  let functions = ref false and vars_only = ref false in
+  let rec options = function
+    | "-f" :: rest -> functions := true; options rest
+    | "-v" :: rest -> vars_only := true; options rest
+    | "--" :: rest -> rest
+    | (a :: _) as rest when not (String.length a > 1 && a.[0] = '-') -> rest
+    | a :: _ -> fail "unset" "Illegal option %s" a
+    | [] -> [] in
+  let names = options args in
+  let functions = !functions and vars_only = !vars_only in
   List.iter (fun name ->
       if not (is_name name) then fail "unset" "%s: bad variable name" name) names;
   let status = ref 0 in

@@ -53,3 +53,14 @@ try 'read x < /dev/null'
 # was going.
 ( echo A > redirected 2> /nosuchdir/f; echo "after a failed redirection" ) 2>/dev/null
 echo "the file holds: [$(cat redirected 2>/dev/null)]"
+
+# The options of the special built-ins: `--' ends them, an unknown one
+# is an error, and so is an operand that could not be a variable name.
+try 'x=1; unset -- x; echo "x is [${x-gone}]"'
+try 'export -- one=1; echo "one is $one"'
+try 'readonly -- two=2; echo "two is $two"'
+try 'unset -q'
+try 'export -q x'
+try 'export 1bad'
+try 'readonly 1bad'
+try 'unset 1bad'
