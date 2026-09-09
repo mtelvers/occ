@@ -61,7 +61,11 @@ Four points that decide whether real scripts work:
   ends the shell and `echo hi > /nowhere/f` does not, and `. missing`
   stops a script where `cd missing` does not. Built-ins raise their
   errors rather than deciding what should follow, which keeps the rule
-  in one place.
+  in one place. One deliberate difference: when the redirection that
+  failed is the one for the error output, the message still goes to the
+  error output the command started with, which is what bash and busybox
+  do; dash writes it into the redirection it could not make and so
+  loses it.
 
 - **The input is read a line at a time, not all at once.** A shell reads
   a complete command, runs it, and only then reads more (2.10.2). Three
