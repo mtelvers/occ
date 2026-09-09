@@ -6,3 +6,6 @@ doc/
 # test binaries the runner leaves if interrupted
 occtest*
 toolbin/
+# tools/toolbin.sh stages the toolchain here, with the headers beside
+# it in the layout an installation would have
+share/
