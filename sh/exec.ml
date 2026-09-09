@@ -494,7 +494,10 @@ and run_pending_traps st =
    holds wherever the text came from -- the script, -c, eval, or dot. *)
 and run_text st text =
   let stream = Parse.open_text text in
-  let status = ref st.status in
+  (* text with no command in it -- an empty eval, a file of comments --
+     has the status of a command that succeeded, not the status of
+     whatever ran last *)
+  let status = ref 0 in
   let fatal msg line =
     Printf.eprintf "%s: line %d: %s\n" st.arg0 line msg;
     flush stderr;

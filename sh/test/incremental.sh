@@ -23,3 +23,10 @@ echo before
 ( echo inner; eval 'if' ) 2>/dev/null
 echo "status $?"
 echo after
+# Text with no command in it has the status of a command that
+# succeeded, and not the status of whatever ran last.
+false; eval ""; echo "eval empty: $?"
+false; eval "# nothing but a comment"; echo "eval comment: $?"
+: > nothing
+false; . ./nothing; echo "dot empty: $?"
+false; { :; }; echo "group: $?"

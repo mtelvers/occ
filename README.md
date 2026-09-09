@@ -193,11 +193,13 @@ bytes.
     tools/shcheck.sh                        # occsh vs /bin/sh, per clause group
     tools/utcheck.py                        # occutils vs the GNU utilities
     tools/mkcheck.sh                        # occmake vs GNU make (-n plans)
+    tools/jscheck.sh                        # occmake -jN vs GNU make -jN
 
     7740 regex cases, identical
-      17 shell scripts, identical output, error output, status and files
-     228 utility cases, identical but for four named differences
-       7 makefiles, identical plans
+      21 shell scripts, identical output, error output, status and files
+     248 utility cases, identical but for four named differences
+      13 makefiles, identical plans
+       8 parallel runs, the same peak number of recipes at once
 
 ## A build with no C
 
@@ -224,6 +226,10 @@ was started in lacks something it needs.
 failed. A run of the same tree with dash and the GNU utilities passes
 the same 1562 and fails one, `native-debugger`, which compares gdb
 backtraces; the hermetic run skips it because gdb is not on that PATH.
+
+`occmake -j8` builds the same tree in 291 seconds against 1075 serial,
+and `-jN` is a limit for the whole build rather than for each make in
+the recursion: the makes share a pool of job tokens, as GNU make's do.
 
 The build produces the same tree whether GNU make or occmake drives
 it. `tools/compare-trees.sh` on two trees built at paths of equal

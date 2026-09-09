@@ -82,7 +82,10 @@ found by comparing plans on the tree itself rather than by reading:
 
 `OCCMAKE_DEBUG=1` names, for each target, how it was chosen, with which
 prerequisites, and what its automatic variables held: the quickest way
-to see why a plan differs from make's.
+to see why a plan differs from make's. A recipe that fails is reported
+with the makefile and line its command was written on, since in a
+recursive build over a 4500-line Makefile that is the only part of the
+message that helps.
 
 ## Known differences
 
@@ -97,10 +100,39 @@ differ. Three such differences:
 - `$(shell)` runs its command through the shell, so a command that does
   not exist is reported by the shell rather than by make.
 
+## Parallel jobs
+
+`-jN` runs up to N recipes at once. The walk over the graph and the
+running of recipes are separate passes for this: the walk decides what
+has to be rebuilt and records a job for each, in the order it reached
+them, with the jobs each one waits for; then a scheduler starts them,
+never more than N at a time and never one whose jobs have not all
+finished. Recording rather than running keeps the decisions in one
+place, so `-j8` and `-j1` build the same tree.
+
+`-jN` is a limit for the whole build and not for each make in it, which
+a recursive build needs: the makes share one pool of tokens, made by the
+make that was given `-j` and named in MAKEFLAGS
+(`--jobserver-auth=fifo:PATH`, the spelling of GNU make 4.4 and later).
+Every make may run one recipe for free, since it is itself occupying a
+token of the make that started it, and takes a token from the pool
+before starting a second. `tools/jscheck.sh` checks this by measuring:
+it runs a recursive tree under both makes and compares the largest
+number of recipes either had running at once, with the pool and with the
+pool taken away.
+
+A make started by GNU make 4.3 or earlier is offered a pair of
+descriptors instead of a named pipe. That pool cannot be joined here --
+a descriptor passed down is one open file shared by every make, and
+reading it without blocking would change how all of them read it -- so
+such a make says so and runs one recipe at a time, rather than taking a
+whole `-jN` for itself on top of what the rest of the tree is doing.
+
+`.NOTPARALLEL` in a makefile, `-n`, and `-q` all keep the recipes where
+the walk reaches them.
+
 ## Not covered
 
-Parallel jobs (`-j`) are accepted and ignored: a build is correct
-serially, and the OCaml tree's only use of `-j` is to pass it to GNU
-parallel in the test suite. There is no `--debug`, no `-p`, no jobserver
-and no built-in rule set -- the build cancels the built-in rules
-anyway.
+There is no `--debug`, no `-p` and no built-in rule set -- the build
+cancels the built-in rules anyway. `-l` (load average) is accepted and
+ignored.

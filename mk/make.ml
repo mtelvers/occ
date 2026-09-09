@@ -35,7 +35,7 @@ let find_makefile () =
    any option that has an argument, then the variable assignments.  A
    sub-make reads it before its own arguments, so its own command line
    still wins. *)
-let makeflags o =
+let makeflags ?server o =
   let letters = Buffer.create 8 in
   if o.keep_going then Buffer.add_char letters 'k';
   if o.dry_run then Buffer.add_char letters 'n';
@@ -43,7 +43,10 @@ let makeflags o =
   if o.question then Buffer.add_char letters 'q';
   let pieces =
     (if Buffer.length letters > 0 then [ Buffer.contents letters ] else [])
-    @ (if o.jobs > 1 then [ Printf.sprintf "-j%d" o.jobs ] else [])
+    @ (if o.jobs > 1 then [ Printf.sprintf "-j%d" o.jobs ]
+       else if o.jobs = 0 then [ "-j" ] else [])
+    (* the pool the makes below this one share (5.7.1) *)
+    @ (match server with Some s -> [ "--jobserver-auth=" ^ Jobserver.auth s ] | None -> [])
     @ List.map (fun (n, v) -> n ^ "=" ^ v) o.overrides in
   String.concat " " pieces
 
@@ -110,6 +113,14 @@ let run argv =
                   | _ -> o.jobs <- 0);           (* -j with no count: no limit *)
                  ()
                end
+           | 'l' ->
+               (* -l takes a load average, or nothing at all; either way
+                  it is ignored here, but its argument must not be left
+                  to be read as a goal *)
+               if !i + 1 < n then ignore (argument ())
+               else (match !rest with
+                   | v :: tl when float_of_string_opt v <> None -> rest := tl; stop := true
+                   | _ -> ())
            | 'k' -> o.keep_going <- true
            | 'n' -> o.dry_run <- true
            | 's' -> o.silent <- true
@@ -161,7 +172,32 @@ let run argv =
      the environment, since the recipe that starts it is a child. *)
   Value.set db ~origin:Value.Command_line "MAKELEVEL" (string_of_int depth);
   (try Unix.putenv "MAKELEVEL" (string_of_int (depth + 1)) with _ -> ());
-  let flags = makeflags o in
+  (* The pool of job tokens: joined if the make that started this one
+     made one, and otherwise made here if this make was given -j.  A
+     make started by GNU make 4.3 or earlier is offered a pair of
+     descriptors instead of a named pipe; that pool cannot be joined, so
+     this make runs one recipe at a time rather than taking a whole -jN
+     for itself on top of what the rest of the tree is doing. *)
+  let inherited_flags = match Sys.getenv_opt "MAKEFLAGS" with Some f -> f | None -> "" in
+  let server =
+    match Jobserver.parse_auth inherited_flags with
+    | Jobserver.Fifo path -> Jobserver.connect path
+    | Jobserver.Descriptors ->
+        if o.jobs <> 1 then begin
+          o.jobs <- 1;
+          Printf.eprintf
+            "%s: warning: the make that started this one shares its jobs by \
+             passing descriptors, which this make cannot join; running one \
+             recipe at a time\n" me;
+          flush stderr
+        end;
+        None
+    | Jobserver.None_ ->
+        (* -j with a count sizes the pool; -j with none asks for no
+           limit at all, which is no pool to share *)
+        if o.jobs > 1 then Jobserver.create o.jobs else None in
+  (match server with Some s -> at_exit (fun () -> Jobserver.destroy s) | None -> ());
+  let flags = makeflags ?server o in
   Value.set db ~origin:Value.Command_line "MAKEFLAGS" flags;
   (try Unix.putenv "MAKEFLAGS" flags with _ -> ());
   let rules = Rule.create () in
@@ -184,6 +220,6 @@ let run argv =
   let goals = if o.goals <> [] then o.goals
     else match st.default_goal with Some g -> [ g ] | None -> (match rules.Rule.explicit with r :: _ -> [ List.hd r.targets ] | [] -> []) in
   let ok = Build.build ~db ~rules ~keep_going:o.keep_going ~dry_run:o.dry_run
-      ~silent:o.silent ~question:o.question ~jobs:o.jobs ~name:me goals in
+      ~silent:o.silent ~question:o.question ~jobs:o.jobs ~server ~name:me goals in
   announce "Leaving";
   if ok then 0 else if o.question then 1 else 2

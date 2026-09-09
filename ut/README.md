@@ -8,7 +8,7 @@ it and behaves as `sed`; `occutils sed ...` works too.
                output, the '-' operand that means standard input
     table      the list of utilities, each with the options it accepts
     textio     cat tee head tail wc cut tr sort uniq cmp
-    files      rm cp mv mkdir rmdir ln touch chmod mktemp
+    files      rm cp mv mkdir rmdir ln touch chmod mktemp install
     paths      basename dirname realpath pwd, and echo printf test
                true false
     misc       env which uname hostname ls expr sleep

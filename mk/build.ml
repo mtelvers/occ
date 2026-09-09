@@ -440,11 +440,24 @@ and update_one b t ~was h =
    its lines to the shell.  A job starts once every job it waits for has
    finished; when one fails, nothing that waited for it is started, and
    without -k nothing new is started at all. *)
-let run_jobs b (jobs : job array) ~limit =
+let run_jobs b (jobs : job array) ~limit ~server =
   let n = Array.length jobs in
   let state = Array.make n `Waiting in
   let pids = Hashtbl.create 16 in
+  (* whether the job in that slot is running on a token from the pool,
+     which has to go back when it finishes *)
+  let token = Array.make n false in
   let running = ref 0 and left = ref n in
+  (* One recipe runs for free: this make is itself occupying a token of
+     the make that started it (5.7.1).  A second needs a token from the
+     pool, and if there is none this make waits for a recipe of its own
+     to finish rather than for a token. *)
+  let take () =
+    if !running >= limit then None
+    else if !running = 0 then Some false
+    else match server with
+      | None -> Some false
+      | Some s -> if Jobserver.acquire s then Some true else None in
   let start i =
     let j = jobs.(i) in
     flush_all ();
@@ -461,6 +474,11 @@ let run_jobs b (jobs : job array) ~limit =
         Hashtbl.replace pids pid i;
         state.(i) <- `Running;
         incr running in
+  let give_back i =
+    if token.(i) then begin
+      token.(i) <- false;
+      match server with Some s -> Jobserver.release s | None -> ()
+    end in
   let stopping () = b.failed && not b.keep_going in
   let progress = ref true in
   while !left > 0 && !progress do
@@ -474,11 +492,15 @@ let run_jobs b (jobs : job array) ~limit =
     done;
     if not (stopping ()) then begin
       let i = ref 0 in
-      while !running < limit && !i < n do
+      let room = ref true in
+      while !room && !i < n do
         if state.(!i) = `Waiting
            && List.for_all (fun d -> state.(d) = `Done) jobs.(!i).jdeps
-        then (start !i; progress := true);
-        incr i
+        then
+          (match take () with
+           | None -> room := false
+           | Some took -> token.(!i) <- took; start !i; progress := true);
+        if !room then incr i
       done
     end;
     if !running > 0 then begin
@@ -488,6 +510,7 @@ let run_jobs b (jobs : job array) ~limit =
            | Some i ->
                Hashtbl.remove pids pid;
                decr running; decr left; progress := true;
+               give_back i;
                (match st with
                 | Unix.WEXITED 0 -> state.(i) <- `Done
                 | _ -> state.(i) <- `Failed; b.failed <- true)
@@ -499,11 +522,14 @@ let run_jobs b (jobs : job array) ~limit =
   (* anything still running when a failure stopped the rest *)
   while !running > 0 do
     match Unix.waitpid [] (-1) with
-    | (pid, _) -> if Hashtbl.mem pids pid then (Hashtbl.remove pids pid; decr running)
+    | (pid, _) ->
+        (match Hashtbl.find_opt pids pid with
+         | Some i -> Hashtbl.remove pids pid; decr running; give_back i
+         | None -> ())
     | exception _ -> running := 0
   done
 
-let build ~db ~rules ~keep_going ~dry_run ~silent ~question ~jobs ~name goals =
+let build ~db ~rules ~keep_going ~dry_run ~silent ~question ~jobs ~server ~name goals =
   let mentioned = Hashtbl.create 512 in
   (* A file the makefile writes out by name -- as a target or as a
      prerequisite -- is not an intermediate, however it came to be built:
@@ -519,6 +545,9 @@ let build ~db ~rules ~keep_going ~dry_run ~silent ~question ~jobs ~name goals =
   let limit =
     if dry_run || question || rules.Rule.notparallel then 1
     else if jobs = 0 then 1024 else jobs in
+  (* .NOTPARALLEL in this makefile stops this make from running recipes
+     at once; the pool is still there for the makes it starts *)
+  let server = if limit = 1 then None else server in
   let b = { db; rules; building = Hashtbl.create 64; done_ = Hashtbl.create 256;
             keep_going; dry_run; silent; question; name;
             intermediates = Hashtbl.create 64; mentioned; goals = goal_set;
@@ -532,7 +561,7 @@ let build ~db ~rules ~keep_going ~dry_run ~silent ~question ~jobs ~name goals =
       let before = b.ran in
       ignore (update b (resolve b g));
       b.ran = before) goals in
-  if b.parallel then run_jobs b (Array.of_list (List.rev b.jobs)) ~limit;
+  if b.parallel then run_jobs b (Array.of_list (List.rev b.jobs)) ~limit ~server;
   if not question then
     List.iter (fun g ->
         let r = resolve b g in
