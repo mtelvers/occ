@@ -30,9 +30,11 @@ MK
 # pool from a make that simply never runs much at once
 sed 's/@\$(MAKE) -f/@MAKEFLAGS= $(MAKE) -j2 -f/' "$work/Makefile" > "$work/Makefile.nopool"
 
+# TMPDIR is set to the work directory so that the pool these runs make
+# is there and not among any another build's
 peak() {                       # peak make-binary makefile -jN
   rm -rf "$work/run" "$work/counts"
-  ( cd "$work" && "$1" -f "$2" "$3" -s >/dev/null 2>&1 )
+  ( cd "$work" && TMPDIR="$work" "$1" -f "$2" "$3" -s >/dev/null 2>&1 )
   sort -n "$work/counts" | tail -1
 }
 
@@ -49,7 +51,7 @@ for j in ${@:-1 2 4 8}; do
   done
 done
 # a pool is a named pipe, and the make that made it removes it
-left=$(ls "${TMPDIR:-/tmp}"/occmake-jobs.* 2>/dev/null | wc -l)
+left=$(ls "$work"/occmake-jobs.* 2>/dev/null | wc -l)
 if [ "$left" != 0 ]; then
   fail=$((fail+1))
   echo "DIFF $left job pool(s) left behind"
