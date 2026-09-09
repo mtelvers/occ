@@ -220,7 +220,12 @@ the names of the tools it found, which is what should differ. It never
 re-executes itself under another shell, which it does when the shell it
 was started in lacks something it needs.
 
-The build then produces the same tree whether GNU make or occmake drives
+`make tests` under that PATH reports 1562 passed, 117 skipped and none
+failed. A run of the same tree with dash and the GNU utilities passes
+the same 1562 and fails one, `native-debugger`, which compares gdb
+backtraces; the hermetic run skips it because gdb is not on that PATH.
+
+The build produces the same tree whether GNU make or occmake drives
 it. `tools/compare-trees.sh` on two trees built at paths of equal
 length, one with each make, reports 1676 compiled units identical and
 `ocamlc`, `ocaml`, `ocamllex`, `ocamldoc`, `ocamldep` and `ocamlyacc`
