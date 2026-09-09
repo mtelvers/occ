@@ -290,6 +290,10 @@ CASES = [
     ("xargs", ["echo"], "a b c\n"),
     ("xargs", ["-n", "1", "echo"], "a b c\n"),
     ("xargs", ["echo"], "'quoted arg'\nplain\n"),
+    # the utility's own options are operands of xargs, not options of it
+    ("xargs", ["ls", "-d"], "d1\n"),
+    ("xargs", ["-n", "1", "echo", "-n"], "a b\n"),
+    ("xargs", ["rm", "-f"], "gone1 gone2\n"),
 
     # tee
     ("tee", ["t1"], TEXT),

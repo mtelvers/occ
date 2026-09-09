@@ -72,7 +72,9 @@ let utilities : entry list = [
   e "expr" ~permute:false "" Misc.expr;
   e "sleep" "" Misc.sleep;
   e "find" ~permute:false "HLPdsx" Find.main;
-  e "xargs" "0rtn:I:s:" Xargs.main;
+  (* xargs's operands are the utility to run and its own options, which
+     must be left alone: 'xargs rm -rf' passes -rf to rm *)
+  e "xargs" ~permute:false "0rtn:I:s:" Xargs.main;
 
   (* the ones the shell also has as built-ins *)
   e "echo" ~permute:false "" Paths.echo;

@@ -257,12 +257,18 @@ and update_uncached b t =
 and update_body b t =
   (* Each of the target's rules in turn: one, unless it was written with
      two colons (4.13).  The target counts as rebuilt if any of them
-     rebuilt it. *)
+     rebuilt it.  Its time is taken once, before any of them runs, so
+     that each rule is judged against the state the target was in and
+     not against what an earlier rule of the same target just wrote. *)
+  let was =
+    match mtime t with
+    | Some _ as time -> time
+    | None -> (match locate b t with Some found -> mtime found | None -> None) in
   List.fold_left (fun rebuilt h ->
       if b.failed && not b.keep_going then rebuilt
-      else update_one b t h || rebuilt) false (how b t)
+      else update_one b t ~was h || rebuilt) false (how b t)
 
-and update_one b t h =
+and update_one b t ~was h =
   let phony = Rule.is_phony b.rules t in
   (* OCCMAKE_DEBUG names, for each target, how it was chosen and with
      which prerequisites; the fastest way to see why a build differs *)
@@ -315,10 +321,7 @@ and update_one b t h =
       let prereq_rebuilt = List.map (fun p -> let rb = update b p in (p, rb)) (prereqs @ order) in
       if b.failed && not b.keep_going then false
       else begin
-        let target_time =
-          match mtime t with
-          | Some _ as time -> time
-          | None -> (match locate b t with Some found -> mtime found | None -> None) in
+        let target_time = was in
         let newer = List.filter_map (fun p ->
             if List.mem p order then None
             else match target_time, mtime p with
@@ -327,8 +330,14 @@ and update_one b t h =
               | Some tt, Some pt -> if pt > tt then Some p else None) prereqs in
         let any_prereq_rebuilt = List.exists (fun (p, rb) -> rb && not (List.mem p order)) prereq_rebuilt in
         (* A target the search path can find counts as existing, and if
-           nothing is newer it is up to date where it was found (4.5.3). *)
-        let must = phony || locate b t = None || newer <> [] || any_prereq_rebuilt in
+           nothing is newer it is up to date where it was found (4.5.3).
+           A double-colon rule with no prerequisites is the exception: it
+           always runs (4.13), which is how the build's asmcomp.depend
+           collects each architecture's dependencies in turn after an
+           earlier rule of the same target has already made the file. *)
+        let always = r.is_double_colon && prereqs = [] in
+        let must = phony || always || was = None || newer <> []
+                   || any_prereq_rebuilt in
         if must && r.recipe <> [] then begin
           if debug then
             Printf.eprintf "occmake: %s: running with prereqs=[%s]\n  recipe: %s\n" t
