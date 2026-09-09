@@ -78,7 +78,10 @@ program converting anything.
 **diff** finds a shortest edit script by Myers' algorithm (1986): the
 edit graph is searched by increasing edit distance, keeping for each
 diagonal the furthest point reached, which is O(ND) rather than the
-O(NM) a full table would need. Output is plain or unified.
+O(NM) a full table would need. Output is plain or unified, and
+`--color=WHEN` paints it as GNU diff does: removed lines red, added
+green, the command or hunk line cyan, the file headers bold, and
+`auto` meaning only when the output is a terminal.
 
 Two questions come before the search, because they do not need it and
 the reference diff answers them first by comparison: whether the files
