@@ -187,7 +187,10 @@ what the build was measured to need.
 
 Each is held to the same test as the assembler and the archiver: run the
 reference implementation and ours on the same input and compare the
-bytes.
+bytes. Two of the harnesses compare something else, because for a
+utility not only what comes out matters but when: whether a line has
+been passed on before its input ends, and how many recipes a recursive
+build had running at once.
 
     tools/regexcheck.py                     # the regex engine vs GNU grep
     tools/shcheck.sh                        # occsh vs /bin/sh, per clause group
@@ -195,6 +198,7 @@ bytes.
     tools/mkcheck.sh                        # occmake vs GNU make (-n plans)
     tools/jscheck.sh                        # occmake -jN vs GNU make -jN
     tools/streamcheck.sh                    # when the output goes out
+    tools/ldrcheck.sh                       # occld -r vs GNU ld -r
 
     7740 regex cases, identical
       21 shell scripts, identical output, error output, status and files
@@ -203,6 +207,8 @@ bytes.
        8 parallel runs, the same peak number of recipes at once
       14 cases of when a utility passes its output on or stops
          reading, one named difference
+       8 groups of the runtime's objects, partially linked, identical
+         in sections, symbols and relocations
 
 ## A build with no C
 
