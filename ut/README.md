@@ -80,9 +80,14 @@ edit graph is searched by increasing edit distance, keeping for each
 diagonal the furthest point reached, which is O(ND) rather than the
 O(NM) a full table would need. Output is plain or unified.
 
+Two questions come before the search, because they do not need it and
+the reference diff answers them first by comparison: whether the files
+are the same at all, which they usually are where the test suite uses
+diff, and `-q`, which asks only whether they differ.
+
 ## Testing
 
-`tools/utcheck.py` runs 228 cases against the GNU utilities. Each case
+`tools/utcheck.py` runs 248 cases against the GNU utilities. Each case
 is an argument list and a standard input; the two run in identical
 scratch directories, and standard output, standard error, the exit
 status and the files left behind must all agree. They do, with four
