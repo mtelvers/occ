@@ -275,7 +275,7 @@ let link o objects output =
         | None -> [ crt "crt1.o"; crt "crti.o"; crt "crtbeginT.o" ] @ items
                   @ [ Link.Library "gcc"; Link.Library "gcc_eh"; Link.Library "c"; crt "crtend.o"; crt "crtn.o" ] in
       if o.verbose then prerr_endline ("occld -o " ^ output);
-      Link.link ~output ~entry:"_start" ~search items
+      Link.link ~output ~entry:(Some "_start") ~search items
 
 (* ---- Main --------------------------------------------------------------- *)
 

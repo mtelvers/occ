@@ -16,9 +16,16 @@ val find_library : string list -> string -> string
 val script_items : string -> item list
 (** the items a GNU ld script names, for the libm.a that is one *)
 
-val link : output:string -> entry:string -> search:string list -> item list -> unit
+val link :
+  ?shared:bool -> ?soname:string ->
+  output:string -> entry:string option -> search:string list -> item list -> unit
 (** Link the items, in order, into a statically linked executable at
     [output] whose entry point is the symbol [entry].  Archive members are
     included only when they define a symbol still undefined.  Raises
     [Failure] with a message for undefined symbols, duplicate definitions,
-    overflowing relocations and unsupported inputs. *)
+    overflowing relocations and unsupported inputs.
+
+    With [~shared:true] the output is a shared object instead: ET_DYN,
+    starting at address zero, with the tables a dynamic loader reads
+    (see dynamic.ml).  It has no entry point, and [~soname] gives the
+    name the loader is to record for it. *)

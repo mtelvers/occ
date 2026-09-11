@@ -1,18 +1,24 @@
 (* occld: a static linker with the parts of ld's command line that gcc
    and the OCaml build use. *)
 
-let usage = "usage: occld [-r] [-o output] [-L dir] [-l lib] [-e entry] files...\n"
+let usage = "usage: occld [-r|-shared] [-o output] [-L dir] [-l lib] [-e entry] [-soname name] files...\n"
 
 let () =
   let output = ref "a.out" and entry = ref "_start" and search = ref [] and items = ref [] in
   (* -r asks for another relocatable object rather than an executable,
-     which is a different job: see src/linker/partial.ml *)
-  let relocatable = ref false in
+     which is a different job: see src/linker/partial.ml.  -shared asks
+     for a shared object, which is the same job with the loader left
+     something to do: see src/linker/dynamic.ml *)
+  let relocatable = ref false and shared = ref false and soname = ref "" in
   let rec go = function
     | [] -> ()
     | "-o" :: f :: rest -> output := f; go rest
     | ("-r" | "-i" | "--relocatable") :: rest -> relocatable := true; go rest
     | "-e" :: e :: rest -> entry := e; go rest
+    | ("-shared" | "--shared" | "-Bshareable") :: rest -> shared := true; go rest
+    | ("-soname" | "--soname" | "-h") :: n :: rest -> soname := n; go rest
+    | a :: rest when String.length a > 8 && String.sub a 0 8 = "-soname=" ->
+        soname := String.sub a 8 (String.length a - 8); go rest
     | "-L" :: d :: rest -> search := !search @ [ d ]; go rest
     | "-l" :: l :: rest -> items := Occ.Link.Library l :: !items; go rest
     | ("-static" | "--start-group" | "--end-group" | "-E" | "--export-dynamic" | "--build-id" | "-z" | "--hash-style" | "--as-needed" | "-m") :: rest ->
@@ -28,5 +34,8 @@ let () =
   if !items = [] then begin prerr_string usage; exit 2 end;
   try
     if !relocatable then Occ.Partial.link ~output:!output ~search:!search (List.rev !items)
-    else Occ.Link.link ~output:!output ~entry:!entry ~search:!search (List.rev !items)
+    else if !shared then
+      Occ.Link.link ~shared:true ~soname:!soname ~output:!output ~entry:None
+        ~search:!search (List.rev !items)
+    else Occ.Link.link ~output:!output ~entry:(Some !entry) ~search:!search (List.rev !items)
   with Failure msg -> prerr_endline ("occld: " ^ msg); exit 1
