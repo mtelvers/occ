@@ -4,14 +4,16 @@
 type item =
   | Object of string    (** a relocatable object file *)
   | Archive of string   (** a static library, or a GNU ld script naming some *)
-  | Library of string   (** -lname, found as libname.a on the search path *)
+  | Library of string   (** -lname, found on the search path *)
+  | Shared of string    (** a shared object: what it offers, not what is in it *)
 
 val read_file : string -> string
 (** the whole of a file, as bytes *)
 
-val find_library : string list -> string -> string
+val find_library : ?shared:bool -> string list -> string -> string
 (** [find_library search name] is the path of libname.a on the search
-    path.  Raises [Failure] if it is not there. *)
+    path, or of libname.so before it with [~shared:true].  Raises
+    [Failure] if it is not there. *)
 
 val script_items : string -> item list
 (** the items a GNU ld script names, for the libm.a that is one *)

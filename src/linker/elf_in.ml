@@ -50,13 +50,69 @@ type t = {
   groups : (string * int list) list;   (* COMDAT signature, member section indices *)
 }
 
-let is_object s =
-  String.length s >= 64 && String.sub s 0 4 = "\x7fELF" && s.[4] = '\002' && s.[5] = '\001' && u16 s 16 = 1
+let is_elf s =
+  String.length s >= 64 && String.sub s 0 4 = "\x7fELF" && s.[4] = '\002' && s.[5] = '\001'
+
+let is_object s = is_elf s && u16 s 16 = 1          (* ET_REL *)
+let is_shared s = is_elf s && u16 s 16 = 3          (* ET_DYN *)
 
 let cstring s off =
   match String.index_from_opt s off '\000' with
   | Some e -> String.sub s off (e - off)
   | None -> String.sub s off (String.length s - off)
+
+(* A shared object as an input.  The linker does not take it apart: it
+   reads what the object offers, so that references to those names
+   resolve, and the name to record for it, so that the loader knows what
+   to load.  That name is the object's own SONAME if it has one, which
+   is what makes a library's version travel with the program that used
+   it, and otherwise the path as it was given. *)
+type shared = {
+  sfile : string;
+  soname : string;
+  provides : symbol array;
+}
+
+let read_shared file (s : string) : shared =
+  if not (is_shared s) then failwith (file ^ ": not an ELF64 shared object");
+  let shoff = u64 s 0x28 and shentsize = u16 s 0x3a and shnum = u16 s 0x3c and shstrndx = u16 s 0x3e in
+  let hdr i = shoff + i * shentsize in
+  let shstr = u64 s (hdr shstrndx + 0x18) in
+  let body i =
+    let h = hdr i in
+    let typ = u32 s (h + 4) in
+    if typ = 8 || typ = 0 then "" else String.sub s (u64 s (h + 0x18)) (u64 s (h + 0x20)) in
+  let named name =
+    let found = ref None in
+    for i = 0 to shnum - 1 do
+      if cstring s (shstr + u32 s (hdr i)) = name then found := Some i
+    done;
+    !found in
+  let dynsym = named ".dynsym" and dynstr = named ".dynstr" in
+  let strings = match dynstr with Some i -> body i | None -> "" in
+  let provides =
+    match dynsym with
+    | None -> [||]
+    | Some i ->
+        let b = body i in
+        Array.init (String.length b / 24) (fun k ->
+            let e = k * 24 in
+            let info = u8 b (e + 4) in
+            { sname = cstring strings (u32 b e); bind = info lsr 4; stype = info land 0xf;
+              other = u8 b (e + 5); shndx = u16 b (e + 6); value = u64 b (e + 8); ssize = u64 b (e + 16) }) in
+  (* DT_SONAME (tag 14) names an offset in .dynstr *)
+  let soname =
+    match named ".dynamic" with
+    | None -> ""
+    | Some i ->
+        let b = body i in
+        let rec go off =
+          if off + 16 > String.length b then ""
+          else
+            let tag = u64 b off and value = u64 b (off + 8) in
+            if tag = 0 then "" else if tag = 14 then cstring strings value else go (off + 16) in
+        go 0 in
+  { sfile = file; soname = (if soname <> "" then soname else Filename.basename file); provides }
 
 let read file (s : string) : t =
   if not (is_object s) then failwith (file ^ ": not an ELF64 relocatable object");
