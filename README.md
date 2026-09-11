@@ -283,6 +283,28 @@ tests and fails one, `native-debugger`, which compares gdb backtraces
 with a reference recorded from gcc at `-O2`; the hermetic run skips it
 because gdb is not on that PATH.
 
+### With no glibc either
+
+The C library is the one thing in the picture that is neither OCaml nor
+generated, and it need not be the system's. musl 1.2.5 builds with this
+toolchain and nothing else -- its `configure` under occsh, its Makefile
+under occmake, its sources through occ, its archives through occar --
+and the OCaml tree then builds against that, `--sysroot` selecting it:
+
+    env -i PATH=~/occ/toolbin HOME=$HOME TERM=dumb \
+      OCC_SYSROOT=/path/to/musl-sysroot ...
+
+`make tests` there reports 1563 passed, 116 skipped and none failed,
+and every program it produces is statically linked: no `libc.so`, no
+`ld-linux`, and no libgcc at all -- the musl-built `ocamlrun` contains
+none of the 36 libgcc symbols the glibc-linked one does, because
+nothing occ compiles needs them and only glibc's own objects did.
+
+1277 of musl's 1345 objects build. The 68 that do not are its complex
+number sources, every one of them refused at the same place --
+`_Complex`, which occ does not implement. Nothing in OCaml or its test
+suite needs them.
+
 `occmake -j8` builds the same tree in 291 seconds against 1075 serial,
 and `-jN` is a limit for the whole build rather than for each make in
 the recursion: the makes share a pool of job tokens, as GNU make's do.
