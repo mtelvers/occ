@@ -812,6 +812,10 @@ let relocate st =
                     else if t = r_x86_64_gottpoff then begin
                       let v = got_addr (Hashtbl.find st.got (got_key inp sy true)) + a - p in check_signed32 name v; patch o where 4 v
                     end
+                    else if (t = r_x86_64_tlsgd || t = r_x86_64_tlsld) && st.shared then
+                      error "%s: %s is reached by the general dynamic thread-local sequence, \
+                             which a shared object cannot have rewritten; compile it with \
+                             -ftls-model=initial-exec" inp.obj.file name
                     else if t = r_x86_64_tlsgd then begin
                       (* general dynamic to local exec (ABI table 4.11):
                            .byte 0x66; leaq x@tlsgd(%rip),%rdi; .word 0x6666; rex64; call __tls_get_addr@PLT
@@ -846,7 +850,10 @@ let fill_tables st =
            let k = Hashtbl.find st.got key in
            let v = match key with
              (* [shared] a slot for a symbol from elsewhere holds nothing
-                until the loader fills it *)
+                until the loader fills it, and neither does one holding
+                the position of a thread-local, which depends on where
+                the object's block of them ends up *)
+             | _ when st.shared && tls -> 0
              | Global (name, _) when from_loader ~shared:st.shared (gsym st name) -> 0
              | Global (name, _) -> let g = gsym st name in if tls then tp_offset st (value_of st g) else address_of st g
              | Local (file, shndx, value, _) ->
@@ -862,16 +869,40 @@ let fill_tables st =
                 still the loader's to rebase; in an executable at a
                 fixed address it is already right. *)
              let named = match key with
-               | Global (name, false) -> let g = gsym st name in if g.dynidx > 0 then Some g else None
+               | Global (name, _) -> let g = gsym st name in if g.dynidx > 0 then Some g else None
                | _ -> None in
-             match named with
-             | Some g when st.shared || is_imported g ->
-                 st.dynrels <- { Dynamic.where = o.addr + 8 * k; rtype = Dynamic.r_x86_64_glob_dat;
-                                 rsym = g.dynidx; addend = 0 } :: st.dynrels
-             | _ ->
-                 if st.shared then
-                   st.dynrels <- { Dynamic.where = o.addr + 8 * k; rtype = Dynamic.r_x86_64_relative;
-                                   rsym = 0; addend = v } :: st.dynrels
+             let at = o.addr + 8 * k in
+             if tls then begin
+               (* Where a thread-local sits is measured from the thread
+                  pointer, and only the loader knows that: it is told
+                  the symbol if it can be named, and otherwise the
+                  position within this object's own block, which is
+                  what a thread-local nothing else can see needs. *)
+               if st.shared then
+                 match named with
+                 | Some g ->
+                     st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_x86_64_tpoff64;
+                                     rsym = g.dynidx; addend = 0 } :: st.dynrels
+                 | None ->
+                     let within = match key with
+                       | Local (file, shndx, value, _) ->
+                           let inp = List.find (fun (i : input) -> i.obj.file = file) st.inputs in
+                           symbol_value st inp { sname = ""; bind = stb_local; stype = stt_notype;
+                                                 other = 0; shndx; value; ssize = 0 }
+                           - tls_block_start st
+                       | Global (name, _) -> value_of st (gsym st name) - tls_block_start st in
+                     st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_x86_64_tpoff64;
+                                     rsym = 0; addend = within } :: st.dynrels
+             end
+             else
+               match named with
+               | Some g when st.shared || is_imported g ->
+                   st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_x86_64_glob_dat;
+                                   rsym = g.dynidx; addend = 0 } :: st.dynrels
+               | _ ->
+                   if st.shared then
+                     st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_x86_64_relative;
+                                     rsym = 0; addend = v } :: st.dynrels
            end) st.got_slots
    | None -> ());
   (* [shared] the stubs for calls out: jmp *slot(%rip), and a JUMP_SLOT
