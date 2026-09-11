@@ -259,7 +259,7 @@ headers beside it in the layout an installation would have.
     cd /path/to/ocaml
     env -i PATH=~/occ/toolbin HOME=$HOME TERM=dumb \
       CONFIG_SHELL=~/occ/toolbin/sh ~/occ/toolbin/sh \
-      ./configure --disable-shared --without-zstd
+      ./configure --without-zstd
     env -i PATH=~/occ/toolbin HOME=$HOME TERM=dumb \
       ~/occ/toolbin/make SHELL=~/occ/toolbin/sh world.opt
 
@@ -270,10 +270,18 @@ the names of the tools it found, which is what should differ. It never
 re-executes itself under another shell, which it does when the shell it
 was started in lacks something it needs.
 
-`make tests` under that PATH reports 1562 passed, 117 skipped and none
-failed. A run of the same tree with dash and the GNU utilities passes
-the same 1562 and fails one, `native-debugger`, which compares gdb
-backtraces; the hermetic run skips it because gdb is not on that PATH.
+`make tests` under that PATH reports 1621 passed, 58 skipped and none
+failed, with the tree in its own default configuration -- shared
+libraries and all, the `dll*.so` stubs loaded by a dynamically linked
+`ocamlrun` that occld produced. Configured `--disable-shared` instead,
+where nothing is loaded and every executable is static, it reports 1562
+passed, 117 skipped and none failed; the 59 tests between the two are
+the ones that load code.
+
+A run of the same tree with dash and the GNU utilities passes the same
+tests and fails one, `native-debugger`, which compares gdb backtraces
+with a reference recorded from gcc at `-O2`; the hermetic run skips it
+because gdb is not on that PATH.
 
 `occmake -j8` builds the same tree in 291 seconds against 1075 serial,
 and `-jN` is a limit for the whole build rather than for each make in
