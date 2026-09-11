@@ -6,6 +6,8 @@ type item =
   | Archive of string   (** a static library, or a GNU ld script naming some *)
   | Library of string   (** -lname, found on the search path *)
   | Shared of string    (** a shared object: what it offers, not what is in it *)
+  | Named of string     (** a name a linker script gave, to look for on the path *)
+  | Named_shared of string  (** the same, for a shared object *)
 
 val read_file : string -> string
 (** the whole of a file, as bytes *)

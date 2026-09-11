@@ -1,10 +1,10 @@
 type stage = Preprocess | Compile | Assemble | Link
 type mode = Native | Delegate
 
-(* Every stage is native by default: preprocessing, compilation, assembly
-   and (static) linking; shared objects are still gcc's job.  OCC_NATIVE
-   overrides the set ("none" delegates everything, for use as a pure
-   wrapper). *)
+(* Every stage is native by default: preprocessing, compilation,
+   assembly and linking, whether the output is a static executable, a
+   dynamic one, or a shared object.  OCC_NATIVE overrides the set
+   ("none" delegates everything, for use as a pure wrapper). *)
 let native_stages =
   match Sys.getenv_opt "OCC_NATIVE" with
   | None | Some "" -> [ "pp"; "cc"; "as"; "ld" ]
@@ -238,10 +238,10 @@ let assemble o input output =
       if o.verbose then Printf.eprintf "occas %s -o %s\n" input output;
       Assemble.files [ input ] output
 
-(* Where the C runtime's start files and static libraries live.  The
-   native linker is static, so it links crt1.o, crti.o, crtbeginT.o, the
-   objects, then libgcc, libgcc_eh and libc, and crtend.o, crtn.o, the way
-   gcc -static does.  Shared objects are still gcc's job. *)
+(* Where the C runtime's start files and libraries live.  A static
+   executable links crt1.o, crti.o, crtbeginT.o, the objects, then
+   libgcc, libgcc_eh and libc, and crtend.o, crtn.o, the way gcc -static
+   does; the dynamic forms are in [link] below. *)
 let system_lib_dirs () =
   let gcc_dirs =
     let root = "/usr/lib/gcc/x86_64-linux-gnu" in
@@ -255,10 +255,45 @@ let find_file dirs name =
   | Some d -> Filename.concat d name
   | None -> failwith ("cannot find " ^ name)
 
+(* What -Wl, passed down, plus the driver's own spellings of the same
+   things.  Three of them decide what kind of output this is:
+
+   -shared              a shared object rather than an executable
+   -Wl,-E / -rdynamic   an executable whose symbols a loaded object may
+                        bind to, which only a dynamic executable can be
+   a .so on the line     likewise: something has to load it
+
+   Everything else stays a static link, which is what this driver has
+   always produced and what leaves nothing to be run at startup. *)
+type link_kind = Static_exe | Dynamic_exe | Shared_object
+
+let linker_words o =
+  List.concat_map (fun a ->
+      if String.length a > 4 && String.sub a 0 4 = "-Wl," then
+        String.split_on_char ',' (String.sub a 4 (String.length a - 4))
+      else [ a ])
+    o.link_args
+
+let link_kind o =
+  let words = linker_words o in
+  let names_shared =
+    List.exists (fun a -> Filename.check_suffix a ".so" || String.contains a '.' && Filename.check_suffix a ".so.1") o.link_args in
+  if List.mem "-shared" words then Shared_object
+  else if List.mem "-E" words || List.mem "--export-dynamic" words || List.mem "-rdynamic" words
+          || names_shared then Dynamic_exe
+  else Static_exe
+
+(* the value after a -Wl option that takes one, as in -Wl,-soname,libx.so *)
+let linker_value o name =
+  let rec go = function
+    | a :: v :: _ when a = name -> Some v
+    | _ :: rest -> go rest
+    | [] -> None in
+  go (linker_words o)
+
 let link o objects output =
   match mode Link with
   | Delegate -> run o delegate_cc (o.passthrough @ objects @ o.link_args @ [ "-o"; output ])
-  | Native when List.mem "-shared" o.passthrough -> run o delegate_cc (o.passthrough @ objects @ o.link_args @ [ "-o"; output ])
   | Native ->
       let user_dirs = List.filter_map (fun a ->
           if String.length a > 2 && String.sub a 0 2 = "-L" then Some (String.sub a 2 (String.length a - 2)) else None) o.link_args in
@@ -269,16 +304,38 @@ let link o objects output =
           else if Filename.check_suffix a ".o" then Some (Link.Object a)
           else None) (objects @ o.link_args) in
       let crt name = Link.Object (find_file search name) in
+      let kind = link_kind o in
+      (* The start files and the compiler's own library differ with the
+         kind of output, as they do for gcc: an executable starts at
+         crt1.o, a shared object has no start at all, and the static
+         forms of both crtbegin and libgcc's unwinder are for a link
+         with nothing to load. *)
       let items =
-        match sysroot () with
-        | Some _ -> [ crt "crt1.o"; crt "crti.o" ] @ items @ [ Link.Library "c"; crt "crtn.o" ]
-        | None -> [ crt "crt1.o"; crt "crti.o"; crt "crtbeginT.o" ] @ items
-                  @ [ Link.Library "gcc"; Link.Library "gcc_eh"; Link.Library "c"; crt "crtend.o"; crt "crtn.o" ] in
+        match kind, sysroot () with
+        | _, Some _ ->
+            [ crt "crt1.o"; crt "crti.o" ] @ items @ [ Link.Library "c"; crt "crtn.o" ]
+        | Static_exe, None ->
+            [ crt "crt1.o"; crt "crti.o"; crt "crtbeginT.o" ] @ items
+            @ [ Link.Library "gcc"; Link.Library "gcc_eh"; Link.Library "c"; crt "crtend.o"; crt "crtn.o" ]
+        | Dynamic_exe, None ->
+            [ crt "crt1.o"; crt "crti.o"; crt "crtbegin.o" ] @ items
+            @ [ Link.Library "gcc"; Link.Library "gcc_s"; Link.Library "c";
+                Link.Library "gcc"; Link.Library "gcc_s"; crt "crtend.o"; crt "crtn.o" ]
+        | Shared_object, None ->
+            [ crt "crti.o"; crt "crtbeginS.o" ] @ items
+            @ [ Link.Library "gcc"; Link.Library "gcc_s"; Link.Library "c";
+                Link.Library "gcc"; Link.Library "gcc_s"; crt "crtendS.o"; crt "crtn.o" ] in
       if o.verbose then prerr_endline ("occld -o " ^ output);
-      (* A link that mentions no shared object is static, which is what
-         this driver has always produced; -shared and the dynamic
-         executables are asked for by name. *)
-      Link.link ~output ~entry:(Some "_start") ~search items
+      let rpath = match linker_value o "-rpath" with Some d -> d | None -> "" in
+      let soname = match linker_value o "-soname" with Some n -> n | None -> "" in
+      match kind with
+      | Static_exe -> Link.link ~output ~entry:(Some "_start") ~search items
+      | Dynamic_exe ->
+          Link.link ~export_all:true ~prefer_shared:true ~rpath ~output
+            ~entry:(Some "_start") ~search items
+      | Shared_object ->
+          Link.link ~shared:true ~soname ~prefer_shared:true ~rpath ~output
+            ~entry:None ~search items
 
 (* ---- Main --------------------------------------------------------------- *)
 

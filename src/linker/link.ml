@@ -245,7 +245,10 @@ let add_object st (obj : Elf_in.t) =
       end) obj.symbols;
   st.inputs <- inp :: st.inputs
 
-type item = Object of string | Archive of string | Library of string | Shared of string
+type item =
+  | Object of string | Archive of string | Library of string | Shared of string
+  (* a name a linker script gave, to be looked for on the search path *)
+  | Named of string | Named_shared of string
 
 (* remove /* ... */ comments from a linker script *)
 let strip_comments text =
@@ -274,9 +277,24 @@ let find_library ?(shared = false) search name =
 (* an archive's members with the symbols each defines, read once *)
 type archive = { aname : string; members : (Ar.member * string list) array; loaded : bool array }
 
-(* Some "libraries" are tiny GNU ld scripts naming the real files, such as
-   Ubuntu's libm.a: GROUP ( libm-2.39.a libmvec.a ).  Only GROUP and
-   INPUT lists of file names and -l options are understood. *)
+(* Some "libraries" are tiny GNU ld scripts naming the real files, such
+   as Ubuntu's libm.a: GROUP ( libm-2.39.a libmvec.a ), and its
+   libgcc_s.so: GROUP ( libgcc_s.so.1 -lgcc ).  Only GROUP and INPUT
+   lists of file names and -l options are understood.
+
+   A name in one of these is not a path but something to look for on the
+   search path, as ld does, and a name ending in .so or .so.N is a
+   shared object rather than an archive. *)
+let shared_name w =
+  Filename.check_suffix w ".so"
+  || (match String.rindex_opt w '.' with
+      | Some i ->
+          let last = String.sub w (i + 1) (String.length w - i - 1) in
+          int_of_string_opt last <> None
+          && (let stem = String.sub w 0 i in
+              Filename.check_suffix stem ".so" || String.length stem > 3 && Filename.check_suffix stem ".so")
+      | None -> false)
+
 let script_items text =
   let text = strip_comments text in
   let words = String.split_on_char ' ' (String.map (fun c -> if c = '\n' || c = '\t' || c = '(' || c = ')' then ' ' else c) text) in
@@ -285,7 +303,8 @@ let script_items text =
     | ("GROUP" | "INPUT" | "AS_NEEDED" | "") :: rest -> go acc rest
     | ("OUTPUT_FORMAT" | "TARGET") :: _ :: rest -> go acc rest
     | w :: rest when String.length w > 2 && String.sub w 0 2 = "-l" -> go (Library (String.sub w 2 (String.length w - 2)) :: acc) rest
-    | w :: rest -> go (Archive w :: acc) rest in
+    | w :: rest when shared_name w -> go (Named_shared w :: acc) rest
+    | w :: rest -> go (Named w :: acc) rest in
   go [] words
 
 let load st ~search items =
@@ -294,6 +313,15 @@ let load st ~search items =
     match item with
     | Object f -> add_object st (Elf_in.read f (read_file f))
     | Shared f -> shareds := Elf_in.read_shared f (read_file f) :: !shareds
+    | Named name | Named_shared name ->
+        (* look for it where the libraries are, then where it says *)
+        let found =
+          if Filename.is_relative name then
+            match List.find_opt Sys.file_exists (List.map (fun d -> Filename.concat d name) search) with
+            | Some f -> f
+            | None -> if Sys.file_exists name then name else error "cannot find %s" name
+          else name in
+        add (match item with Named_shared _ -> Shared found | _ -> Archive found)
     | Archive f | Library f ->
         let f = match item with Library name -> find_library ~shared:st.prefer_shared search name | _ -> f in
         let text = read_file f in

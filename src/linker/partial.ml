@@ -134,10 +134,18 @@ let load st ~search items =
   let rec add item =
     match item with
     | Link.Object f -> add_object st (Elf_in.read f (Link.read_file f))
-    | Link.Shared f ->
+    | Link.Shared f | Link.Named_shared f ->
         (* a partial link joins relocatable objects; a shared object is
            not one, and nothing in the build asks for that mixture *)
         failwith (f ^ ": a shared object cannot go into a relocatable link")
+    | Link.Named name ->
+        let found =
+          if Filename.is_relative name then
+            match List.find_opt Sys.file_exists (List.map (fun d -> Filename.concat d name) search) with
+            | Some f -> f
+            | None -> if Sys.file_exists name then name else failwith ("cannot find " ^ name)
+          else name in
+        add (Link.Archive found)
     | Link.Archive f | Link.Library f ->
         let f = match item with Link.Library name -> Link.find_library search name | _ -> f in
         let text = Link.read_file f in
