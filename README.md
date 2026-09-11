@@ -14,7 +14,7 @@ down from 6 times with everything in frame slots. x86-64 Linux, System V ABI.
 
 Everything the build runs is now ours as well: the assembler (`occas`,
 byte-identical to GNU as on everything occ and ocamlopt produce), the
-archiver (`occar`), a static linker (`occld`), a make (`occmake`), a
+archiver (`occar`), a linker (`occld`), a make (`occmake`), a
 POSIX shell (`occsh`) and the utilities the build calls (`occutils`:
 sed, awk, grep, diff, sort, tr, cp, rm and twenty-odd more). With a
 PATH holding only those, `./configure && make world.opt` builds the
@@ -25,7 +25,7 @@ OCaml compiler with no program written in C on it.
     bin/main.ml          entry point of occ, the compiler driver
     bin/occas.ml         entry point of occas, the assembler (GNU as command line)
     bin/occar.ml         entry point of occar, the archiver (ar command line)
-    bin/occld.ml         entry point of occld, the static linker (ld command line)
+    bin/occld.ml         entry point of occld, the linker (ld command line)
     bin/occmake.ml       entry point of occmake, the make
     bin/occsh.ml         entry point of occsh, the shell
     bin/occutils.ml      entry point of occutils, every utility in one binary
@@ -111,8 +111,8 @@ gets the original file back byte for byte (34 of 34). Configure with
 
 ## Linker
 
-`occld` links relocatable objects and archives into a statically linked
-ELF executable in five steps: loading (archive members pulled in while
+`occld` links relocatable objects and archives into an ELF executable in
+five steps: loading (archive members pulled in while
 they define undefined symbols, COMDAT groups deduplicated), symbol
 resolution (strong over weak over common), placement (input sections
 grouped by name into output sections, output sections into read-only,
@@ -123,6 +123,41 @@ relocations for glibc's startup code), and output with a symbol table for
 debuggers. It links glibc's `libc.a`, `libgcc_eh.a` and Ubuntu's
 linker-script `libm.a`; statically linked `ocamlrun` and ocamlopt
 programs run, and gdb finds their source lines.
+
+### Shared objects, and the executables that load them
+
+`occld -shared` produces a shared object instead, and an executable
+linked against one carries what the loader needs too. That is a
+different job in four ways, and `src/linker/dynamic.ml` is the part
+that does it: the output is ET_DYN starting at address zero, so the
+loader may put it anywhere; the places holding an address this link
+cannot know go in `.rela.dyn` for the loader to fix; the names it offers
+and the names it wants go in `.dynsym`, with `.hash` to find them by;
+and `.dynamic` says where all of that is. Calls out of the object go
+through stubs whose slots the loader fills before the object runs, and a
+variable of another object that non-position-independent code refers to
+by address gets space here and a copy relocation.
+
+Two things GNU ld emits are left out deliberately, each measured first:
+`.gnu.hash`, because a loader that finds only `DT_HASH` uses it, which
+is a few lines against a few hundred; and the version tables on the
+symbols an object *defines*, which nothing reads unless the object
+itself declares versions.
+
+The versions on its *references* are not optional, and the OCaml test
+suite is what said so. glibc offers `realpath@@GLIBC_2.3`, which
+accepts a null second argument, and `realpath@GLIBC_2.2.5`, which does
+not; a reference naming no version is bound to whichever the loader
+meets first, and it meets the old one. 334 tests failed on it. So
+`occld` reads the version each name is offered under, binds to the
+default, and writes `.gnu.version` and `.gnu.version_r` to say so.
+
+With this, the OCaml tree builds with shared libraries enabled, which
+is its own default: `runtime/libcamlrun_shared.so`, the `dll*.so` stubs
+the bytecode runtime loads, and the `.cmxs` files `ocamlopt -shared`
+produces. Its test suite then reports 1621 passed, 57 skipped and the
+one `native-debugger` failure -- 59 tests more than the static
+configuration, whose skips are mostly the dynamic-loading ones.
 
 `occld -r` is the other job: a partial link, whose output is another
 relocatable object. Sections of the same name are concatenated, the
@@ -199,6 +234,7 @@ build had running at once.
     tools/jscheck.sh                        # occmake -jN vs GNU make -jN
     tools/streamcheck.sh                    # when the output goes out
     tools/ldrcheck.sh                       # occld -r vs GNU ld -r
+    tools/dyncheck.sh                       # occld -shared vs GNU ld -shared
 
     7740 regex cases, identical
       22 shell scripts, identical output, error output, status and files
@@ -210,6 +246,8 @@ build had running at once.
          reading, one named difference
        8 groups of the runtime's objects, partially linked, identical
          in sections, symbols and relocations
+      13 shared objects and dynamic executables, identical in what a
+         loader reads, and running the same
 
 ## A build with no C
 
