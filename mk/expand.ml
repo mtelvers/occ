@@ -314,19 +314,15 @@ and or_and ctx args ~stop_nonempty =
         else (if v = "" then "" else go v rest) in
   go (if stop_nonempty then "" else "x") args
 
+(* $(wildcard pattern): the names that exist and match.  This is
+   pathname expansion, the same notation and the same walk the shell
+   does -- a '*' or '?' or a bracket in any component, not only the
+   last -- so it is the shell's, from posix/.  musl's build asks for
+   $(wildcard src/*/x86_64/*.[csS]), which is both of those at once. *)
 and wildcard pat =
-  (* only a single '*' in the last component is supported, which is all the
-     OCaml build uses *)
-  if not (String.contains pat '*') then (if Sys.file_exists pat then [ pat ] else [])
-  else begin
-    let d = Func.dir pat and base = Func.notdir pat in
-    let dir = if d = "./" then "." else d in
-    match Sys.readdir dir with
-    | entries ->
-        let matched = List.filter (fun e -> Func.pattern_match (Func.subst "*" "%" base) e <> None) (Array.to_list entries) in
-        List.sort compare (List.map (fun e -> if d = "./" then e else d ^ e) matched)
-    | exception _ -> []
-  end
+  match Posix.Fnmatch.glob pat with
+  | Some names -> names
+  | None -> []
 
 and abspath p =
   let p = if Filename.is_relative p then Filename.concat (Sys.getcwd ()) p else p in
