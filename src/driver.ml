@@ -275,6 +275,9 @@ let link o objects output =
         | None -> [ crt "crt1.o"; crt "crti.o"; crt "crtbeginT.o" ] @ items
                   @ [ Link.Library "gcc"; Link.Library "gcc_eh"; Link.Library "c"; crt "crtend.o"; crt "crtn.o" ] in
       if o.verbose then prerr_endline ("occld -o " ^ output);
+      (* A link that mentions no shared object is static, which is what
+         this driver has always produced; -shared and the dynamic
+         executables are asked for by name. *)
       Link.link ~output ~entry:(Some "_start") ~search items
 
 (* ---- Main --------------------------------------------------------------- *)

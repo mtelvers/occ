@@ -19,7 +19,7 @@ val script_items : string -> item list
 (** the items a GNU ld script names, for the libm.a that is one *)
 
 val link :
-  ?shared:bool -> ?soname:string ->
+  ?shared:bool -> ?soname:string -> ?export_all:bool -> ?prefer_shared:bool -> ?rpath:string ->
   output:string -> entry:string option -> search:string list -> item list -> unit
 (** Link the items, in order, into a statically linked executable at
     [output] whose entry point is the symbol [entry].  Archive members are
@@ -30,4 +30,12 @@ val link :
     With [~shared:true] the output is a shared object instead: ET_DYN,
     starting at address zero, with the tables a dynamic loader reads
     (see dynamic.ml).  It has no entry point, and [~soname] gives the
-    name the loader is to record for it. *)
+    name the loader is to record for it.
+
+    An executable linked against a shared object gets those tables too,
+    and a loader to read them.  [~export_all] (ld's -E) puts every
+    global into .dynsym, which is what an executable that loads objects
+    expecting to bind back to it needs; [~prefer_shared] makes -lname
+    look for libname.so before libname.a, as ld does unless it is
+    linking statically; [~rpath] is where the loader is to look for what
+    it needs. *)
