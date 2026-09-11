@@ -99,7 +99,10 @@ let parse_args argv =
      | "-MF" -> let f = next a in o.deps_file <- Some f; o.passthrough <- o.passthrough @ [ a; f ]
      | "-MT" -> let t = next a in o.deps_target <- Some t; o.passthrough <- o.passthrough @ [ a; t ]
      | _ when String.length a > 7 && String.sub a 0 7 = "--dump=" -> o.dump <- Some (split "--dump="); o.stop_after <- Assemble
-     | "--version" -> print_string "occ 0.1 (C11, x86-64 Linux; native preprocess, compile, assemble; gcc links)\n"; exit 0
+     | "--version" ->
+         print_string "occ 0.1 (C11, x86-64 Linux; native preprocess, compile, assemble and link; \
+                       gcc for shared objects)\n";
+         exit 0
      | "-I" -> o.cpp <- { o.cpp with include_dirs = o.cpp.include_dirs @ [ next a ] }
      | "-isystem" -> o.cpp <- { o.cpp with system_dirs = o.cpp.system_dirs @ [ next a ] }
      | "-D" -> let d = next a in o.cpp <- { o.cpp with defines = o.cpp.defines @ [ (match String.index_opt d '=' with None -> d, None | Some k -> String.sub d 0 k, Some (String.sub d (k+1) (String.length d - k - 1))) ] }
