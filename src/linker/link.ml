@@ -96,6 +96,10 @@ type gsym = {
   mutable plt : int option;               (* index of its .iplt entry, for IFUNC symbols *)
   mutable common_at : int;                (* offset in .bss once allocated *)
   mutable dplt : int option;              (* [shared] index of its .plt entry, for an imported function *)
+  (* [shared] the slot that entry jumps through, when it needs one of
+     its own: a function whose address is already in the table jumps
+     through that instead *)
+  mutable dplt_slot : int option;
   mutable dynidx : int;                   (* [shared] its place in .dynsym, 0 if it is not there *)
 }
 
@@ -132,8 +136,10 @@ type state = {
   mutable exports : gsym list;            (* the symbols .dynsym offers, in order *)
   mutable imports : gsym list;            (* the symbols a shared object will provide *)
   mutable needed : string list;           (* the shared objects to record, in order *)
+  mutable shareds : Elf_in.shared list;   (* every one that was named, in order *)
   mutable dplts : gsym list;              (* reversed: one .plt entry each *)
   mutable n_dplt : int;
+  mutable n_dplt_slots : int;             (* of those, the ones needing a slot of their own *)
   provided : (string, symbol) Hashtbl.t;  (* what the shared objects offer, by name *)
   (* the object and version an imported name is bound to, which the
      loader is told so that it binds to the same one *)
@@ -147,7 +153,7 @@ let gsym st name =
   | Some s -> s
   | None ->
       let s = { name; defn = Undefined; weak = true; ifunc = false; referenced = false; plt = None;
-                common_at = 0; dplt = None; dynidx = 0 } in
+                common_at = 0; dplt = None; dplt_slot = None; dynidx = 0 } in
       Hashtbl.replace st.symbols name s;
       st.order <- s :: st.order;
       s
@@ -363,11 +369,7 @@ let load st ~search items =
      loader's tables as much as a shared object does, and a loader to
      read them. *)
   if shareds <> [] then st.dyn <- true;
-  (* one entry per object, in the order they were named: a library
-     mentioned twice, as gcc mentions libgcc_s, is still loaded once *)
-  st.needed <-
-    List.fold_left (fun acc (sh : Elf_in.shared) ->
-        if List.mem sh.soname acc then acc else acc @ [ sh.soname ]) [] shareds;
+  st.shareds <- shareds;
   List.iter (fun (sh : Elf_in.shared) ->
       Array.iter (fun (p : Elf_in.provided) ->
           let sy = p.psym in
@@ -601,7 +603,26 @@ let visibility (inp : input) name =
   | Some sy -> sy.other land 3
   | None -> 0
 
+(* The names the linker defines itself (see define_synthetics, which
+   gives them their values once the layout is known).  They are listed
+   here as well because the loader's tables are settled first, and a
+   name this linker made up belongs in neither half of .dynsym: it is
+   not offered to anyone, and it is not wanted from anyone. *)
+let synthetic_names st =
+  let arrays = List.concat_map (fun p -> [ p ^ "_start"; p ^ "_end" ])
+      [ "__init_array"; "__fini_array"; "__preinit_array"; "__rela_iplt" ] in
+  let sections =
+    Hashtbl.fold (fun name (o : osec) acc ->
+        if o.oflags land shf_alloc <> 0 && name <> "" && name.[0] <> '.'
+        then ("__start_" ^ name) :: ("__stop_" ^ name) :: acc else acc)
+      st.sections [] in
+  arrays @ sections
+  @ [ "__ehdr_start"; "_GLOBAL_OFFSET_TABLE_"; "etext"; "_etext"; "__etext";
+      "edata"; "_edata"; "end"; "_end"; "__bss_start"; "__executable_start" ]
+
 let choose_exports st =
+  let mine = synthetic_names st in
+  let made_here (g : gsym) = (not (is_defined g)) && List.mem g.name mine in
   (* A shared object offers what it defines; an executable offers
      nothing unless it is asked to (-E), which it is when it means to
      load objects that will bind back to it. *)
@@ -615,6 +636,8 @@ let choose_exports st =
                v <> stv_hidden && v <> stv_internal
            | Copy _ -> true
            | Common _ | Absolute _ -> true
+           (* a symbol this linker made up, such as
+              _GLOBAL_OFFSET_TABLE_, is not one to offer *)
            | Imported _ | Synthetic _ | Undefined -> false)
          (List.rev st.order));
   (* a name it has taken a copy of is offered whether or not the rest
@@ -626,8 +649,27 @@ let choose_exports st =
      whatever loads it may have it *)
   st.imports <-
     List.filter (fun (g : gsym) ->
-        g.referenced && (is_imported g || not (is_defined g)))
+        g.referenced && (is_imported g || not (is_defined g)) && not (made_here g))
       (List.rev st.order);
+  (* Which objects to record.  Only the ones something is actually taken
+     from: a library named on the command line and not used is not a
+     library this output needs, and ld leaves it out too (--as-needed,
+     which is the default on this platform).  A library mentioned twice,
+     as gcc mentions libgcc_s, is recorded once. *)
+  let used = List.filter_map (fun (g : gsym) ->
+      match g.defn with
+      (* a weak reference is not a need: crtbeginS.o names
+         __cxa_finalize weakly, and an object that uses nothing else of
+         the C library does not need it loaded *)
+      | Imported soname when not g.weak -> Some soname
+      | _ -> None) st.imports in
+  let used = used @ List.filter_map (fun ((g : gsym), _) ->
+      match Hashtbl.find_opt st.version g.name with Some (soname, _) -> Some soname | None -> None)
+      st.copies in
+  st.needed <-
+    List.filter_map (fun (sh : Elf_in.shared) ->
+        if List.mem sh.soname used then Some sh.soname else None) st.shareds
+    |> List.fold_left (fun acc n -> if List.mem n acc then acc else acc @ [ n ]) [];
   (* .dynsym is numbered now, because the relocations the loader is
      given name symbols by their place in it *)
   let k = ref 1 in
@@ -706,7 +748,7 @@ let dynamic_entries st strings =
       Dynamic.dt_relasz, size ".rela.dyn";
       Dynamic.dt_relaent, 24;
       Dynamic.dt_relacount, st.n_relative ]
-  @ (if size ".plt" > 0
+  @ (if size ".rela.plt" > 0
      then [ Dynamic.dt_pltgot, addr ".got.plt";
             Dynamic.dt_pltrelsz, size ".rela.plt";
             Dynamic.dt_pltrel, 7;                 (* DT_RELA *)
@@ -742,13 +784,13 @@ let synthesize st =
   if st.dyn && st.n_iplt > 0 then
     error "an indirect function in an object that a loader finishes is not supported yet";
   make ".got.plt" (shf_alloc lor shf_write) sht_progbits 8
-    (if st.dyn then (if st.n_dplt > 0 then 24 + 8 * st.n_dplt else 0) else 8 * st.n_iplt);
+    (if st.dyn then (if st.n_dplt_slots > 0 then 24 + 8 * st.n_dplt_slots else 0) else 8 * st.n_iplt);
   make ".iplt" (shf_alloc lor shf_execinstr) sht_progbits 16 (16 * st.n_iplt);
   make ".rela.iplt" shf_alloc sht_rela 8 (24 * st.n_iplt);
   (* [shared] the stubs for calls out, the slots they jump through, and
      the relocations that tell the loader what to put in those slots *)
   make ".plt" (shf_alloc lor shf_execinstr) sht_progbits 16 (16 * st.n_dplt);
-  make ".rela.plt" shf_alloc sht_rela 8 (24 * st.n_dplt);
+  make ".rela.plt" shf_alloc sht_rela 8 (24 * st.n_dplt_slots);
   (* [shared] the tables a loader reads.  Their sizes are known here --
      how many symbols, how many relocations -- although what goes in
      them is not known until addresses are assigned. *)
@@ -990,7 +1032,23 @@ let relocate st =
                   end) rels) inp.obj.relocs) (List.rev st.inputs)
 
 (* [shared] the slot the stub for entry [k] jumps through *)
-let dplt_slot st k = (osec st ".got.plt").addr + 24 + 8 * k
+let dplt_slot_addr st k = (osec st ".got.plt").addr + 24 + 8 * k
+
+(* [shared] Which stubs need a slot of their own.  A function whose
+   address is already wanted in the global offset table -- because
+   something takes its address, as the test on a weak function does --
+   has a table entry the loader fills already, and the stub can jump
+   through that: one slot and one relocation fewer each, which is what
+   GNU ld does with its .plt.got. *)
+let assign_plt_slots st =
+  let k = ref 0 in
+  List.iter (fun (g : gsym) ->
+      if not (Hashtbl.mem st.got (Global (g.name, false))) then begin
+        g.dplt_slot <- Some !k;
+        incr k
+      end)
+    (List.rev st.dplts);
+  st.n_dplt_slots <- !k
 
 (* GOT contents, PLT stubs and IRELATIVE entries *)
 let fill_tables st =
@@ -1060,22 +1118,30 @@ let fill_tables st =
   (* [shared] the stubs for calls out: jmp *slot(%rip), and a JUMP_SLOT
      relocation asking the loader to put the function's address there *)
   (match Hashtbl.find_opt st.sections ".plt", Hashtbl.find_opt st.sections ".rela.plt" with
-   | Some plt, Some rela when st.n_dplt > 0 ->
+   | Some plt, rela when st.n_dplt > 0 ->
+       let rela = match rela with Some r -> r | None -> plt in
        (* the first .got.plt entry holds where .dynamic is, which is
           where a loader looks when it has to find its way back *)
        (match Hashtbl.find_opt st.sections ".got.plt", Hashtbl.find_opt st.sections ".dynamic" with
         | Some gotplt, Some dyn -> patch gotplt 0 8 dyn.addr
         | _ -> ());
        List.iter (fun (g : gsym) ->
-           let k = Option.get g.dplt in
-           let entry = 16 * k in
-           let slot = dplt_slot st k in
+           let entry = 16 * Option.get g.dplt in
+           let slot =
+             match g.dplt_slot with
+             | Some k ->
+                 let slot = dplt_slot_addr st k in
+                 (* the loader is asked for this function's address *)
+                 patch rela (24 * k) 8 slot;
+                 patch rela (24 * k + 8) 8 (Dynamic.r_x86_64_jump_slot lor (g.dynidx lsl 32));
+                 patch rela (24 * k + 16) 8 0;
+                 slot
+             | None ->
+                 (* it is already in the table, with its own relocation *)
+                 (osec st ".got").addr + 8 * Hashtbl.find st.got (Global (g.name, false)) in
            Bytes.blit_string "\xff\x25" 0 plt.body entry 2;
            patch plt (entry + 2) 4 (slot - (plt.addr + entry + 6));
-           Bytes.blit_string "\x0f\x1f\x84\x00\x00\x00\x00\x00\x66\x90" 0 plt.body (entry + 6) 10;
-           patch rela (24 * k) 8 slot;
-           patch rela (24 * k + 8) 8 (Dynamic.r_x86_64_jump_slot lor (g.dynidx lsl 32));
-           patch rela (24 * k + 16) 8 0)
+           Bytes.blit_string "\x0f\x1f\x84\x00\x00\x00\x00\x00\x66\x90" 0 plt.body (entry + 6) 10)
          st.dplts
    | _ -> ());
   match Hashtbl.find_opt st.sections ".iplt", Hashtbl.find_opt st.sections ".got.plt", Hashtbl.find_opt st.sections ".rela.iplt" with
@@ -1229,7 +1295,7 @@ let link ?(shared = false) ?(soname = "") ?(export_all = false) ?(prefer_shared 
              section_order = []; got = Hashtbl.create 256; got_slots = []; iplt = []; n_got = 0; n_iplt = 0; tls_end = 0;
              shared; dyn = shared; export_all; prefer_shared = prefer_shared || shared; rpath;
              base = (if shared then 0 else exec_base); n_dynrel = 0; n_relative = 0; n_verneed = 0; n_from_relocs = 0; n_from_got = 0; dynrels = []; exports = [];
-             imports = []; needed = []; dplts = []; n_dplt = 0;
+             imports = []; needed = []; shareds = []; dplts = []; n_dplt = 0; n_dplt_slots = 0;
              provided = Hashtbl.create 256; version = Hashtbl.create 256; copies = []; soname } in
   (* 1, 2 *)
   load st ~search items;
@@ -1238,6 +1304,7 @@ let link ?(shared = false) ?(soname = "") ?(export_all = false) ?(prefer_shared 
   List.iter layout_section (List.rev st.section_order);
   allocate_commons st;
   scan_relocs st;
+  assign_plt_slots st;
   allocate_copies st;
   if st.dyn then choose_exports st;
   synthesize st;
