@@ -66,6 +66,22 @@ val dt_fini_arraysz : int
 val dt_runpath : int
 val dt_flags : int
 val dt_relacount : int
+val dt_versym : int
+val dt_verneed : int
+val dt_verneednum : int
+
+val ver_ndx_global : int
+(** the index for a name with no version of its own *)
+
+val versym : int list -> string
+(** .gnu.version: one index per .dynsym entry, in that order *)
+
+type need = { file : int; versions : (int * int * int) list }
+(** an object named in .dynstr, and the versions wanted from it as
+    (name offset, hash, index) *)
+
+val verneed : need list -> string
+val verneed_size : need list -> int
 
 val dynamic : (int * int) list -> string
 (** the entries, with DT_NULL added at the end *)

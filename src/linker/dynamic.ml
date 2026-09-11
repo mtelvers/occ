@@ -149,6 +149,57 @@ let sort_rels rels =
   let relative, rest = List.partition (fun r -> r.rtype = r_x86_64_relative) rels in
   relative @ rest
 
+(* ---- the version tables ---- *)
+
+(* A reference has to say which version of a name it means, or the
+   loader binds it to whichever it meets first, which for glibc means
+   the compatibility version rather than the current one (see the
+   comment on [provided] in elf_in.ml).  Two tables say it:
+
+     .gnu.version    one index per .dynsym entry
+     .gnu.version_r  what each index means: an object and a version in
+                     it, as Verneed and Vernaux records
+
+   Index 0 is a local symbol and 1 a name with no version; the ones
+   these tables give out start at 2. *)
+
+let ver_ndx_global = 1
+
+(* .gnu.version: [indices] in .dynsym order, the null entry first *)
+let versym indices =
+  let b = Buffer.create (2 * List.length indices) in
+  List.iter (fun i -> Buffer.add_int16_le b (i land 0xffff)) indices;
+  Buffer.contents b
+
+(* .gnu.version_r: for each object, the versions wanted from it.  Each
+   [need] is the offset of the object's name in .dynstr and a list of
+   (version name offset, hash, index). *)
+type need = { file : int; versions : (int * int * int) list }
+
+let verneed needs =
+  let b = Buffer.create 64 in
+  let n = List.length needs in
+  List.iteri (fun i (nd : need) ->
+      let last = i = n - 1 in
+      let count = List.length nd.versions in
+      Buffer.add_int16_le b 1;                        (* vn_version *)
+      Buffer.add_int16_le b count;                    (* vn_cnt *)
+      u32 b nd.file;                                  (* vn_file *)
+      u32 b 16;                                       (* vn_aux: the records follow *)
+      u32 b (if last then 0 else 16 + 16 * count);    (* vn_next *)
+      List.iteri (fun k (name, hash, index) ->
+          u32 b hash;                                 (* vna_hash *)
+          Buffer.add_int16_le b 0;                    (* vna_flags *)
+          Buffer.add_int16_le b index;                (* vna_other *)
+          u32 b name;                                 (* vna_name *)
+          u32 b (if k = count - 1 then 0 else 16))    (* vna_next *)
+        nd.versions)
+    needs;
+  Buffer.contents b
+
+let verneed_size needs =
+  List.fold_left (fun acc (nd : need) -> acc + 16 + 16 * List.length nd.versions) 0 needs
+
 (* ---- .dynamic ---- *)
 
 let dt_null = 0 and dt_needed = 1 and dt_pltrelsz = 2 and dt_pltgot = 3
@@ -159,6 +210,7 @@ and dt_symbolic = 16 and dt_pltrel = 20 and dt_textrel = 22 and dt_jmprel = 23
 and dt_init_array = 25 and dt_fini_array = 26 and dt_init_arraysz = 27
 and dt_fini_arraysz = 28 and dt_runpath = 29 and dt_flags = 30
 and dt_relacount = 0x6ffffff9
+and dt_versym = 0x6ffffff0 and dt_verneed = 0x6ffffffe and dt_verneednum = 0x6fffffff
 
 let dynamic entries =
   let b = Buffer.create (16 * (List.length entries + 1)) in

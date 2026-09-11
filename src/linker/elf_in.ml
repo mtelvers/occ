@@ -66,11 +66,26 @@ let cstring s off =
    resolve, and the name to record for it, so that the loader knows what
    to load.  That name is the object's own SONAME if it has one, which
    is what makes a library's version travel with the program that used
-   it, and otherwise the path as it was given. *)
+   it, and otherwise the path as it was given.
+
+   What it offers comes with a version, and that is not a nicety.  A C
+   library keeps its old behaviour under an old version name: glibc
+   offers realpath@@GLIBC_2.3, which takes a null second argument, and
+   realpath@GLIBC_2.2.5, which does not.  A reference that names no
+   version is bound by the loader to whichever it finds first, and it
+   finds the old one.  So the version each name is offered under is read
+   here, and the default one -- the one written @@ -- is what a
+   reference to that name means. *)
+type provided = {
+  psym : symbol;
+  pversion : string;        (* the version it is offered under, "" for none *)
+  pdefault : bool;          (* and whether that is the default for the name *)
+}
+
 type shared = {
   sfile : string;
   soname : string;
-  provides : symbol array;
+  provides : provided array;
 }
 
 let read_shared file (s : string) : shared =
@@ -90,7 +105,7 @@ let read_shared file (s : string) : shared =
     !found in
   let dynsym = named ".dynsym" and dynstr = named ".dynstr" in
   let strings = match dynstr with Some i -> body i | None -> "" in
-  let provides =
+  let symbols =
     match dynsym with
     | None -> [||]
     | Some i ->
@@ -100,6 +115,44 @@ let read_shared file (s : string) : shared =
             let info = u8 b (e + 4) in
             { sname = cstring strings (u32 b e); bind = info lsr 4; stype = info land 0xf;
               other = u8 b (e + 5); shndx = u16 b (e + 6); value = u64 b (e + 8); ssize = u64 b (e + 16) }) in
+  (* The version each symbol is offered under: .gnu.version holds an
+     index per symbol into the definitions in .gnu.version_d, with the
+     top bit set on a name that is not the default for that symbol. *)
+  let versym = match named ".gnu.version" with Some i -> body i | None -> "" in
+  let verdef_names =
+    match named ".gnu.version_d" with
+    | None -> [||]
+    | Some i ->
+        let b = body i in
+        let names = Array.make 64 "" in
+        let grow a n = if n < Array.length a then a
+          else (let bigger = Array.make (2 * n + 2) "" in Array.blit a 0 bigger 0 (Array.length a); bigger) in
+        let table = ref names in
+        let rec go off =
+          if off + 20 <= String.length b then begin
+            let flags = u16 b (off + 2) and ndx = u16 b (off + 4) in
+            let aux = u32 b (off + 12) and next = u32 b (off + 16) in
+            (* the base entry names the file itself, not a version *)
+            if flags land 1 = 0 && off + aux + 4 <= String.length b then begin
+              table := grow !table ndx;
+              !table.(ndx) <- cstring strings (u32 b (off + aux))
+            end;
+            if next > 0 then go (off + next)
+          end in
+        go 0;
+        !table in
+  let version_of k =
+    if 2 * k + 2 > String.length versym then ("", true)
+    else
+      let v = u16 versym (2 * k) in
+      let ndx = v land 0x7fff and hidden = v land 0x8000 <> 0 in
+      if ndx < 2 || ndx >= Array.length verdef_names then ("", true)
+      else (verdef_names.(ndx), not hidden) in
+  let provides =
+    Array.mapi (fun k sy ->
+        let (pversion, pdefault) = version_of k in
+        { psym = sy; pversion; pdefault })
+      symbols in
   (* DT_SONAME (tag 14) names an offset in .dynstr *)
   let soname =
     match named ".dynamic" with

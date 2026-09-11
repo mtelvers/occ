@@ -125,6 +125,9 @@ type state = {
   base : int;                             (* the address the image starts at: 0 when shared *)
   mutable n_dynrel : int;                 (* relocations the loader will be given *)
   mutable n_relative : int;               (* of those, the ones naming no symbol *)
+  mutable n_verneed : int;                (* objects whose versions are named *)
+  mutable n_from_relocs : int;            (* how many of n_dynrel the scan counted *)
+  mutable n_from_got : int;               (* and how many the table needs *)
   mutable dynrels : Dynamic.rel list;     (* reversed; built once addresses are known *)
   mutable exports : gsym list;            (* the symbols .dynsym offers, in order *)
   mutable imports : gsym list;            (* the symbols a shared object will provide *)
@@ -132,6 +135,9 @@ type state = {
   mutable dplts : gsym list;              (* reversed: one .plt entry each *)
   mutable n_dplt : int;
   provided : (string, symbol) Hashtbl.t;  (* what the shared objects offer, by name *)
+  (* the object and version an imported name is bound to, which the
+     loader is told so that it binds to the same one *)
+  version : (string, string * string) Hashtbl.t;
   mutable copies : (gsym * int) list;     (* a variable to copy here, and its size *)
   soname : string;                        (* -soname: the name the loader records *)
 }
@@ -357,14 +363,26 @@ let load st ~search items =
      loader's tables as much as a shared object does, and a loader to
      read them. *)
   if shareds <> [] then st.dyn <- true;
-  st.needed <- List.map (fun (sh : Elf_in.shared) -> sh.soname) shareds;
+  (* one entry per object, in the order they were named: a library
+     mentioned twice, as gcc mentions libgcc_s, is still loaded once *)
+  st.needed <-
+    List.fold_left (fun acc (sh : Elf_in.shared) ->
+        if List.mem sh.soname acc then acc else acc @ [ sh.soname ]) [] shareds;
   List.iter (fun (sh : Elf_in.shared) ->
-      Array.iter (fun (sy : Elf_in.symbol) ->
+      Array.iter (fun (p : Elf_in.provided) ->
+          let sy = p.psym in
           if sy.sname <> "" && sy.shndx <> shn_undef && sy.bind <> stb_local then
             match Hashtbl.find_opt st.symbols sy.sname with
-            | Some g when not (is_defined g) ->
-                g.defn <- Imported sh.soname;
-                Hashtbl.replace st.provided sy.sname sy
+            | Some g when not (is_defined g) || (is_imported g && p.pdefault
+                                                 && not (Hashtbl.mem st.version g.name)) ->
+                (* the default version of a name is what a reference to
+                   it means; a compatibility version is passed over *)
+                if p.pdefault || not (is_imported g) then begin
+                  g.defn <- Imported sh.soname;
+                  Hashtbl.replace st.provided sy.sname sy;
+                  if p.pversion <> "" && p.pdefault then
+                    Hashtbl.replace st.version sy.sname (sh.soname, p.pversion)
+                end
             | _ -> ())
         sh.provides)
     shareds
@@ -374,7 +392,8 @@ let load st ~search items =
 let align_up n a = if a <= 1 then n else (n + a - 1) / a * a
 
 (* the order of output sections; orphans go after the listed ones of the same segment *)
-let r_order = [ ".interp"; ".hash"; ".dynsym"; ".dynstr"; ".rela.dyn"; ".rela.plt"; ".rela.iplt";
+let r_order = [ ".interp"; ".hash"; ".dynsym"; ".dynstr"; ".gnu.version"; ".gnu.version_r";
+                ".rela.dyn"; ".rela.plt"; ".rela.iplt";
                 ".rodata"; ".eh_frame"; ".gcc_except_table" ]
 let x_order = [ ".init"; ".iplt"; ".text"; ".fini" ]
 let w_order = [ ".tdata"; ".tbss"; ".preinit_array"; ".init_array"; ".fini_array";
@@ -493,6 +512,28 @@ let dplt_entry st g =
   | Some k -> k
   | None -> let k = st.n_dplt in g.dplt <- Some k; st.n_dplt <- k + 1; st.dplts <- g :: st.dplts; k
 
+(* [shared] What the loader has to be told about this relocation, if
+   anything.  This is the one place that decides, because the count is
+   taken before the layout and the entries are written after it, and the
+   two cannot be allowed to disagree: a link that reserved two entries
+   and produced thirty-eight is how this came to be one function. *)
+type dyn_need = No_need | Need_relative | Need_symbol of gsym
+
+let dyn_need st (inp : input) target (r : reloc) =
+  if not st.dyn || inp.obj.sections.(target).flags land shf_alloc = 0 then No_need
+  else if r.rtype <> r_x86_64_64 then No_need
+  else
+    let sy = inp.obj.symbols.(r.sym) in
+    let global = sy.bind <> stb_local && sy.stype <> stt_section && sy.sname <> "" in
+    match (if global then Some (gsym st sy.sname) else None) with
+    (* A variable copied into this image is answered from the copy,
+       whose address this link knows; the test has to name it that way
+       because the copy is decided in the same pass as the count, and
+       by the time the entries are written the symbol says so itself. *)
+    | Some g when List.exists (fun (h, _) -> h == g) st.copies -> No_need
+    | Some g when from_loader ~shared:st.shared g -> Need_symbol g
+    | _ -> if st.shared then Need_relative else No_need
+
 (* Scan relocations for the GOT and PLT entries they need, so those
    sections can be sized before addresses are assigned. *)
 let scan_relocs st =
@@ -527,19 +568,25 @@ let scan_relocs st =
                 if r.rtype = r_x86_64_gotpcrel || r.rtype = r_x86_64_gotpcrelx || r.rtype = r_x86_64_rex_gotpcrelx then
                   (if not ifunc then ignore (got_slot st (got_key inp sy false)))
                 else if r.rtype = r_x86_64_gottpoff then ignore (got_slot st (got_key inp sy true))
-                else if st.shared && r.rtype = r_x86_64_64
-                        && inp.obj.sections.(target).flags land shf_alloc <> 0 then
+                else if dyn_need st inp target r <> No_need then
+                  (st.n_from_relocs <- st.n_from_relocs + 1;
                   (* [shared] an address the loader will have to put in,
                      since this link does not know where the object will
-                     be *)
-                  st.n_dynrel <- st.n_dynrel + 1) rels) inp.obj.relocs) (List.rev st.inputs);
-  (* [shared] and one for each entry of the global offset table that
-     the loader has to fill, and one for each variable copied here *)
+                     be, or whose it is *)
+                  st.n_dynrel <- st.n_dynrel + 1)) rels) inp.obj.relocs) (List.rev st.inputs);
+  (* [shared] and one for each entry of the global offset table that the
+     loader has to fill, and one for each variable copied here *)
   if st.shared then st.n_dynrel <- st.n_dynrel + st.n_got
   else if st.dyn then begin
+    let will_copy (g : gsym) = List.exists (fun (h, _) -> h == g) st.copies in
     let slots =
       List.length (List.filter (fun (key, _) ->
-          match key with Global (name, false) -> is_imported (gsym st name) | _ -> false) st.got_slots) in
+          match key with
+          | Global (name, _) ->
+              let g = gsym st name in
+              from_loader ~shared:st.shared g && not (will_copy g)
+          | Local _ -> false) st.got_slots) in
+    st.n_from_got <- slots;
     st.n_dynrel <- st.n_dynrel + slots + List.length st.copies
   end
 
@@ -587,6 +634,42 @@ let choose_exports st =
   List.iter (fun (g : gsym) -> g.dynidx <- !k; incr k) st.exports;
   List.iter (fun (g : gsym) -> g.dynidx <- !k; incr k) st.imports
 
+(* [shared] The versions this output asks for, grouped by the object
+   that offers them, with an index each, and the index every imported
+   name is to be looked up under.  Both come from one walk, so that the
+   grouping written into the file and the indices the symbols carry
+   cannot disagree.  Index 0 means a local symbol and 1 a name with no
+   version of its own, so the ones handed out here start at 2. *)
+let version_needs st strings =
+  let by_object = ref [] in                (* soname, versions, in order *)
+  let index_of = Hashtbl.create 64 in      (* symbol name -> index *)
+  let assigned = Hashtbl.create 16 in      (* soname \000 version -> index *)
+  let next = ref 2 in
+  List.iter (fun (g : gsym) ->
+      match Hashtbl.find_opt st.version g.name with
+      | None -> ()
+      | Some (soname, version) ->
+          let key = soname ^ "\000" ^ version in
+          let i =
+            match Hashtbl.find_opt assigned key with
+            | Some i -> i
+            | None ->
+                let i = !next in
+                incr next;
+                Hashtbl.replace assigned key i;
+                let versions = try List.assoc soname !by_object with Not_found -> [] in
+                by_object := (soname, versions @ [ (version, i) ])
+                             :: List.remove_assoc soname !by_object;
+                i in
+          Hashtbl.replace index_of g.name i)
+    st.imports;
+  let needs =
+    List.map (fun (soname, versions) ->
+        { Dynamic.file = Dynamic.intern strings soname;
+          versions = List.map (fun (v, i) -> (Dynamic.intern strings v, Dynamic.hash v, i)) versions })
+      (List.rev !by_object) in
+  (needs, index_of)
+
 (* [shared] .dynstr holds every name the loader will look at: the
    symbols, the objects to load, and this object's own name.  The order
    is fixed so that the table built to size it and the table built to
@@ -598,6 +681,9 @@ let build_strtab st =
   List.iter (fun n -> ignore (Dynamic.intern strings n)) st.needed;
   if st.soname <> "" then ignore (Dynamic.intern strings st.soname);
   if st.rpath <> "" then ignore (Dynamic.intern strings st.rpath);
+  (* the version names too, and the objects they come from, which
+     version_needs interns as it groups them *)
+  ignore (version_needs st strings);
   strings
 
 (* [shared] What .dynamic says.  Called twice: once before addresses are
@@ -636,6 +722,11 @@ let dynamic_entries st strings =
   @ (if size ".fini_array" > 0
      then [ Dynamic.dt_fini_array, addr ".fini_array"; Dynamic.dt_fini_arraysz, size ".fini_array" ] else [])
   @ (if st.rpath <> "" then [ Dynamic.dt_runpath, Dynamic.intern strings st.rpath ] else [])
+  @ (if size ".gnu.version_r" > 0
+     then [ Dynamic.dt_versym, addr ".gnu.version";
+            Dynamic.dt_verneed, addr ".gnu.version_r";
+            Dynamic.dt_verneednum, List.length (fst (version_needs st strings)) ]
+     else [])
 
 (* Synthetic sections: .got, .got.plt, .iplt and .rela.iplt, sized from the scan. *)
 let synthesize st =
@@ -676,6 +767,13 @@ let synthesize st =
     make ".dynsym" shf_alloc 11 8 (24 * n);
     make ".dynstr" shf_alloc 3 1 (String.length (Dynamic.strtab_contents strings));
     make ".rela.dyn" shf_alloc sht_rela 8 (24 * st.n_dynrel);
+    (* the versions the imports are to be looked up under, and what the
+       indices in that table mean *)
+    let (needs, _) = version_needs st strings in
+    if needs <> [] then begin
+      make ".gnu.version" shf_alloc 0x6fffffff 2 (2 * n);
+      make ".gnu.version_r" shf_alloc 0x6ffffffe 8 (Dynamic.verneed_size needs)
+    end;
     make ".dynamic" (shf_alloc lor shf_write) 6 8
       (Dynamic.dynamic_size (List.length (dynamic_entries st strings)))
   end
@@ -719,8 +817,17 @@ let allocate_commons st =
    to map.  Non-allocated sections follow in the file only. *)
 type segment = { flags : int; vaddr : int; off : int; filesz : int; memsz : int }
 
+(* Room for the program headers, which sit right after the ELF header and
+   are mapped with the first segment.  The most there can be: the three
+   loadable segments, the thread-local block, the dynamic table, the
+   interpreter, and the note about the stack.  The writer checks the
+   count against this rather than trusting it, since headers written
+   past the room reserved would land on top of the first section -- as
+   they did once, and the only sign was a garbled interpreter name. *)
+let max_phnum = 8
+
 let assign_addresses st (r, x, w, other) =
-  let cursor = ref (64 + 56 * 6) in   (* the ELF header and room for program headers *)
+  let cursor = ref (64 + 56 * max_phnum) in
   let segments = ref [] in
   let place flags secs first =
     let secs = List.filter (fun o -> o.osize > 0 || o.oname = ".bss") secs in
@@ -801,11 +908,21 @@ let relocate st =
                       end
                       else if t = r_x86_64_64 then begin
                         patch o where 8 a;
-                        st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_x86_64_64;
-                                        rsym = g.dynidx; addend = a } :: st.dynrels
+                        match dyn_need st inp target r with
+                        | Need_symbol g ->
+                            st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_x86_64_64;
+                                            rsym = g.dynidx; addend = a } :: st.dynrels
+                        | Need_relative | No_need -> ()
                       end
                       else if t = r_x86_64_gotpcrel || t = r_x86_64_gotpcrelx || t = r_x86_64_rex_gotpcrelx then begin
                         let slot = got_addr (Hashtbl.find st.got (got_key inp sy false)) in
+                        let v = slot + a - p in check_signed32 name v; patch o where 4 v
+                      end
+                      else if t = r_x86_64_gottpoff then begin
+                        (* a thread-local of another object: the table
+                           entry holds its position from the thread
+                           pointer, which only the loader knows *)
+                        let slot = got_addr (Hashtbl.find st.got (got_key inp sy true)) in
                         let v = slot + a - p in check_signed32 name v; patch o where 4 v
                       end
                       else
@@ -818,9 +935,14 @@ let relocate st =
                       (* [shared] the loader adds where the object went
                          to this address, so the value left here is the
                          addend it works from *)
-                      if st.shared && o.oflags land shf_alloc <> 0 then
-                        st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_x86_64_relative;
-                                        rsym = 0; addend = v } :: st.dynrels
+                      match dyn_need st inp target r with
+                      | Need_relative ->
+                          st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_x86_64_relative;
+                                          rsym = 0; addend = v } :: st.dynrels
+                      | Need_symbol g ->
+                          st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_x86_64_64;
+                                          rsym = g.dynidx; addend = a } :: st.dynrels
+                      | No_need -> ()
                     end
                     else if t = r_x86_64_32 then (let v = s () + a in check_unsigned32 name v; patch o where 4 v)
                     else if t = r_x86_64_32s then (let v = s () + a in check_signed32 name v; patch o where 4 v)
@@ -902,25 +1024,27 @@ let fill_tables st =
              let at = o.addr + 8 * k in
              if tls then begin
                (* Where a thread-local sits is measured from the thread
-                  pointer, and only the loader knows that: it is told
-                  the symbol if it can be named, and otherwise the
-                  position within this object's own block, which is
-                  what a thread-local nothing else can see needs. *)
-               if st.shared then
-                 match named with
-                 | Some g ->
-                     st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_x86_64_tpoff64;
-                                     rsym = g.dynidx; addend = 0 } :: st.dynrels
-                 | None ->
-                     let within = match key with
-                       | Local (file, shndx, value, _) ->
-                           let inp = List.find (fun (i : input) -> i.obj.file = file) st.inputs in
-                           symbol_value st inp { sname = ""; bind = stb_local; stype = stt_notype;
-                                                 other = 0; shndx; value; ssize = 0 }
-                           - tls_block_start st
-                       | Global (name, _) -> value_of st (gsym st name) - tls_block_start st in
-                     st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_x86_64_tpoff64;
-                                     rsym = 0; addend = within } :: st.dynrels
+                  pointer, and only the loader knows that when the block
+                  it is in is not this image's own: it is told the
+                  symbol if it can be named, and otherwise the position
+                  within this object's own block, which is what a
+                  thread-local nothing else can see needs. *)
+               match named with
+               | Some g when st.shared || from_loader ~shared:st.shared g ->
+                   st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_x86_64_tpoff64;
+                                   rsym = g.dynidx; addend = 0 } :: st.dynrels
+               | _ ->
+                 if st.shared then begin
+                   let within = match key with
+                     | Local (file, shndx, value, _) ->
+                         let inp = List.find (fun (i : input) -> i.obj.file = file) st.inputs in
+                         symbol_value st inp { sname = ""; bind = stb_local; stype = stt_notype;
+                                               other = 0; shndx; value; ssize = 0 }
+                         - tls_block_start st
+                     | Global (name, _) -> value_of st (gsym st name) - tls_block_start st in
+                   st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_x86_64_tpoff64;
+                                   rsym = 0; addend = within } :: st.dynrels
+                 end
              end
              else
                match named with
@@ -982,8 +1106,10 @@ let fill_dynamic st =
     match sec name with
     | Some o when o.osize > 0 ->
         if String.length text <> o.osize then
-          error "%s: the loader's table came out %d bytes, not the %d reserved"
-            name (String.length text) o.osize;
+          error "%s: the loader's table came out %d bytes, not the %d reserved \
+                 (counted %d: %d from relocations, %d from the table, %d copied)"
+            name (String.length text) o.osize st.n_dynrel st.n_from_relocs st.n_from_got
+            (List.length st.copies);
         Bytes.blit_string text 0 o.body 0 (String.length text)
     | _ -> () in
   let strings = build_strtab st in
@@ -1033,6 +1159,22 @@ let fill_dynamic st =
   let rels = Dynamic.sort_rels (List.rev st.dynrels @ copies) in
   st.n_relative <- List.length (List.filter (fun (r : Dynamic.rel) -> r.rtype = Dynamic.r_x86_64_relative) rels);
   put ".rela.dyn" (Dynamic.rela rels);
+  (* the version each name is to be looked up under: the imports carry
+     what the shared object offered, and anything this object defines
+     itself has no version *)
+  let (needs, index_of) = version_needs st strings in
+  st.n_verneed <- List.length needs;
+  if needs <> [] then begin
+    let indices =
+      0 :: List.map (fun (_ : gsym) -> Dynamic.ver_ndx_global) st.exports
+      @ List.map (fun (g : gsym) ->
+            match Hashtbl.find_opt index_of g.name with
+            | Some i -> i
+            | None -> Dynamic.ver_ndx_global)
+          st.imports in
+    put ".gnu.version" (Dynamic.versym indices);
+    put ".gnu.version_r" (Dynamic.verneed needs)
+  end;
   put ".interp" (interpreter ^ "\000");
   put ".dynamic" (Dynamic.dynamic (dynamic_entries st strings))
 
@@ -1086,9 +1228,9 @@ let link ?(shared = false) ?(soname = "") ?(export_all = false) ?(prefer_shared 
   let st = { symbols = Hashtbl.create 4096; order = []; inputs = []; comdat = Hashtbl.create 64; sections = Hashtbl.create 32;
              section_order = []; got = Hashtbl.create 256; got_slots = []; iplt = []; n_got = 0; n_iplt = 0; tls_end = 0;
              shared; dyn = shared; export_all; prefer_shared = prefer_shared || shared; rpath;
-             base = (if shared then 0 else exec_base); n_dynrel = 0; n_relative = 0; dynrels = []; exports = [];
+             base = (if shared then 0 else exec_base); n_dynrel = 0; n_relative = 0; n_verneed = 0; n_from_relocs = 0; n_from_got = 0; dynrels = []; exports = [];
              imports = []; needed = []; dplts = []; n_dplt = 0;
-             provided = Hashtbl.create 256; copies = []; soname } in
+             provided = Hashtbl.create 256; version = Hashtbl.create 256; copies = []; soname } in
   (* 1, 2 *)
   load st ~search items;
   (match entry with Some e -> (gsym st e).referenced <- true | None -> ());
@@ -1176,6 +1318,8 @@ let link ?(shared = false) ?(soname = "") ?(export_all = false) ?(prefer_shared 
     match Hashtbl.find_opt st.sections ".interp" with Some o -> o.osize > 0 | None -> false in
   let phnum = List.length segments + (if st.tls_end <> 0 then 1 else 0)
               + (if dynamic_present then 1 else 0) + (if interp_present then 1 else 0) + 1 in
+  if phnum > max_phnum then
+    error "%d program headers, and there is room for %d" phnum max_phnum;
   let shstr_names = List.map (fun o -> o.oname) placed @ [ ".symtab"; ".strtab"; ".shstrtab" ] in
   let shstrtab, shstr_offs = string_table shstr_names in
   Buffer.add_string out "\x7fELF\x02\x01\x01\x00"; Buffer.add_string out (String.make 8 '\000');
@@ -1227,6 +1371,8 @@ let link ?(shared = false) ?(soname = "") ?(export_all = false) ?(prefer_shared 
     match o.oname with
     | ".dynsym" -> index ".dynstr", 1, 24            (* one local entry: the null one *)
     | ".hash" -> index ".dynsym", 0, 4
+    | ".gnu.version" -> index ".dynsym", 0, 2
+    | ".gnu.version_r" -> index ".dynstr", st.n_verneed, 0
     | ".dynamic" -> index ".dynstr", 0, 16
     | ".rela.dyn" | ".rela.plt" -> index ".dynsym", 0, 24
     | _ -> 0, 0, (if o.otype = sht_rela then 24 else 0) in
