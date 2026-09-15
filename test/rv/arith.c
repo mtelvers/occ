@@ -28,5 +28,19 @@ int main(void) {
   yes("byte", byte(0x1234) == 0x34);
   yes("compare", (add(1, 1) < add(1, 2)) == 1);
   yes("unsigned compare", (udiv(10, 1) > udiv(5, 1)) == 1);
+  /* A comparison against a constant with its top bit set.  The machine
+     keeps a 32-bit value sign-extended in a 64-bit register, so the
+     constant has to be made the same way or the two disagree. */
+  volatile unsigned top = 4294967295u;
+  yes("unsigned equal to a large constant", top == 4294967295u);
+  yes("unsigned above one", top > 2147483648u);
+  yes("unsigned below the largest", (top - 1) < 4294967295u);
+  volatile unsigned short half = 65535;
+  yes("unsigned short against a constant", half == 65535);
+  volatile unsigned char one_byte = 255;
+  yes("unsigned char against a constant", one_byte == 255);
+  volatile unsigned long whole = 18446744073709551615UL;
+  yes("unsigned long against a constant", whole == 18446744073709551615UL);
+  yes("and above half of it", whole > 9223372036854775808UL);
   return 0;
 }

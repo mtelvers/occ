@@ -167,10 +167,24 @@ let load_sym st sym (dst : reg) =
     op st "addi" [ Reg dst; Reg dst; Sym ("%lo(" ^ sym ^ ")", 0) ]
   end
 
+(* An immediate in the form the machine keeps a value of its type in.
+   RV64 holds a 32-bit value sign-extended in its 64-bit register, and
+   every load here sign-extends, so the whole back end may compare two
+   registers whole and get an unsigned answer right.  An immediate has to
+   join that convention: 4294967295 as an unsigned int is the pattern of
+   -1, not 0x00000000ffffffff.  Materialising it the other way makes
+   `u == 4294967295u' false, which is how this was found. *)
+let narrow (ty : Ir.ty) (v : int64) =
+  if is_float ty then v
+  else
+    let bits = 8 * width ty in
+    if bits >= 64 then v
+    else Int64.shift_right (Int64.shift_left v (64 - bits)) (64 - bits)
+
 (* An operand into a named integer register. *)
 let rec load_int st (ty : Ir.ty) (o : Ir.operand) (dst : reg) =
   match o with
-  | Ir.Imm v -> op st "li" [ Reg dst; Imm v ]
+  | Ir.Imm v -> op st "li" [ Reg dst; Imm (narrow ty v) ]
   | Ir.Reg r -> op st (load_mnemonic ty true) [ Reg dst; addr st (S 0) (reg_slot st r) dst ]
   | Ir.Slot k -> op st "addi" [ Reg dst; Reg (S 0); Imm (Int64.of_int st.slots.(k)) ]
   | Ir.Sym s -> load_sym st s dst
@@ -318,6 +332,80 @@ let soft_binop = function
   | Ir.Fadd -> "__addtf3" | Ir.Fsub -> "__subtf3"
   | Ir.Fmul -> "__multf3" | Ir.Fdiv -> "__divtf3"
   | _ -> failwith "Riscv64.Select: that operation has no long double form"
+
+(* ---- an operation that reports its own overflow --------------------- *)
+
+(* This machine has no condition flags: overflow is detected in
+   arithmetic.  Below the register's width there is nothing to detect,
+   only something to notice: the exact result of an operation on two
+   32-bit values fits in a 64-bit register, so the sequence computes it
+   there and asks whether narrowing it back lost anything.  At the
+   register's own width the answer comes from the operands' signs, as
+   the RISC-V manual's commentary on the integer instructions describes,
+   or from the high half of the product for a multiplication. *)
+
+(* the w-bit value in [r], extended to fill the register *)
+let extend st (ty : Ir.ty) signed (r : reg) =
+  let bits = 64 - 8 * width ty in
+  if bits = 0 then ()
+  else if ty = Ir.I32 && signed then op st "sext.w" [ Reg r; Reg r ]
+  else begin
+    op st "slli" [ Reg r; Reg r; Imm (Int64.of_int bits) ];
+    op st (if signed then "srai" else "srli") [ Reg r; Reg r; Imm (Int64.of_int bits) ]
+  end
+
+let binop_overflow st (b : Ir.binop) (ty : Ir.ty) signed (r : int) (flag : int) a c =
+  (* t0 and t1 hold the operands at their exact values, t3 the result
+     and t4 the flag; t5 is scratch.  t2 is left alone: [store] uses it
+     to reach a slot a long way from the frame pointer. *)
+  load_int st ty a (T 0); extend st ty signed (T 0);
+  load_int st ty c (T 1); extend st ty signed (T 1);
+  if width ty < 8 then begin
+    op st (match b with Ir.Add -> "add" | Ir.Sub -> "sub" | _ -> "mul")
+      [ Reg (T 3); Reg (T 0); Reg (T 1) ];
+    op st "mv" [ Reg (T 5); Reg (T 3) ];
+    extend st ty signed (T 5);
+    op st "xor" [ Reg (T 4); Reg (T 3); Reg (T 5) ];
+    op st "snez" [ Reg (T 4); Reg (T 4) ]
+  end else begin
+    match b, signed with
+    | Ir.Add, true ->
+        (* the sum has the wrong sign for both operands *)
+        op st "add" [ Reg (T 3); Reg (T 0); Reg (T 1) ];
+        op st "xor" [ Reg (T 4); Reg (T 0); Reg (T 3) ];
+        op st "xor" [ Reg (T 5); Reg (T 1); Reg (T 3) ];
+        op st "and" [ Reg (T 4); Reg (T 4); Reg (T 5) ];
+        op st "slti" [ Reg (T 4); Reg (T 4); Imm 0L ]
+    | Ir.Add, false ->
+        (* a carry out: the sum came out below one of the addends *)
+        op st "add" [ Reg (T 3); Reg (T 0); Reg (T 1) ];
+        op st "sltu" [ Reg (T 4); Reg (T 3); Reg (T 0) ]
+    | Ir.Sub, true ->
+        (* the operands differ in sign and the difference agrees with the
+           subtrahend rather than with what it was taken from *)
+        op st "sub" [ Reg (T 3); Reg (T 0); Reg (T 1) ];
+        op st "xor" [ Reg (T 4); Reg (T 0); Reg (T 1) ];
+        op st "xor" [ Reg (T 5); Reg (T 0); Reg (T 3) ];
+        op st "and" [ Reg (T 4); Reg (T 4); Reg (T 5) ];
+        op st "slti" [ Reg (T 4); Reg (T 4); Imm 0L ]
+    | Ir.Sub, false ->
+        op st "sltu" [ Reg (T 4); Reg (T 0); Reg (T 1) ];
+        op st "sub" [ Reg (T 3); Reg (T 0); Reg (T 1) ]
+    | _, true ->
+        (* the high half of a signed product is the sign of the low half
+           repeated, and nothing else *)
+        op st "mulh" [ Reg (T 4); Reg (T 0); Reg (T 1) ];
+        op st "mul" [ Reg (T 3); Reg (T 0); Reg (T 1) ];
+        op st "srai" [ Reg (T 5); Reg (T 3); Imm 63L ];
+        op st "xor" [ Reg (T 4); Reg (T 4); Reg (T 5) ];
+        op st "snez" [ Reg (T 4); Reg (T 4) ]
+    | _, false ->
+        op st "mulhu" [ Reg (T 4); Reg (T 0); Reg (T 1) ];
+        op st "mul" [ Reg (T 3); Reg (T 0); Reg (T 1) ];
+        op st "snez" [ Reg (T 4); Reg (T 4) ]
+  end;
+  store st ty r (T 3);
+  store st Ir.I32 flag (T 4)
 
 let binop st (b : Ir.binop) (ty : Ir.ty) (r : int) a c =
   if ty = Ir.F80 then begin
@@ -757,7 +845,7 @@ let instr st (i : Ir.instr) =
       store st ty r (FT 0)
   | Ir.Fence _ -> op st "fence" [ Sym ("rw, rw", 0) ]
   | Ir.Return_address r -> store st Ir.I64 r RA
-  | Ir.Binop_overflow _ -> not_yet "an operation with an overflow flag"
+  | Ir.Binop_overflow (b, ty, signed, r, flag, a, c) -> binop_overflow st b ty signed r flag a c
   (* 7.17, mapped onto the A extension the way the machine's own
      compiler does it: a fence on each side of a sequentially consistent
      load, a fence before such a store, and the acquire-release forms of
