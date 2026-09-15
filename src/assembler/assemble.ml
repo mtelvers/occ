@@ -27,7 +27,7 @@ type fixup = Fixup.t
 
 type chunk =
   | Bytes of string * fixup list * int                (* content, fixups, source line *)
-  | Branch of { short : string; long : string; target : expr; mutable is_long : bool; bline : int }
+  | Branch of { short : Fixup.form; long : Fixup.form; target : expr; mutable is_long : bool; bline : int }
   | Align of int * int option                        (* alignment in bytes, fill byte *)
   | Label of string
 
@@ -302,7 +302,9 @@ let statement st (l : line) =
       let i = { i with operands = List.map (substitute_operand st) i.operands } in
       (match Encode.instruction i with
        | Encode.Fixed (bytes, fixups) -> add_chunk st (Bytes (bytes, fixups, st.line))
-       | Encode.Branch { short; long; target } -> add_chunk st (Branch { short; long; target; is_long = false; bline = st.line })
+       | Encode.Relaxable { short; long } ->
+           let target = match short.Fixup.ffixups with f :: _ -> f.Fixup.target | [] -> assert false in
+           add_chunk st (Branch { short; long; target; is_long = false; bline = st.line })
        | exception Encode.Bad msg -> error st "%s" msg)
 
 (* ---- Expression evaluation after layout ------------------------------------ *)
@@ -391,7 +393,7 @@ let align_up n a = (n + a - 1) / a * a
 
 let chunk_size off = function
   | Bytes (s, _, _) -> String.length s
-  | Branch b -> if b.is_long then String.length b.long + 4 else String.length b.short + 1
+  | Branch b -> String.length (if b.is_long then b.long.Fixup.fbytes else b.short.Fixup.fbytes)
   | Align (n, _) -> align_up off n - off
   | Label _ -> 0
 
@@ -422,8 +424,9 @@ let layout st (sec : section) =
               | _ -> None in
             (match local with
              | Some target ->
-                 let disp = Int64.add (Int64.of_int (target - (sec.offsets.(i) + String.length b.short + 1))) v.addend in
-                 if not (Encode.fits_int8 disp) then begin b.is_long <- true; changed := true end
+                 let f = match b.short.Fixup.ffixups with f :: _ -> f | [] -> assert false in
+                 let disp = Int64.add (Int64.of_int (target - (sec.offsets.(i) + f.Fixup.pcbase))) v.addend in
+                 if not (Fixup.fits_signed b.short.Fixup.fbits disp) then begin b.is_long <- true; changed := true end
              | None -> b.is_long <- true; changed := true)
         | _ -> ()) sec.arr
   done
@@ -613,15 +616,13 @@ let section_body st (sec : section) =
           Buffer.add_bytes body bytes
       | Branch b ->
           st.line <- b.bline;
-          let opcode = if b.is_long then b.long else b.short in
-          let size = if b.is_long then 4 else 1 in
-          let at = String.length opcode in
-          let bytes = Bytes.make (at + size) '\000' in
-          Bytes.blit_string opcode 0 bytes 0 at;
-          let f = Fixup.make ~at ~size ~pcrel:true ~pcbase:(at + size) ~signed:true ~branch:true b.target in
-          (match resolve st sec ~pos:(off + at) ~base:(off + at + size) ~rex:false ~relaxed:true f with
-           | Value v -> check_fits st size true v; patch bytes at size v
-           | Reloc (t, target, addend) -> relocs := (off + at, t, target, addend) :: !relocs);
+          let form = if b.is_long then b.long else b.short in
+          let bytes = Bytes.of_string form.Fixup.fbytes in
+          List.iter (fun (f : Fixup.t) ->
+              match resolve st sec ~pos:(off + f.at) ~base:(off + f.pcbase) ~rex:false ~relaxed:true f with
+              | Value v -> check_fits st f.size f.signed v; patch bytes f.at f.size v
+              | Reloc (t, target, addend) -> relocs := (off + f.at, t, target, addend) :: !relocs)
+            form.Fixup.ffixups;
           Buffer.add_bytes body bytes) sec.arr;
   Buffer.contents body, List.rev !relocs
 

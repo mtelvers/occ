@@ -39,3 +39,15 @@ type t = {
 let make ?(pcrel = false) ?(pcbase = 0) ?(signed = false) ?(relaxable = false)
     ?(branch = false) ?(field = Whole) ~at ~size target =
   { at; size; target; pcrel; pcbase; signed; relaxable; branch; field }
+
+(* One encoding of a branch the assembler may have to lengthen: its
+   bytes, the fixups in them, and how many bits of signed displacement it
+   can reach.  A branch to a nearby label is written in the short form
+   and, when layout shows the target is out of reach, in the long one --
+   x86-64's pair is a one-byte displacement and a four-byte one, RISC-V's
+   a conditional branch and an inverted branch around a jump. *)
+type form = { fbytes : string; ffixups : t list; fbits : int }
+
+let fits_signed bits v =
+  bits >= 64 || (let half = Int64.shift_left 1L (bits - 1) in
+                 Int64.compare v (Int64.neg half) >= 0 && Int64.compare v half < 0)

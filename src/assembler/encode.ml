@@ -22,7 +22,7 @@ type fixup = Fixup.t
    picks after layout ("branch relaxation"). *)
 type encoded =
   | Fixed of string * fixup list
-  | Branch of { short : string; long : string; target : expr }
+  | Relaxable of { short : Fixup.form; long : Fixup.form }
 
 exception Bad of string
 let bad fmt = Printf.ksprintf (fun s -> raise (Bad s)) fmt
@@ -406,14 +406,27 @@ let call op =
       let e = target_of op in
       Fixed ("\xE8\000\000\000\000", [ Fixup.make ~at:1 ~size:4 ~pcrel:true ~pcbase:5 ~signed:true ~branch:true e ])
 
+(* The two forms of a jump to a label: an opcode and a signed
+   displacement, one byte of it or four, each measured from the end of
+   the instruction. *)
+let relaxable_branch short long target =
+  let form opcode size =
+    let at = String.length opcode in
+    { Fixup.fbytes = opcode ^ String.make size '\000';
+      ffixups = [ Fixup.make ~at ~size ~pcrel:true ~pcbase:(at + size) ~signed:true ~branch:true target ];
+      fbits = size * 8 } in
+  Relaxable { short = form short 1; long = form long 4 }
+
 let jmp op =
   match op with
   | Indirect target ->
       let rm, seg, _ = rm_of S64 target in
       build { default with legacy = seg; reg = 4; rm = Some rm; opcode = [ 0xFF ]; relaxable = true }
-  | _ -> Branch { short = "\xEB"; long = "\xE9"; target = target_of op }
+  | _ -> relaxable_branch "\xEB" "\xE9" (target_of op)
 
-let jcc cc op = Branch { short = String.make 1 (Char.chr (0x70 + cc)); long = "\x0F" ^ String.make 1 (Char.chr (0x80 + cc)); target = target_of op }
+let jcc cc op =
+  relaxable_branch (String.make 1 (Char.chr (0x70 + cc)))
+    ("\x0F" ^ String.make 1 (Char.chr (0x80 + cc))) (target_of op)
 
 let xchg size a b =
   match a, b with
@@ -445,7 +458,7 @@ let sse ?(imm = "") prefix opcode ~w ~reg rm_op =
   let rm, seg, _ = rm_of S64 rm_op in
   match build { default with legacy = seg @ prefix; w; reg; rm = Some rm; opcode = 0x0F :: opcode } with
   | Fixed (s, f) -> Fixed (s ^ imm, f)
-  | Branch _ -> assert false
+  | Relaxable _ -> assert false
 
 (* xmm <- xmm/mem *)
 let sse_load prefix opcode src dst = sse prefix [ opcode ] ~w:false ~reg:(xmm dst).rnum src
@@ -520,7 +533,7 @@ let rec x87 mnemonic operands =
   | ("fstcw" | "fstsw" | "fclex" | "finit"), _ ->
       (* the waiting forms: fwait then the no-wait instruction *)
       let m = "fn" ^ String.sub mnemonic 1 (String.length mnemonic - 1) in
-      (match x87 m operands with Fixed (b, f) -> Fixed ("\x9B" ^ b, f) | Branch _ -> assert false)
+      (match x87 m operands with Fixed (b, f) -> Fixed ("\x9B" ^ b, f) | Relaxable _ -> assert false)
   | "stmxcsr", [ (Mem _ as m) ] -> let rm, seg, _ = rm_of S64 m in build { default with legacy = seg; reg = 3; rm = Some rm; opcode = [ 0x0F; 0xAE ] }
   | "ldmxcsr", [ (Mem _ as m) ] -> let rm, seg, _ = rm_of S64 m in build { default with legacy = seg; reg = 2; rm = Some rm; opcode = [ 0x0F; 0xAE ] }
   | _, ([ Reg { rclass = X87; rnum = i; _ } ] | [ Reg { rclass = X87; rnum = i; _ }; Reg { rclass = X87; rnum = 0; _ } ])
@@ -654,7 +667,7 @@ let rec encode mnemonic operands =
       let rm, _, _ = rm_of S64 d in
       (match build { default with legacy = [ 0x66 ]; reg = ext; rm = Some rm; opcode = [ 0x0F; opcode ] } with
        | Fixed (b, f) -> Fixed (b ^ imm8 i, f)
-       | Branch _ -> assert false)
+       | Relaxable _ -> assert false)
   | "pcmpeqb", [ s; d ] -> sse_load [ 0x66 ] 0x74 s d
   | "pmovmskb", [ s; d ] -> sse [ 0x66 ] [ 0xD7 ] ~w:false ~reg:(gpr d).rnum s
   | "movmskpd", [ s; d ] -> sse [ 0x66 ] [ 0x50 ] ~w:false ~reg:(gpr d).rnum s
@@ -738,4 +751,4 @@ let instruction (i : instruction) =
   | Fixed (s, fixups) ->
       let k = String.length prefix in
       Fixed (prefix ^ s, List.map (fun (f : Fixup.t) -> { f with Fixup.at = f.at + k; pcbase = f.pcbase + k }) fixups)
-  | Branch _ as b -> if prefix = "" then b else bad "prefix on a branch"
+  | Relaxable _ as b -> if prefix = "" then b else bad "prefix on a branch"
