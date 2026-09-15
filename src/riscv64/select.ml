@@ -355,7 +355,8 @@ let compare_wide st (c : Ir.cond) a b (dst : reg) =
    | _ -> ())
 
 let compare_float st (c : Ir.cond) ty a b (dst : reg) =
-  if ty = Ir.F80 then compare_wide st c a b dst else
+  if ty = Ir.F80 then compare_wide st c a b dst
+  else begin
   load_float st ty a (FT 0);
   load_float st ty b (FT 1);
   let s = if ty = Ir.F32 then ".s" else ".d" in
@@ -367,6 +368,7 @@ let compare_float st (c : Ir.cond) ty a b (dst : reg) =
   | Ir.Fgt -> op st ("flt" ^ s) [ Reg dst; Reg (FT 1); Reg (FT 0) ]
   | Ir.Fge -> op st ("fle" ^ s) [ Reg dst; Reg (FT 1); Reg (FT 0) ]
   | _ -> failwith "Riscv64.Select: an integer comparison came to the floating-point path"
+  end
 
 (* ---- conversions ---------------------------------------------------- *)
 
