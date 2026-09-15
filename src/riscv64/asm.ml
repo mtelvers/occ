@@ -40,7 +40,53 @@ type instr =
   | Op of string * operand list (* a mnemonic and its operands, source last *)
   | Label of string
   | Directive of string * string list
+  | Raw of string (* an exact line the assembler must see, for inline assembly *)
+  | Loc of int * int (* .loc N line, for the line table *)
 
-type func = { name : string; body : instr list }
+(* The data side is ELF's rather than the machine's, so it is shaped as
+   on the other machine: a named object with its binding, its section
+   and its contents.  Only the spelling differs, and [Emit] owns that --
+   notably [.align], which on this machine counts powers of two. *)
 
-type program = { funcs : func list; data : instr list }
+type section = Data | Bss | Rodata | Tdata | Tbss
+
+type data_item =
+  | Bytes of string
+  | Zeros of int
+  | Quad_sym of string * int64 (* a symbol plus an addend, eight bytes *)
+  | Quad of int64
+  | Long of int32
+
+type data = {
+  dname : string;
+  dglobal : bool;
+  dweak : bool;
+  dhidden : bool;
+  dalias : string option; (* this symbol is defined equal to that one *)
+  dfunc : bool; (* the symbol has function type *)
+  ddecl : bool; (* only the binding: no storage is defined *)
+  dtls : bool;
+  dalign : int; (* in bytes; [Emit] turns it into the power of two *)
+  section : section;
+  size : int;
+  items : data_item list;
+}
+
+type func = {
+  name : string;
+  global : bool;
+  weak : bool;
+  hidden : bool;
+  body : instr list;
+  debug : bool; (* the function has line information, so it needs its range labelled *)
+}
+
+type program = {
+  funcs : func list;
+  data : data list;
+  source : string option; (* Some when emitting debug information *)
+  files : (int * string) list; (* the .file table for line information *)
+  asm_blocks : string list; (* file-scope asm, emitted as written *)
+  init_array : (int * string) list; (* constructors: priority, function *)
+  fini_array : (int * string) list;
+}

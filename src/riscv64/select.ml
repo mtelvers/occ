@@ -41,7 +41,6 @@ type st = {
   mutable regs : (int, int) Hashtbl.t; (* Ir register -> offset from s0 *)
   mutable slots : int array;          (* Ir slot -> offset from s0 *)
   mutable frame : int;                (* bytes below s0 given out so far *)
-  mutable outgoing : int;             (* bytes above sp for arguments that do not fit in registers *)
   mutable fname : string;
   mutable label_count : int;
   mutable float_consts : ((int64 * bool) * string) list;  (* bits and whether four bytes *)
@@ -55,6 +54,11 @@ type st = {
      frame, and the return address and frame pointer go below it. *)
   mutable va_bytes : int;             (* size of that area, 0 if not variadic *)
   mutable named_int : int;            (* integer registers the named parameters took *)
+  tls : (string, unit) Hashtbl.t;     (* thread-local symbols, defined or declared *)
+  mutable moved_sp : bool;            (* the function moved sp itself, for a variable length array *)
+  mutable consts : data list;         (* the read-only constants the functions needed *)
+  mutable files : (string, int) Hashtbl.t;  (* source file -> its number in the .file table *)
+  mutable next_file : int;
 }
 
 let emit st i = st.code <- i :: st.code
@@ -135,9 +139,29 @@ let float_const st (ty : Ir.ty) (v : float) =
 (* The address of a symbol.  Without position independence that is the
    twenty-high/twelve-low pair the machine is built around; with it, a
    load from the global offset table, which the assembler spells for us
-   as one pseudo-instruction. *)
+   as one pseudo-instruction.
+
+   A thread-local symbol is an offset from the thread pointer, tp, and
+   the two forms are the same two choices the other machine makes.
+   Without position independence the offset is known at link time and
+   the sequence is the twenty-high/twelve-low pair again, with the
+   relocations that name a thread-local offset -- the `add' carrying a
+   third operand that exists only to tell the linker which symbol the
+   pair belongs to, which is how this machine spells it.  With position
+   independence the offset is read from the global offset table, which
+   is initial-exec, the model that needs no call into the dynamic
+   loader; `la.tls.ie' is the assembler's name for that load. *)
 let load_sym st sym (dst : reg) =
-  if st.pic then op st "la" [ Reg dst; Sym (sym, 0) ]
+  if Hashtbl.mem st.tls sym then
+    if st.pic then begin
+      op st "la.tls.ie" [ Reg dst; Sym (sym, 0) ];
+      op st "add" [ Reg dst; Reg dst; Reg TP ]
+    end else begin
+      op st "lui" [ Reg dst; Sym ("%tprel_hi(" ^ sym ^ ")", 0) ];
+      op st "add" [ Reg dst; Reg dst; Reg TP; Sym ("%tprel_add(" ^ sym ^ ")", 0) ];
+      op st "addi" [ Reg dst; Reg dst; Sym ("%tprel_lo(" ^ sym ^ ")", 0) ]
+    end
+  else if st.pic then op st "la" [ Reg dst; Sym (sym, 0) ]
   else begin
     op st "lui" [ Reg dst; Sym ("%hi(" ^ sym ^ ")", 0) ];
     op st "addi" [ Reg dst; Reg dst; Sym ("%lo(" ^ sym ^ ")", 0) ]
@@ -523,7 +547,10 @@ let assign_args ?(named = None) ~hidden (args : Ir.arg list) =
 let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) named =
   let hidden = match res with Some (Ir.Ret_aggregate a) -> a.passing = Ir.In_memory | _ -> false in
   let places, _, _, stack_bytes = assign_args ~named ~hidden args in
-  if stack_bytes > st.outgoing then st.outgoing <- round_up stack_bytes 16;
+  (* room for the arguments that did not fit in registers, kept to the
+     sixteen-byte alignment the ABI asks of sp at a call *)
+  let area = round_up stack_bytes 16 in
+  if area > 0 then op st "addi" [ Reg SP; Reg SP; Imm (Int64.of_int (- area)) ];
   (* the arguments, into their registers or onto the stack *)
   List.iter2 (fun (a : Ir.arg) ps ->
       match a, ps with
@@ -586,8 +613,9 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
      | _ -> ());
   (* the call itself *)
   (match callee with
-   | Ir.Sym s -> op st (if st.pic then "call" else "call") [ Sym ((if st.pic then s ^ "@plt" else s), 0) ]
+   | Ir.Sym s -> op st "call" [ Sym ((if st.pic then s ^ "@plt" else s), 0) ]
    | o -> load_int st Ir.I64 o (T 2); op st "jalr" [ Reg (T 2) ]);
+  if area > 0 then op st "addi" [ Reg SP; Reg SP; Imm (Int64.of_int area) ];
   (* and its result *)
   match res with
   | None -> ()
@@ -854,7 +882,16 @@ let instr st (i : Ir.instr) =
            done);
       op st "addi" [ Reg (T 3); Reg (T 3); Imm (Int64.of_int (8 * words)) ];
       op st "sd" [ Reg (T 3); Mem (T 2, 0) ]
-  | Ir.Alloca _ -> not_yet "a variable length array"
+  | Ir.Alloca (r, size) ->
+      (* fresh stack below sp, kept to the ABI's sixteen bytes.  Nothing
+         gives it back before the function returns, which the epilogue
+         then does by restoring sp from the frame pointer. *)
+      st.moved_sp <- true;
+      load_int st Ir.I64 size (T 0);
+      op st "addi" [ Reg (T 0); Reg (T 0); Imm 15L ];
+      op st "andi" [ Reg (T 0); Reg (T 0); Imm (-16L) ];
+      op st "sub" [ Reg SP; Reg SP; Reg (T 0) ];
+      store st Ir.I64 r SP
   | Ir.Inline_asm _ -> not_yet "inline assembly"
 
 (* ---- a function ----------------------------------------------------- *)
@@ -871,7 +908,7 @@ let instr st (i : Ir.instr) =
    are the only registers that have to be saved. *)
 let func st (f : Ir.func) : func =
   st.code <- []; st.regs <- Hashtbl.create 64; st.wide <- Hashtbl.create 8;
-  st.frame <- saved_bytes; st.outgoing <- 0;
+  st.frame <- saved_bytes; st.moved_sp <- false;
   st.fname <- f.name; st.label_count <- 0; st.hidden_ptr <- 0;
   let hidden = match f.returns_aggregate with Some (_, p) -> p = Ir.In_memory | None -> false in
   (* the parameters arrive where a caller would have put them *)
@@ -943,78 +980,84 @@ let func st (f : Ir.func) : func =
   List.iter (instr st) f.body;
   let body = List.rev st.code in
   st.code <- saved;
-  (* the frame: locals, the two saved registers, and room for outgoing
-     arguments, rounded to the sixteen the ABI asks of sp *)
-  let size = round_up (st.frame + st.outgoing) 16 in
+  (* the frame: the locals and the two saved registers, rounded to the
+     sixteen the ABI asks of sp.  Arguments that do not fit in registers
+     are not here: each call makes room for its own just below sp, as
+     the other machine does, so that a variable length array may move sp
+     without disturbing them. *)
+  let size = round_up st.frame 16 in
   let prologue =
-    [ Directive ("text", []) ]
-    @ (if f.global then [ Directive ("globl", [ f.name ]) ] else [])
-    @ [ Directive ("type", [ f.name; "@function" ]); Label f.name;
-        Op ("addi", [ Reg SP; Reg SP; Imm (Int64.of_int (- size)) ]);
-        Op ("sd", [ Reg RA; Mem (SP, size + ra_offset st) ]);
-        Op ("sd", [ Reg (S 0); Mem (SP, size + fp_offset st) ]);
-        Op ("addi", [ Reg (S 0); Reg SP; Imm (Int64.of_int size) ]) ] in
+    [ Op ("addi", [ Reg SP; Reg SP; Imm (Int64.of_int (- size)) ]);
+      Op ("sd", [ Reg RA; Mem (SP, size + ra_offset st) ]);
+      Op ("sd", [ Reg (S 0); Mem (SP, size + fp_offset st) ]);
+      Op ("addi", [ Reg (S 0); Reg SP; Imm (Int64.of_int size) ]) ] in
   let epilogue =
-    [ Label (".Lreturn." ^ f.name);
-      Op ("ld", [ Reg RA; Mem (SP, size + ra_offset st) ]);
-      Op ("ld", [ Reg (S 0); Mem (SP, size + fp_offset st) ]);
-      Op ("addi", [ Reg SP; Reg SP; Imm (Int64.of_int size) ]);
-      Op ("ret", []) ]
-    @ (if f.global then [ Directive ("size", [ f.name; ".-" ^ f.name ]) ] else []) in
-  (* the floating-point constants this function needed *)
-  let consts =
-    List.concat_map (fun ((bits, narrow), l) ->
-        [ Directive ("section", [ ".rodata" ]);
-          Directive ("align", [ if narrow then "2" else "3" ]);
-          Label l;
-          Directive ((if narrow then "word" else "quad"), [ Int64.to_string bits ]) ])
-      st.float_consts in
-  st.float_consts <- [];
-  let wide_consts =
-    List.concat_map (fun ((lo, hi), l) ->
-        [ Directive ("section", [ ".rodata" ]); Directive ("align", [ "4" ]); Label l;
-          Directive ("quad", [ Int64.to_string lo ]); Directive ("quad", [ Int64.to_string hi ]) ])
-      st.wide_consts in
-  st.wide_consts <- [];
-  { name = f.name; body = prologue @ body @ epilogue @ consts @ wide_consts }
+    [ Label (".Lreturn." ^ f.name) ]
+    (* A function that moved sp itself -- one with a variable length
+       array -- cannot undo that by adding the frame's size back, so the
+       stack pointer comes from the frame pointer, which is what a frame
+       pointer is for.  gcc here writes the same `addi sp,s0,-size'. *)
+    @ (if st.moved_sp then [ Op ("addi", [ Reg SP; Reg (S 0); Imm (Int64.of_int (- size)) ]) ] else [])
+    @ [ Op ("ld", [ Reg RA; Mem (SP, size + ra_offset st) ]);
+        Op ("ld", [ Reg (S 0); Mem (SP, size + fp_offset st) ]);
+        Op ("addi", [ Reg SP; Reg SP; Imm (Int64.of_int size) ]);
+        Op ("ret", []) ] in
+  (* the constants this function needed, as read-only objects *)
+  let const name align size items =
+    { dname = name; dglobal = false; dweak = false; dhidden = false; dalias = None;
+      dfunc = false; ddecl = false; dtls = false; dalign = align; section = Rodata; size; items } in
+  st.consts <-
+    List.map (fun ((bits, narrow), l) ->
+        if narrow then const l 4 4 [ Long (Int64.to_int32 bits) ] else const l 8 8 [ Quad bits ])
+      st.float_consts
+    @ List.map (fun ((lo, hi), l) -> const l 16 16 [ Quad lo; Quad hi ]) st.wide_consts
+    @ st.consts;
+  st.float_consts <- []; st.wide_consts <- [];
+  { name = f.name; global = f.global; weak = f.flink.weak; hidden = f.flink.hidden;
+    body = prologue @ body @ epilogue; debug = false }
 
 (* ---- data ----------------------------------------------------------- *)
 
-let data_of_global (g : Ir.global) : instr list =
-  if not g.gdefined then []
+let data_of_global (g : Ir.global) : data option =
+  if not g.gdefined then
+    (* an undefined reference declared weak or hidden: emit just the
+       binding, so the assembler records it *)
+    (if g.glink.weak || g.glink.hidden then
+       Some { dname = g.gname; dglobal = false; dweak = g.glink.weak; dhidden = g.glink.hidden;
+              dalias = None; dfunc = false; ddecl = true; dtls = false; dalign = 1;
+              section = Data; size = 0; items = [] }
+     else None)
+  else if g.glink.alias <> None then
+    (* an alias defines no storage; it is a .set to its target *)
+    Some { dname = g.gname; dglobal = g.gglobal; dweak = g.glink.weak; dhidden = g.glink.hidden;
+           dalias = g.glink.alias; dfunc = g.gfunc; ddecl = false; dtls = g.gtls; dalign = 1;
+           section = Data; size = 0; items = [] }
   else
-    let align = [ Directive ("align", [ string_of_int (max 0 (int_of_float (log (float_of_int (max 1 g.galign)) /. log 2.))) ]) ] in
-    let head =
-      (if g.gglobal then [ Directive ("globl", [ g.gname ]) ] else [])
-      @ [ Directive ("type", [ g.gname; if g.gfunc then "@function" else "@object" ]) ] in
-    match g.ginit with
-    | None ->
-        [ Directive ("bss", []) ] @ head @ align
-        @ [ Label g.gname; Directive ("zero", [ string_of_int (max 1 g.gsize) ]) ]
-    | Some items ->
-        let body =
-          List.concat_map (function
-              | Ir.Bytes s ->
-                  [ Directive ("ascii", [ "\"" ^ String.concat ""
-                        (List.map (fun c ->
-                             let c = Char.code c in
-                             if c = 34 then "\\\"" else if c = 92 then "\\\\"
-                             else if c >= 32 && c < 127 then String.make 1 (Char.chr c)
-                             else Printf.sprintf "\\%03o" c)
-                           (List.init (String.length s) (String.get s))) ^ "\"" ]) ]
-              | Ir.Zeros n -> [ Directive ("zero", [ string_of_int n ]) ]
-              | Ir.Addr (s, 0L) -> [ Directive ("quad", [ s ]) ]
-              | Ir.Addr (s, n) -> [ Directive ("quad", [ Printf.sprintf "%s+%Ld" s n ]) ])
-            items in
-        [ Directive ("data", []) ] @ head @ align @ [ Label g.gname ] @ body
+    let items = match g.ginit with
+      | None -> [ Zeros (max g.gsize 1) ]
+      | Some ds ->
+          List.map (function
+              | Ir.Bytes s -> Bytes s | Ir.Zeros n -> Zeros n | Ir.Addr (s, o) -> Quad_sym (s, o)) ds in
+    let zero = g.ginit = None || List.for_all (function Zeros _ -> true | _ -> false) items in
+    let section = match g.gtls, zero with
+      | true, true -> Tbss | true, false -> Tdata | false, true -> Bss | false, false -> Data in
+    Some { dname = g.gname; dglobal = g.gglobal; dweak = g.glink.weak; dhidden = g.glink.hidden;
+           dalias = None; dfunc = false; ddecl = false; dtls = g.gtls; dalign = g.galign;
+           section; size = max g.gsize 1; items }
 
 (* ---- a program ------------------------------------------------------ *)
 
 let program ~pic ~debug (p : Ir.program) : program =
-  let st = { pic; debug; code = []; regs = Hashtbl.create 64; slots = [||]; frame = 0;
-             outgoing = 0; fname = ""; label_count = 0; float_consts = []; const_count = 0;
-             hidden_ptr = 0; va_bytes = 0; named_int = 0;
-             wide = Hashtbl.create 8; wide_consts = [] } in
-  let funcs = List.map (fun f -> func st f) (List.filter (fun (f : Ir.func) -> not f.discardable || true) p.funcs) in
-  let data = List.concat_map data_of_global p.globals in
-  { funcs; data }
+  let tls = Hashtbl.create 16 in
+  List.iter (fun (g : Ir.global) -> if g.gtls then Hashtbl.replace tls g.gname ()) p.globals;
+  let st = { pic; debug; tls; code = []; regs = Hashtbl.create 64; slots = [||]; frame = 0;
+             fname = ""; label_count = 0; float_consts = []; const_count = 0;
+             hidden_ptr = 0; va_bytes = 0; named_int = 0; moved_sp = false;
+             wide = Hashtbl.create 8; wide_consts = []; consts = [];
+             files = Hashtbl.create 8; next_file = 1 } in
+  let funcs = List.map (fun f -> func st f) p.funcs in
+  let data = List.filter_map data_of_global p.globals in
+  let files = List.sort compare (Hashtbl.fold (fun name n acc -> (n, name) :: acc) st.files []) in
+  { funcs; data = data @ List.rev st.consts;
+    source = (if debug then Some p.source else None); files;
+    asm_blocks = p.asm_blocks; init_array = p.init_array; fini_array = p.fini_array }
