@@ -55,7 +55,6 @@ type st = {
   mutable va_bytes : int;             (* size of that area, 0 if not variadic *)
   mutable named_int : int;            (* integer registers the named parameters took *)
   tls : (string, unit) Hashtbl.t;     (* thread-local symbols, defined or declared *)
-  mutable moved_sp : bool;            (* the function moved sp itself, for a variable length array *)
   mutable consts : data list;         (* the read-only constants the functions needed *)
   mutable files : (string, int) Hashtbl.t;  (* source file -> its number in the .file table *)
   mutable next_file : int;
@@ -191,24 +190,36 @@ let narrow (ty : Ir.ty) (v : int64) =
     if bits >= 64 then v
     else Int64.shift_right (Int64.shift_left v (64 - bits)) (64 - bits)
 
+(* The address of a place in the frame, in a register, whatever the
+   offset: past twelve bits it has to be built rather than added. *)
+let frame_addr st off (dst : reg) =
+  if fits12 off then op st "addi" [ Reg dst; Reg (S 0); Imm (Int64.of_int off) ]
+  else begin
+    op st "li" [ Reg dst; Imm (Int64.of_int off) ];
+    op st "add" [ Reg dst; Reg (S 0); Reg dst ]
+  end
+
+(* The stack pointer moved by a constant, which past twelve bits takes a
+   register to say. *)
+let sp_adjust st n =
+  if fits12 n then op st "addi" [ Reg SP; Reg SP; Imm (Int64.of_int n) ]
+  else begin
+    op st "li" [ Reg (T 0); Imm (Int64.of_int n) ];
+    op st "add" [ Reg SP; Reg SP; Reg (T 0) ]
+  end
+
 (* An operand into a named integer register. *)
 let rec load_int st (ty : Ir.ty) (o : Ir.operand) (dst : reg) =
   match o with
   | Ir.Imm v -> op st "li" [ Reg dst; Imm (narrow ty v) ]
   | Ir.Reg r -> op st (load_mnemonic ty true) [ Reg dst; addr st (S 0) (reg_slot st r) dst ]
-  | Ir.Slot k -> op st "addi" [ Reg dst; Reg (S 0); Imm (Int64.of_int st.slots.(k)) ]
+  | Ir.Slot k -> frame_addr st st.slots.(k) dst
   | Ir.Sym s -> load_sym st s dst
   | Ir.Fimm f -> load_int st ty (Ir.Imm (Int64.bits_of_float f)) dst
 
 let load_addr st o dst =
   match o with
-  | Ir.Slot k ->
-      let off = st.slots.(k) in
-      if fits12 off then op st "addi" [ Reg dst; Reg (S 0); Imm (Int64.of_int off) ]
-      else begin
-        op st "li" [ Reg dst; Imm (Int64.of_int off) ];
-        op st "add" [ Reg dst; Reg (S 0); Reg dst ]
-      end
+  | Ir.Slot k -> frame_addr st st.slots.(k) dst
   | _ -> load_int st Ir.I64 o dst
 
 let load_float st (ty : Ir.ty) (o : Ir.operand) (dst : reg) =
@@ -573,6 +584,54 @@ let conv st (c : Ir.conv) (r : int) (o : Ir.operand) =
       end
   | Ir.Fconv (_, _) -> failwith "Riscv64.Select: a conversion between two long doubles"
 
+(* ---- block moves ---------------------------------------------------- *)
+
+(* A copy, and a clear, between addresses already in registers.  A small
+   one is written out a byte at a time; a large one is a loop, because
+   the unrolled form of a four-kilobyte structure would be thousands of
+   instructions and its offsets would leave twelve bits far behind --
+   which is how a real program found this.  The loop advances the
+   pointers it was given, so nothing may rely on them afterwards.
+
+   A byte at a time either way: the addresses have no alignment this can
+   count on, and correctness is the point. *)
+let unroll_limit = 16
+
+let copy_bytes st (dst : reg) (src : reg) n =
+  if n <= unroll_limit then
+    for k = 0 to n - 1 do
+      op st "lbu" [ Reg (T 0); Mem (src, k) ];
+      op st "sb" [ Reg (T 0); Mem (dst, k) ]
+    done
+  else begin
+    let again = fresh_label st "copy" and out = fresh_label st "copied" in
+    op st "li" [ Reg (T 5); Imm (Int64.of_int n) ];
+    emit st (Label again);
+    op st "beqz" [ Reg (T 5); Sym (out, 0) ];
+    op st "lbu" [ Reg (T 0); Mem (src, 0) ];
+    op st "sb" [ Reg (T 0); Mem (dst, 0) ];
+    op st "addi" [ Reg src; Reg src; Imm 1L ];
+    op st "addi" [ Reg dst; Reg dst; Imm 1L ];
+    op st "addi" [ Reg (T 5); Reg (T 5); Imm (-1L) ];
+    op st "j" [ Sym (again, 0) ];
+    emit st (Label out)
+  end
+
+let zero_bytes st (dst : reg) n =
+  if n <= unroll_limit then
+    for k = 0 to n - 1 do op st "sb" [ Reg Zero; Mem (dst, k) ] done
+  else begin
+    let again = fresh_label st "zero" and out = fresh_label st "zeroed" in
+    op st "li" [ Reg (T 5); Imm (Int64.of_int n) ];
+    emit st (Label again);
+    op st "beqz" [ Reg (T 5); Sym (out, 0) ];
+    op st "sb" [ Reg Zero; Mem (dst, 0) ];
+    op st "addi" [ Reg dst; Reg dst; Imm 1L ];
+    op st "addi" [ Reg (T 5); Reg (T 5); Imm (-1L) ];
+    op st "j" [ Sym (again, 0) ];
+    emit st (Label out)
+  end
+
 (* ---- calls ---------------------------------------------------------- *)
 
 (* Where each argument goes.  Integers and pointers take a0..a7,
@@ -648,7 +707,7 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
   (* room for the arguments that did not fit in registers, kept to the
      sixteen-byte alignment the ABI asks of sp at a call *)
   let area = round_up stack_bytes 16 in
-  if area > 0 then op st "addi" [ Reg SP; Reg SP; Imm (Int64.of_int (- area)) ];
+  if area > 0 then sp_adjust st (- area);
   (* the arguments, into their registers or onto the stack *)
   List.iter2 (fun (a : Ir.arg) ps ->
       match a, ps with
@@ -674,20 +733,15 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
       | Ir.Aggregate a, [ In_int i ] when a.passing = Ir.In_memory ->
           let tmp = alloc st a.size 8 in
           load_addr st a.addr (T 4);
-          op st "addi" [ Reg (T 3); Reg (S 0); Imm (Int64.of_int tmp) ];
-          for k = 0 to a.size - 1 do
-            op st "lbu" [ Reg (T 0); Mem (T 4, k) ];
-            op st "sb" [ Reg (T 0); Mem (T 3, k) ]
-          done;
-          op st "addi" [ Reg (A i); Reg (S 0); Imm (Int64.of_int tmp) ]
+          frame_addr st tmp (T 3);
+          copy_bytes st (T 3) (T 4) a.size;
+          frame_addr st tmp (A i)
       | Ir.Aggregate a, [ On_stack off ] when a.passing = Ir.In_memory ->
           let tmp = alloc st a.size 8 in
           load_addr st a.addr (T 4);
-          op st "addi" [ Reg (T 3); Reg (S 0); Imm (Int64.of_int tmp) ];
-          for k = 0 to a.size - 1 do
-            op st "lbu" [ Reg (T 0); Mem (T 4, k) ];
-            op st "sb" [ Reg (T 0); Mem (T 3, k) ]
-          done;
+          frame_addr st tmp (T 3);
+          copy_bytes st (T 3) (T 4) a.size;
+          frame_addr st tmp (T 3);
           op st "sd" [ Reg (T 3); Mem (SP, off) ]
       | Ir.Aggregate a, ps ->
           (* the pieces, read from the object a piece at a time *)
@@ -713,7 +767,7 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
   (match callee with
    | Ir.Sym s -> op st "call" [ Sym ((if st.pic then s ^ "@plt" else s), 0) ]
    | o -> load_int st Ir.I64 o (T 2); op st "jalr" [ Reg (T 2) ]);
-  if area > 0 then op st "addi" [ Reg SP; Reg SP; Imm (Int64.of_int area) ];
+  if area > 0 then sp_adjust st area;
   (* and its result *)
   match res with
   | None -> ()
@@ -735,18 +789,13 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
 (* ---- one instruction ------------------------------------------------ *)
 
 let memcopy st (dst : Ir.operand) (src : Ir.operand) bytes =
-  (* a byte at a time, which is what a first back end should do: the
-     runtime's copies are small and correctness is the point *)
   load_addr st dst (T 3);
   load_addr st src (T 4);
-  for i = 0 to bytes - 1 do
-    op st "lbu" [ Reg (T 0); Mem (T 4, i) ];
-    op st "sb" [ Reg (T 0); Mem (T 3, i) ]
-  done
+  copy_bytes st (T 3) (T 4) bytes
 
 let memzero st (dst : Ir.operand) bytes =
   load_addr st dst (T 3);
-  for i = 0 to bytes - 1 do op st "sb" [ Reg Zero; Mem (T 3, i) ] done
+  zero_bytes st (T 3) bytes
 
 (* ---- an atomic narrower than a word --------------------------------- *)
 
@@ -1000,12 +1049,10 @@ let instr st (i : Ir.instr) =
            (* the caller gave us where to put it, and we saved that *)
            op st "ld" [ Reg (T 3); addr st (S 0) st.hidden_ptr (T 2) ];
            load_addr st a.addr (T 4);
-           let n = a.size in
-           for k = 0 to n - 1 do
-             op st "lbu" [ Reg (T 0); Mem (T 4, k) ];
-             op st "sb" [ Reg (T 0); Mem (T 3, k) ]
-           done;
-           op st "mv" [ Reg (A 0); Reg (T 3) ]
+           copy_bytes st (T 3) (T 4) a.size;
+           (* the copy advanced t3, so the address is read again: a
+              function returning an aggregate in memory answers with it *)
+           op st "ld" [ Reg (A 0); addr st (S 0) st.hidden_ptr (T 2) ]
        | Ir.In_registers pieces ->
            load_addr st a.addr (T 2);
            let ni = ref 0 and nf = ref 0 in
@@ -1153,23 +1200,19 @@ let instr st (i : Ir.instr) =
        | Ir.In_memory ->
            op st "ld" [ Reg (T 4); Mem (T 3, 0) ];
            load_addr st dst (T 5);
-           for k = 0 to size - 1 do
-             op st "lbu" [ Reg (T 0); Mem (T 4, k) ];
-             op st "sb" [ Reg (T 0); Mem (T 5, k) ]
-           done
+           copy_bytes st (T 5) (T 4) size
        | Ir.In_registers _ ->
            load_addr st dst (T 5);
-           for k = 0 to size - 1 do
-             op st "lbu" [ Reg (T 0); Mem (T 3, k) ];
-             op st "sb" [ Reg (T 0); Mem (T 5, k) ]
-           done);
+           (* the list's own pointer advances by whole words below, so
+              the copy walks a duplicate of it *)
+           op st "mv" [ Reg (T 6); Reg (T 3) ];
+           copy_bytes st (T 5) (T 6) size);
       op st "addi" [ Reg (T 3); Reg (T 3); Imm (Int64.of_int (8 * words)) ];
       op st "sd" [ Reg (T 3); Mem (T 2, 0) ]
   | Ir.Alloca (r, size) ->
       (* fresh stack below sp, kept to the ABI's sixteen bytes.  Nothing
          gives it back before the function returns, which the epilogue
          then does by restoring sp from the frame pointer. *)
-      st.moved_sp <- true;
       load_int st Ir.I64 size (T 0);
       op st "addi" [ Reg (T 0); Reg (T 0); Imm 15L ];
       op st "andi" [ Reg (T 0); Reg (T 0); Imm (-16L) ];
@@ -1191,7 +1234,7 @@ let instr st (i : Ir.instr) =
    are the only registers that have to be saved. *)
 let func st (f : Ir.func) : func =
   st.code <- []; st.regs <- Hashtbl.create 64; st.wide <- Hashtbl.create 8;
-  st.frame <- saved_bytes; st.moved_sp <- false;
+  st.frame <- saved_bytes;
   st.fname <- f.name; st.label_count <- 0; st.hidden_ptr <- 0;
   let hidden = match f.returns_aggregate with Some (_, p) -> p = Ir.In_memory | None -> false in
   (* the parameters arrive where a caller would have put them *)
@@ -1234,18 +1277,12 @@ let func st (f : Ir.func) : func =
           (* what arrived is the address of the caller's copy; the body
              addresses a slot, so the object is copied into it *)
           op st "mv" [ Reg (T 4); Reg (A i) ];
-          op st "addi" [ Reg (T 3); Reg (S 0); Imm (Int64.of_int st.slots.(slot)) ];
-          for k = 0 to size - 1 do
-            op st "lbu" [ Reg (T 0); Mem (T 4, k) ];
-            op st "sb" [ Reg (T 0); Mem (T 3, k) ]
-          done
+          frame_addr st st.slots.(slot) (T 3);
+          copy_bytes st (T 3) (T 4) size
       | Ir.P_aggregate (slot, size, Ir.In_memory), [ On_stack off ] ->
           op st "ld" [ Reg (T 4); Mem (S 0, off) ];
-          op st "addi" [ Reg (T 3); Reg (S 0); Imm (Int64.of_int st.slots.(slot)) ];
-          for k = 0 to size - 1 do
-            op st "lbu" [ Reg (T 0); Mem (T 4, k) ];
-            op st "sb" [ Reg (T 0); Mem (T 3, k) ]
-          done
+          frame_addr st st.slots.(slot) (T 3);
+          copy_bytes st (T 3) (T 4) size
       | Ir.P_aggregate (slot, _, Ir.In_registers pieces), ps ->
           load_addr st (Ir.Slot slot) (T 2);
           List.iter2 (fun (pc : Ir.piece) place ->
@@ -1290,34 +1327,42 @@ let func st (f : Ir.func) : func =
      first sp plus the frame's size and then the frame pointer itself.
      The DWARF numbering is the hardware's, so ra is register 1 and s0
      is register 8. *)
+  (* Both ends are written through t0 rather than with a constant
+     offset, because a frame here is often bigger than the twelve bits
+     an immediate has: every value lives in a slot, so a function of any
+     size has a frame of some thousands of bytes.  One sequence for
+     every size is easier to trust than two, and it costs an
+     instruction.
+
+     The frame pointer is the whole of the epilogue: it is the stack
+     pointer on entry, so restoring sp from it is right whether or not a
+     variable length array moved sp in between.  While the old frame
+     pointer is being reloaded the canonical frame address lives only in
+     t0, which DWARF can say -- t0 is register 5. *)
   let prologue =
     (if st.debug then [ Loc (file_index st f.loc.Loc.file, f.loc.Loc.line) ] else [])
     @ [ Cfi "startproc";
-        Op ("addi", [ Reg SP; Reg SP; Imm (Int64.of_int (- size)) ]);
+        Op ("li", [ Reg (T 0); Imm (Int64.of_int size) ]);
+        Op ("sub", [ Reg SP; Reg SP; Reg (T 0) ]);
         Cfi (Printf.sprintf "def_cfa_offset %d" size);
-        Op ("sd", [ Reg RA; Mem (SP, size + ra_offset st) ]);
-        Op ("sd", [ Reg (S 0); Mem (SP, size + fp_offset st) ]);
+        Op ("add", [ Reg (T 0); Reg SP; Reg (T 0) ]);   (* the stack pointer on entry *)
+        Op ("sd", [ Reg RA; Mem (T 0, ra_offset st) ]);
+        Op ("sd", [ Reg (S 0); Mem (T 0, fp_offset st) ]);
         Cfi (Printf.sprintf "offset 1, %d" (ra_offset st));
         Cfi (Printf.sprintf "offset 8, %d" (fp_offset st));
-        Op ("addi", [ Reg (S 0); Reg SP; Imm (Int64.of_int size) ]);
+        Op ("mv", [ Reg (S 0); Reg (T 0) ]);
         Cfi "def_cfa 8, 0" ] in
   let epilogue =
-    [ Label (".Lreturn." ^ f.name) ]
-    (* A function that moved sp itself -- one with a variable length
-       array -- cannot undo that by adding the frame's size back, so the
-       stack pointer comes from the frame pointer, which is what a frame
-       pointer is for.  gcc here writes the same `addi sp,s0,-size'. *)
-    @ (if st.moved_sp then [ Op ("addi", [ Reg SP; Reg (S 0); Imm (Int64.of_int (- size)) ]) ] else [])
-    @ [ Op ("ld", [ Reg RA; Mem (SP, size + ra_offset st) ]);
-        Op ("ld", [ Reg (S 0); Mem (SP, size + fp_offset st) ]);
-        Cfi "restore 1"; Cfi "restore 8";
-        (* the frame pointer is gone, so the address is said again in
-           terms of the stack pointer *)
-        Cfi (Printf.sprintf "def_cfa 2, %d" size);
-        Op ("addi", [ Reg SP; Reg SP; Imm (Int64.of_int size) ]);
-        Cfi "def_cfa_offset 0";
-        Op ("ret", []);
-        Cfi "endproc" ] in
+    [ Label (".Lreturn." ^ f.name);
+      Op ("mv", [ Reg (T 0); Reg (S 0) ]);
+      Cfi "def_cfa 5, 0";
+      Op ("ld", [ Reg RA; Mem (T 0, ra_offset st) ]);
+      Op ("ld", [ Reg (S 0); Mem (T 0, fp_offset st) ]);
+      Cfi "restore 1"; Cfi "restore 8";
+      Op ("mv", [ Reg SP; Reg (T 0) ]);
+      Cfi "def_cfa 2, 0";
+      Op ("ret", []);
+      Cfi "endproc" ] in
   (* the constants this function needed, as read-only objects *)
   let const name align size items =
     { dname = name; dglobal = false; dweak = false; dhidden = false; dalias = None;
@@ -1368,7 +1413,7 @@ let program ~pic ~debug (p : Ir.program) : program =
   List.iter (fun (g : Ir.global) -> if g.gtls then Hashtbl.replace tls g.gname ()) p.globals;
   let st = { pic; debug; tls; code = []; regs = Hashtbl.create 64; slots = [||]; frame = 0;
              fname = ""; label_count = 0; float_consts = []; const_count = 0;
-             hidden_ptr = 0; va_bytes = 0; named_int = 0; moved_sp = false;
+             hidden_ptr = 0; va_bytes = 0; named_int = 0;
              wide = Hashtbl.create 8; wide_consts = []; consts = [];
              files = Hashtbl.create 8; next_file = 1 } in
   let funcs = List.map (fun f -> func st f) p.funcs in
