@@ -330,10 +330,29 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
       | Ir.Scalar (ty, o), [ On_stack off ] ->
           load st ty o (T 0) (FT 0);
           op st (store_mnemonic ty) [ Reg (if is_float ty then FT 0 else T 0); Mem (SP, off) ]
-      | Ir.Aggregate a, [ In_int i ] when a.passing = Ir.In_memory -> load_addr st a.addr (A i)
+      (* An object too big for two registers is passed by reference, and
+         the reference must be to a copy: the callee may write to its
+         parameter, and writing through to the caller's object would be
+         wrong.  gcc's callee here uses the pointer in place, so the
+         copy has to be made on this side. *)
+      | Ir.Aggregate a, [ In_int i ] when a.passing = Ir.In_memory ->
+          let tmp = alloc st a.size 8 in
+          load_addr st a.addr (T 4);
+          op st "addi" [ Reg (T 3); Reg (S 0); Imm (Int64.of_int tmp) ];
+          for k = 0 to a.size - 1 do
+            op st "lbu" [ Reg (T 0); Mem (T 4, k) ];
+            op st "sb" [ Reg (T 0); Mem (T 3, k) ]
+          done;
+          op st "addi" [ Reg (A i); Reg (S 0); Imm (Int64.of_int tmp) ]
       | Ir.Aggregate a, [ On_stack off ] when a.passing = Ir.In_memory ->
-          load_addr st a.addr (T 0);
-          op st "sd" [ Reg (T 0); Mem (SP, off) ]
+          let tmp = alloc st a.size 8 in
+          load_addr st a.addr (T 4);
+          op st "addi" [ Reg (T 3); Reg (S 0); Imm (Int64.of_int tmp) ];
+          for k = 0 to a.size - 1 do
+            op st "lbu" [ Reg (T 0); Mem (T 4, k) ];
+            op st "sb" [ Reg (T 0); Mem (T 3, k) ]
+          done;
+          op st "sd" [ Reg (T 3); Mem (SP, off) ]
       | Ir.Aggregate a, ps ->
           (* the pieces, read from the object a piece at a time *)
           let pieces = match a.passing with Ir.In_registers l -> l | Ir.In_memory -> [] in
@@ -521,9 +540,22 @@ let func st (f : Ir.func) : func =
           (* above s0: the caller's outgoing area *)
           op st (load_mnemonic ty true) [ Reg (if is_float ty then FT 0 else T 0); Mem (S 0, off) ];
           store st ty r (if is_float ty then FT 0 else T 0)
-      | Ir.P_aggregate (slot, _, Ir.In_memory), [ In_int i ] ->
-          (* the object is elsewhere; its address was passed *)
-          op st "sd" [ Reg (A i); addr st (S 0) st.slots.(slot) (T 2) ]
+      | Ir.P_aggregate (slot, size, Ir.In_memory), [ In_int i ] ->
+          (* what arrived is the address of the caller's copy; the body
+             addresses a slot, so the object is copied into it *)
+          op st "mv" [ Reg (T 4); Reg (A i) ];
+          op st "addi" [ Reg (T 3); Reg (S 0); Imm (Int64.of_int st.slots.(slot)) ];
+          for k = 0 to size - 1 do
+            op st "lbu" [ Reg (T 0); Mem (T 4, k) ];
+            op st "sb" [ Reg (T 0); Mem (T 3, k) ]
+          done
+      | Ir.P_aggregate (slot, size, Ir.In_memory), [ On_stack off ] ->
+          op st "ld" [ Reg (T 4); Mem (S 0, off) ];
+          op st "addi" [ Reg (T 3); Reg (S 0); Imm (Int64.of_int st.slots.(slot)) ];
+          for k = 0 to size - 1 do
+            op st "lbu" [ Reg (T 0); Mem (T 4, k) ];
+            op st "sb" [ Reg (T 0); Mem (T 3, k) ]
+          done
       | Ir.P_aggregate (slot, _, Ir.In_registers pieces), ps ->
           load_addr st (Ir.Slot slot) (T 2);
           List.iter2 (fun (pc : Ir.piece) place ->
