@@ -45,6 +45,8 @@ type st = {
   mutable fname : string;
   mutable label_count : int;
   mutable float_consts : ((int64 * bool) * string) list;  (* bits and whether four bytes *)
+  mutable wide : (int, int) Hashtbl.t;    (* long double register -> its sixteen-byte slot *)
+  mutable wide_consts : ((int64 * int64) * string) list;
   mutable const_count : int;
   mutable hidden_ptr : int;           (* where the aggregate-return pointer was saved *)
   (* A va_list here is one pointer walking upwards, so the argument
@@ -175,6 +177,90 @@ let load st ty o dst_i dst_f = if is_float ty then load_float st ty o dst_f else
 let store st (ty : Ir.ty) (r : int) (src : reg) =
   op st (store_mnemonic ty) [ Reg src; addr st (S 0) (reg_slot st r) (T 2) ]
 
+(* ---- long double ---------------------------------------------------- *)
+
+(* long double here is IEEE binary128, which the machine has no
+   instructions for: the arithmetic is a call into the compiler's
+   support library, and a value travels in two integer registers, being
+   sixteen bytes (the psABI passes it as it would any pair of words).
+   So an F80 register -- the IR's name for long double, from the machine
+   where it is x87's eighty bits -- lives in a sixteen-byte slot here,
+   and everything below moves it two words at a time. *)
+
+let slot16 st r =
+  match Hashtbl.find_opt st.wide r with
+  | Some off -> off
+  | None -> let off = alloc st 16 16 in Hashtbl.replace st.wide r off; off
+
+(* A double converted to binary128, exactly: every double is one.  The
+   sign stays, the exponent is rebiased from 1023 to 16383, and the
+   mantissa's fifty-two bits move up to the top of the hundred and
+   twelve. *)
+let binary128_of_double (v : float) : int64 * int64 =
+  let bits = Int64.bits_of_float v in
+  let sign = Int64.logand bits Int64.min_int in
+  let exp = Int64.to_int (Int64.logand (Int64.shift_right_logical bits 52) 0x7ffL) in
+  let mant = Int64.logand bits 0xfffffffffffffL in
+  if exp = 0 && Int64.equal mant 0L then (0L, sign)          (* a zero, with its sign *)
+  else if exp = 0x7ff then
+    (* an infinity or a NaN: the exponent is all ones and the mantissa
+       keeps its top bits, so a quiet NaN stays quiet *)
+    (Int64.shift_left mant 60,
+     Int64.logor sign (Int64.logor 0x7fff000000000000L (Int64.shift_right_logical mant 4)))
+  else
+    let exp' = exp - 1023 + 16383 in
+    (Int64.shift_left mant 60,
+     Int64.logor sign
+       (Int64.logor (Int64.shift_left (Int64.of_int exp') 48) (Int64.shift_right_logical mant 4)))
+
+let wide_const st (v : float) =
+  let (lo, hi) = binary128_of_double v in
+  match List.assoc_opt (lo, hi) st.wide_consts with
+  | Some l -> l
+  | None ->
+      st.const_count <- st.const_count + 1;
+      let l = Printf.sprintf ".LW%s.%d" st.fname st.const_count in
+      st.wide_consts <- ((lo, hi), l) :: st.wide_consts;
+      l
+
+(* the two words of a long double, into a pair of integer registers *)
+let load_wide st (o : Ir.operand) (lo : reg) (hi : reg) =
+  match o with
+  | Ir.Reg r ->
+      let off = slot16 st r in
+      op st "ld" [ Reg lo; addr st (S 0) off (T 2) ];
+      op st "ld" [ Reg hi; addr st (S 0) (off + 8) (T 2) ]
+  | Ir.Fimm v ->
+      let l = wide_const st v in
+      load_sym st l (T 2);
+      op st "ld" [ Reg lo; Mem (T 2, 0) ];
+      op st "ld" [ Reg hi; Mem (T 2, 8) ]
+  | _ -> failwith "Riscv64.Select: a long double from an operand that is not one"
+
+let store_wide st (r : int) (lo : reg) (hi : reg) =
+  let off = slot16 st r in
+  op st "sd" [ Reg lo; addr st (S 0) off (T 2) ];
+  op st "sd" [ Reg hi; addr st (S 0) (off + 8) (T 2) ]
+
+(* A call into the support library.  Each long double argument takes two
+   integer registers, each narrower value one, and the result comes back
+   the same way. *)
+let soft_call st name (args : [ `Wide of Ir.operand | `Word of Ir.ty * Ir.operand ] list) =
+  let next = ref 0 in
+  List.iter (fun a ->
+      match a with
+      | `Wide o ->
+          load_wide st o (A !next) (A (!next + 1));
+          next := !next + 2
+      | `Word (ty, o) ->
+          if is_float ty then begin
+            load_float st ty o (FT 0);
+            op st (if ty = Ir.F32 then "fmv.x.w" else "fmv.x.d") [ Reg (A !next); Reg (FT 0) ]
+          end else load_int st ty o (A !next);
+          incr next)
+    args;
+  op st "call" [ Sym (name, 0) ]
+
 (* ---- arithmetic ------------------------------------------------------ *)
 
 (* The mnemonic for an operation at a type.  A 32-bit operation uses the
@@ -203,7 +289,17 @@ let float_mnemonic (b : Ir.binop) (ty : Ir.ty) =
   | Ir.Fmul -> "fmul" ^ s | Ir.Fdiv -> "fdiv" ^ s
   | _ -> failwith "Riscv64.Select: an integer operation asked for a floating-point mnemonic"
 
+(* the support library's names, which are the ones gcc calls *)
+let soft_binop = function
+  | Ir.Fadd -> "__addtf3" | Ir.Fsub -> "__subtf3"
+  | Ir.Fmul -> "__multf3" | Ir.Fdiv -> "__divtf3"
+  | _ -> failwith "Riscv64.Select: that operation has no long double form"
+
 let binop st (b : Ir.binop) (ty : Ir.ty) (r : int) a c =
+  if ty = Ir.F80 then begin
+    soft_call st (soft_binop b) [ `Wide a; `Wide c ];
+    store_wide st r (A 0) (A 1)
+  end else
   match b with
   | Ir.Fadd | Ir.Fsub | Ir.Fmul | Ir.Fdiv ->
       load_float st ty a (FT 0);
@@ -237,7 +333,29 @@ let compare_int st (c : Ir.cond) ty a b (dst : reg) =
   | Ir.Feq | Ir.Fne | Ir.Flt | Ir.Fle | Ir.Fgt | Ir.Fge ->
       failwith "Riscv64.Select: a floating-point comparison came to the integer path"
 
+(* A comparison of long doubles is a call that answers like strcmp: a
+   negative, zero or positive integer, and the condition is then a test
+   of that.  __eqtf2 and __netf2 answer zero for equal, which is the
+   same shape. *)
+let compare_wide st (c : Ir.cond) a b (dst : reg) =
+  let name = match c with
+    | Ir.Feq | Ir.Fne -> "__eqtf2"
+    | Ir.Flt -> "__lttf2" | Ir.Fle -> "__letf2"
+    | Ir.Fgt -> "__gttf2" | Ir.Fge -> "__getf2"
+    | _ -> failwith "Riscv64.Select: that comparison has no long double form" in
+  soft_call st name [ `Wide a; `Wide b ];
+  (match c with
+   | Ir.Feq -> op st "seqz" [ Reg dst; Reg (A 0) ]
+   | Ir.Fne -> op st "snez" [ Reg dst; Reg (A 0) ]
+   | Ir.Flt -> op st "slti" [ Reg dst; Reg (A 0); Imm 0L ]
+   | Ir.Fle -> op st "slti" [ Reg dst; Reg (A 0); Imm 1L ]
+   | Ir.Fgt -> op st "sgtz" [ Reg dst; Reg (A 0) ]
+   | Ir.Fge -> op st "slti" [ Reg dst; Reg (A 0); Imm 0L ];
+               op st "xori" [ Reg dst; Reg dst; Imm 1L ]
+   | _ -> ())
+
 let compare_float st (c : Ir.cond) ty a b (dst : reg) =
+  if ty = Ir.F80 then compare_wide st c a b dst else
   load_float st ty a (FT 0);
   load_float st ty b (FT 1);
   let s = if ty = Ir.F32 then ".s" else ".d" in
@@ -291,7 +409,34 @@ let conv st (c : Ir.conv) (r : int) (o : Ir.operand) =
       let s = if from = Ir.F32 then "s" else "d" and w = if width into <= 4 then "wu" else "lu" in
       op st (Printf.sprintf "fcvt.%s.%s" w s) [ Reg (T 0); Reg (FT 0); Sym ("rtz", 0) ];
       store st into r (T 0)
-  | Ir.Fconv _ -> failwith "Riscv64.Select: long double is not implemented yet"
+  (* to and from long double, again through the support library.  The
+     names say what they do: extend or truncate between the formats,
+     float an integer into one, fix one into an integer. *)
+  | Ir.Fconv (from, into) when into = Ir.F80 ->
+      let name = match from with
+        | Ir.F32 -> "__extendsftf2" | Ir.F64 -> "__extenddftf2"
+        | Ir.I64 -> "__floatditf" | Ir.I32 -> "__floatsitf"
+        | Ir.I8 | Ir.I16 -> "__floatsitf"
+        | Ir.F80 -> "" in
+      if name = "" then (load_wide st o (T 0) (T 1); store_wide st r (T 0) (T 1))
+      else begin
+        soft_call st name [ `Word (from, o) ];
+        store_wide st r (A 0) (A 1)
+      end
+  | Ir.Fconv (from, into) when from = Ir.F80 ->
+      let name = match into with
+        | Ir.F32 -> "__trunctfsf2" | Ir.F64 -> "__trunctfdf2"
+        | Ir.I64 -> "__fixtfdi" | Ir.I32 | Ir.I8 | Ir.I16 -> "__fixtfsi"
+        | Ir.F80 -> "" in
+      if name = "" then (load_wide st o (T 0) (T 1); store_wide st r (T 0) (T 1))
+      else begin
+        soft_call st name [ `Wide o ];
+        if is_float into then begin
+          op st (if into = Ir.F32 then "fmv.w.x" else "fmv.d.x") [ Reg (FT 0); Reg (A 0) ];
+          store st into r (FT 0)
+        end else store st into r (A 0)
+      end
+  | Ir.Fconv (_, _) -> failwith "Riscv64.Select: a conversion between two long doubles"
 
 (* ---- calls ---------------------------------------------------------- *)
 
@@ -445,10 +590,18 @@ let not_yet what = failwith ("Riscv64.Select: " ^ what ^ " is not implemented ye
 
 let instr st (i : Ir.instr) =
   match i with
+  | Ir.Mov (Ir.F80, r, o) -> load_wide st o (T 0) (T 1); store_wide st r (T 0) (T 1)
   | Ir.Mov (ty, r, o) ->
       load st ty o (T 0) (FT 0);
       store st ty r (if is_float ty then FT 0 else T 0)
   | Ir.Binop (b, ty, r, a, c) -> binop st b ty r a c
+  | Ir.Neg (Ir.F80, r, o) ->
+      (* the sign is the top bit of the high word *)
+      load_wide st o (T 0) (T 1);
+      op st "li" [ Reg (T 2); Imm 1L ];
+      op st "slli" [ Reg (T 2); Reg (T 2); Imm 63L ];
+      op st "xor" [ Reg (T 1); Reg (T 1); Reg (T 2) ];
+      store_wide st r (T 0) (T 1)
   | Ir.Neg (ty, r, o) when is_float ty ->
       load_float st ty o (FT 0);
       op st (if ty = Ir.F32 then "fneg.s" else "fneg.d") [ Reg (FT 0); Reg (FT 0) ];
@@ -465,6 +618,16 @@ let instr st (i : Ir.instr) =
       if is_float ty then compare_float st c ty a b (T 0) else compare_int st c ty a b (T 0);
       store st Ir.I32 r (T 0)
   | Ir.Conv (c, r, o) -> conv st c r o
+  | Ir.Load (Ir.F80, r, o) ->
+      load_addr st o (T 2);
+      op st "ld" [ Reg (T 0); Mem (T 2, 0) ];
+      op st "ld" [ Reg (T 1); Mem (T 2, 8) ];
+      store_wide st r (T 0) (T 1)
+  | Ir.Store (Ir.F80, a, v) ->
+      load_wide st v (T 0) (T 1);
+      load_addr st a (T 2);
+      op st "sd" [ Reg (T 0); Mem (T 2, 0) ];
+      op st "sd" [ Reg (T 1); Mem (T 2, 8) ]
   | Ir.Load (ty, r, o) ->
       load_addr st o (T 2);
       op st (load_mnemonic ty true) [ Reg (if is_float ty then FT 0 else T 0); Mem (T 2, 0) ];
@@ -661,7 +824,8 @@ let instr st (i : Ir.instr) =
    Nothing here is kept in a register across instructions, so ra and s0
    are the only registers that have to be saved. *)
 let func st (f : Ir.func) : func =
-  st.code <- []; st.regs <- Hashtbl.create 64; st.frame <- saved_bytes; st.outgoing <- 0;
+  st.code <- []; st.regs <- Hashtbl.create 64; st.wide <- Hashtbl.create 8;
+  st.frame <- saved_bytes; st.outgoing <- 0;
   st.fname <- f.name; st.label_count <- 0; st.hidden_ptr <- 0;
   let hidden = match f.returns_aggregate with Some (_, p) -> p = Ir.In_memory | None -> false in
   (* the parameters arrive where a caller would have put them *)
@@ -755,7 +919,13 @@ let func st (f : Ir.func) : func =
           Directive ((if narrow then "word" else "quad"), [ Int64.to_string bits ]) ])
       st.float_consts in
   st.float_consts <- [];
-  { name = f.name; body = prologue @ body @ epilogue @ consts }
+  let wide_consts =
+    List.concat_map (fun ((lo, hi), l) ->
+        [ Directive ("section", [ ".rodata" ]); Directive ("align", [ "4" ]); Label l;
+          Directive ("quad", [ Int64.to_string lo ]); Directive ("quad", [ Int64.to_string hi ]) ])
+      st.wide_consts in
+  st.wide_consts <- [];
+  { name = f.name; body = prologue @ body @ epilogue @ consts @ wide_consts }
 
 (* ---- data ----------------------------------------------------------- *)
 
@@ -792,7 +962,8 @@ let data_of_global (g : Ir.global) : instr list =
 let program ~pic ~debug (p : Ir.program) : program =
   let st = { pic; debug; code = []; regs = Hashtbl.create 64; slots = [||]; frame = 0;
              outgoing = 0; fname = ""; label_count = 0; float_consts = []; const_count = 0;
-             hidden_ptr = 0; va_bytes = 0; named_int = 0 } in
+             hidden_ptr = 0; va_bytes = 0; named_int = 0;
+             wide = Hashtbl.create 8; wide_consts = [] } in
   let funcs = List.map (fun f -> func st f) (List.filter (fun (f : Ir.func) -> not f.discardable || true) p.funcs) in
   let data = List.concat_map data_of_global p.globals in
   { funcs; data }
