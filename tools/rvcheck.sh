@@ -14,17 +14,20 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 OCC="$HERE/_build/default/bin/main.exe"
 work=${TMPDIR:-/tmp}/rvcheck.$$
 mkdir -p "$work"
-# Both addressing modes: the twenty-high/twelve-low pair, and the
+# Three ways: the twenty-high/twelve-low addressing pair; the
 # position-independent form with its global offset table and its
-# initial-exec thread-local sequence.
+# initial-exec thread-local sequence; and with debugging information,
+# which the assembler has to accept and which must not change what the
+# program computes.
 n=0; fail=0
 for src in ${@:-$HERE/test/rv/*.c}; do
   [ -f "$src" ] || continue
   base=$(basename "$src" .c)
-  for mode in fixed pic; do
+  for mode in fixed pic debug; do
     case $mode in
       fixed) gflags="-no-pie"; oflags="-no-pie";;
       pic)   gflags="-fPIE -pie"; oflags="-fPIE";;
+      debug) gflags="-g -no-pie"; oflags="-g -no-pie";;
     esac
     name=$base.$mode
     n=$((n+1))

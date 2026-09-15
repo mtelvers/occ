@@ -42,6 +42,7 @@ type instr =
   | Directive of string * string list
   | Raw of string (* an exact line the assembler must see, for inline assembly *)
   | Loc of int * int (* .loc N line, for the line table *)
+  | Cfi of string (* a .cfi_* directive, e.g. "def_cfa_offset 48" *)
 
 (* The data side is ELF's rather than the machine's, so it is shaped as
    on the other machine: a named object with its binding, its section
@@ -78,7 +79,7 @@ type func = {
   weak : bool;
   hidden : bool;
   body : instr list;
-  debug : bool; (* the function has line information, so it needs its range labelled *)
+  debug : Dwarf.func option; (* Some when the function is described to a debugger *)
 }
 
 type program = {

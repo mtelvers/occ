@@ -71,6 +71,16 @@ let round_up n a = (n + a - 1) / a * a
 let is_float = function Ir.F32 | Ir.F64 | Ir.F80 -> true | _ -> false
 let width = function Ir.I8 -> 1 | Ir.I16 -> 2 | Ir.I32 -> 4 | Ir.F32 -> 4 | _ -> 8
 
+(* The .file index of a source file, emitting the directive on first use. *)
+let file_index st name =
+  match Hashtbl.find_opt st.files name with
+  | Some n -> n
+  | None ->
+      let n = st.next_file in
+      st.next_file <- n + 1;
+      Hashtbl.replace st.files name n;
+      n
+
 (* ---- the frame ------------------------------------------------------ *)
 
 (* Below s0 come the varargs save area (nothing, usually), then the
@@ -1006,7 +1016,7 @@ let instr st (i : Ir.instr) =
                else (op st (load_mnemonic ty true) [ Reg (A !ni); Mem (T 2, p.poff) ]; incr ni))
              pieces);
       op st "j" [ Sym (".Lreturn." ^ st.fname, 0) ]
-  | Ir.Line _ -> ()                            (* debug lines come later *)
+  | Ir.Line loc -> if st.debug then emit st (Loc (file_index st loc.Loc.file, loc.Loc.line))
   | Ir.Trap -> op st "unimp" []
   | Ir.Intrinsic (Ir.Fabs, ty, r, o) ->
       load_float st ty o (FT 0);
@@ -1253,17 +1263,44 @@ let func st (f : Ir.func) : func =
   List.iter (instr st) f.body;
   let body = List.rev st.code in
   st.code <- saved;
+  (* what a debugger is told: every value here lives in a frame slot, so
+     a parameter is at an offset from the canonical frame address, which
+     the prologue made the frame pointer *)
+  let debug =
+    if not st.debug then None
+    else begin
+      let where = function
+        | Ir.P_scalar (Ir.F80, r) -> Dwarf.At_cfa_offset (slot16 st r)
+        | Ir.P_scalar (_, r) -> Dwarf.At_cfa_offset (reg_slot st r)
+        | Ir.P_aggregate (k, _, _) -> Dwarf.At_cfa_offset st.slots.(k) in
+      let dparams =
+        List.map2 (fun p (pname, ty) -> { Dwarf.pname; ptype = Dwarf.of_ctype ty; ploc = where p })
+          f.params f.params_dbg in
+      Some { Dwarf.dfile = file_index st f.loc.Loc.file; dline = f.loc.Loc.line;
+             dparams; dret = Dwarf.of_ctype f.ret_dbg }
+    end in
   (* the frame: the locals and the two saved registers, rounded to the
      sixteen the ABI asks of sp.  Arguments that do not fit in registers
      are not here: each call makes room for its own just below sp, as
      the other machine does, so that a variable length array may move sp
      without disturbing them. *)
   let size = round_up st.frame 16 in
+  (* The frame described to the unwinder, in the shape gcc writes here:
+     the canonical frame address is the stack pointer on entry, which is
+     first sp plus the frame's size and then the frame pointer itself.
+     The DWARF numbering is the hardware's, so ra is register 1 and s0
+     is register 8. *)
   let prologue =
-    [ Op ("addi", [ Reg SP; Reg SP; Imm (Int64.of_int (- size)) ]);
-      Op ("sd", [ Reg RA; Mem (SP, size + ra_offset st) ]);
-      Op ("sd", [ Reg (S 0); Mem (SP, size + fp_offset st) ]);
-      Op ("addi", [ Reg (S 0); Reg SP; Imm (Int64.of_int size) ]) ] in
+    (if st.debug then [ Loc (file_index st f.loc.Loc.file, f.loc.Loc.line) ] else [])
+    @ [ Cfi "startproc";
+        Op ("addi", [ Reg SP; Reg SP; Imm (Int64.of_int (- size)) ]);
+        Cfi (Printf.sprintf "def_cfa_offset %d" size);
+        Op ("sd", [ Reg RA; Mem (SP, size + ra_offset st) ]);
+        Op ("sd", [ Reg (S 0); Mem (SP, size + fp_offset st) ]);
+        Cfi (Printf.sprintf "offset 1, %d" (ra_offset st));
+        Cfi (Printf.sprintf "offset 8, %d" (fp_offset st));
+        Op ("addi", [ Reg (S 0); Reg SP; Imm (Int64.of_int size) ]);
+        Cfi "def_cfa 8, 0" ] in
   let epilogue =
     [ Label (".Lreturn." ^ f.name) ]
     (* A function that moved sp itself -- one with a variable length
@@ -1273,8 +1310,14 @@ let func st (f : Ir.func) : func =
     @ (if st.moved_sp then [ Op ("addi", [ Reg SP; Reg (S 0); Imm (Int64.of_int (- size)) ]) ] else [])
     @ [ Op ("ld", [ Reg RA; Mem (SP, size + ra_offset st) ]);
         Op ("ld", [ Reg (S 0); Mem (SP, size + fp_offset st) ]);
+        Cfi "restore 1"; Cfi "restore 8";
+        (* the frame pointer is gone, so the address is said again in
+           terms of the stack pointer *)
+        Cfi (Printf.sprintf "def_cfa 2, %d" size);
         Op ("addi", [ Reg SP; Reg SP; Imm (Int64.of_int size) ]);
-        Op ("ret", []) ] in
+        Cfi "def_cfa_offset 0";
+        Op ("ret", []);
+        Cfi "endproc" ] in
   (* the constants this function needed, as read-only objects *)
   let const name align size items =
     { dname = name; dglobal = false; dweak = false; dhidden = false; dalias = None;
@@ -1287,7 +1330,7 @@ let func st (f : Ir.func) : func =
     @ st.consts;
   st.float_consts <- []; st.wide_consts <- [];
   { name = f.name; global = f.global; weak = f.flink.weak; hidden = f.flink.hidden;
-    body = prologue @ body @ epilogue; debug = false }
+    body = prologue @ body @ epilogue; debug }
 
 (* ---- data ----------------------------------------------------------- *)
 

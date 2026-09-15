@@ -81,17 +81,9 @@ let instr ppf = function
   | Op (m, ops) -> Format.fprintf ppf "\t%s\t%s@." m (String.concat "," (List.map operand ops))
   | Raw text -> Format.fprintf ppf "%s@." text
   | Loc (file, line) -> Format.fprintf ppf "\t.loc\t%d %d@." file line
+  | Cfi d -> Format.fprintf ppf "\t.cfi_%s@." d
 
-let escape s =
-  let b = Buffer.create (String.length s * 2) in
-  String.iter (fun c ->
-      match c with
-      | '"' -> Buffer.add_string b "\\\""
-      | '\\' -> Buffer.add_string b "\\\\"
-      | '\n' -> Buffer.add_string b "\\n"
-      | c when Char.code c < 32 || Char.code c >= 127 -> Buffer.add_string b (Printf.sprintf "\\%03o" (Char.code c))
-      | c -> Buffer.add_char b c) s;
-  Buffer.contents b
+let escape = Dwarf.escape
 
 let section_directive = function
   | Data -> "\t.data"
@@ -136,12 +128,15 @@ let data ppf (d : data) =
 let func ppf (f : func) =
   let p fmt = Format.fprintf ppf fmt in
   p "\t.text@.";
+  (* an instruction is four bytes and must be aligned to four; every
+     function here is a whole number of them, but say so anyway *)
+  p "\t.align\t2@.";
   linkage ppf ~global:f.global ~weak:f.weak ~hidden:f.hidden f.name;
   p "\t.type\t%s, @function@." f.name;
   p "%s:@." f.name;
-  if f.debug then p ".LFB.%s:@." f.name;
+  if f.debug <> None then p ".LFB.%s:@." f.name;
   List.iter (instr ppf) f.body;
-  if f.debug then p ".LFE.%s:@." f.name;
+  if f.debug <> None then p ".LFE.%s:@." f.name;
   p "\t.size\t%s, .-%s@." f.name f.name
 
 let program ppf (prog : program) =
@@ -149,12 +144,17 @@ let program ppf (prog : program) =
   List.iter (fun (n, name) -> Format.fprintf ppf "\t.file\t%d \"%s\"@." n (escape name)) prog.files;
   List.iter (fun text -> Format.fprintf ppf "%s@." text) prog.asm_blocks;
   List.iter (data ppf) prog.data;
-  (* Debug information here is the line table only: the .file and .loc
-     directives, which the assembler turns into .debug_line.  The tree
-     of debugging information entries that the other machine also emits
-     is not written yet. *)
-  ignore prog.source;
+  if prog.source <> None then Format.fprintf ppf "\t.text@..Ltext0:@.";
   List.iter (func ppf) prog.funcs;
+  (match prog.source with
+   | Some source ->
+       Format.fprintf ppf "\t.text@..Letext0:@.";
+       Dwarf.info ppf
+         (List.filter_map (fun (f : func) ->
+              Option.map (fun d -> { Dwarf.sname = f.name; sglobal = f.global; sinfo = d }) f.debug)
+            prog.funcs)
+         ~source
+   | None -> ());
   let array name entries =
     if entries <> [] then begin
       Format.fprintf ppf "\t.section %s,\"aw\",@init_array@." name;
