@@ -389,6 +389,18 @@ let conv st (c : Ir.conv) (r : int) (o : Ir.operand) =
   | Ir.Trunc (from, into) -> load_int st from o (T 0); store st into r (T 0)
   | Ir.Fext -> load_float st Ir.F32 o (FT 0); op st "fcvt.d.s" [ Reg (FT 0); Reg (FT 0) ]; store st Ir.F64 r (FT 0)
   | Ir.Ftrunc -> load_float st Ir.F64 o (FT 0); op st "fcvt.s.d" [ Reg (FT 0); Reg (FT 0) ]; store st Ir.F32 r (FT 0)
+  | Ir.Stof (from, Ir.F80) ->
+      soft_call st (if width from <= 4 then "__floatsitf" else "__floatditf") [ `Word (from, o) ];
+      store_wide st r (A 0) (A 1)
+  | Ir.Utof (from, Ir.F80) ->
+      soft_call st (if width from <= 4 then "__floatunsitf" else "__floatunditf") [ `Word (from, o) ];
+      store_wide st r (A 0) (A 1)
+  | Ir.Ftos (Ir.F80, into) ->
+      soft_call st (if width into <= 4 then "__fixtfsi" else "__fixtfdi") [ `Wide o ];
+      store st into r (A 0)
+  | Ir.Ftou (Ir.F80, into) ->
+      soft_call st (if width into <= 4 then "__fixunstfsi" else "__fixunstfdi") [ `Wide o ];
+      store st into r (A 0)
   | Ir.Stof (from, into) ->
       load_int st from o (T 0);
       let s = if into = Ir.F32 then "s" else "d" and w = if width from <= 4 then "w" else "l" in
@@ -433,10 +445,9 @@ let conv st (c : Ir.conv) (r : int) (o : Ir.operand) =
       if name = "" then (load_wide st o (T 0) (T 1); store_wide st r (T 0) (T 1))
       else begin
         soft_call st name [ `Wide o ];
-        if is_float into then begin
-          op st (if into = Ir.F32 then "fmv.w.x" else "fmv.d.x") [ Reg (FT 0); Reg (A 0) ];
-          store st into r (FT 0)
-        end else store st into r (A 0)
+        (* the support library is built for this ABI, so a
+           floating-point result arrives in fa0 and not in a0 *)
+        if is_float into then store st into r (FA 0) else store st into r (A 0)
       end
   | Ir.Fconv (_, _) -> failwith "Riscv64.Select: a conversion between two long doubles"
 
