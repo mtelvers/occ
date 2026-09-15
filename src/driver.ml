@@ -203,7 +203,7 @@ let preprocess o input output =
         match mode Compile, include_dir with
         | Native, Some d ->
             [ "-U__GNUC__"; "-U__SIZEOF_INT128__"; "-U_FORTIFY_SOURCE" ] @ Preprocess.predefined_extras @ [ "-nostdinc"; "-I"; d;
-              "-isystem"; "/usr/include/x86_64-linux-gnu"; "-isystem"; "/usr/include" ]
+              "-isystem"; "/usr/include/" ^ multiarch (); "-isystem"; "/usr/include" ]
         | Native, None -> failwith "cannot find include/ next to the executable"
         | Delegate, _ -> [] in
       run o delegate_cc ([ "-E" ] @ dialect @ cpp_flags o.cpp @ o.passthrough @ [ input; "-o"; output ])
