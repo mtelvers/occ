@@ -14,6 +14,14 @@ let () =
   | Some m -> failwith ("unknown OCC_TARGET " ^ m)
   | None -> Target.machine := Host.machine
 
+(* The directory a distribution puts this machine's headers and
+   libraries in.  Debian and its derivatives name it after the target
+   triple, and the name is not the same on the two machines. *)
+let multiarch () =
+  match !Target.machine with
+  | Target.Amd64 -> "x86_64-linux-gnu"
+  | Target.Riscv64 -> "riscv64-linux-gnu"
+
 let native_stages =
   match Sys.getenv_opt "OCC_NATIVE" with
   | None | Some "" -> [ "pp"; "cc"; "as"; "ld" ]
@@ -208,7 +216,7 @@ let preprocess o input output =
              ones a libc omits (musl ships every freestanding header but
              stdatomic.h) *)
           | Some d, Some root -> [ Filename.concat root "include"; d ]
-          | Some d, None -> [ d; "/usr/include/x86_64-linux-gnu"; "/usr/include" ]
+          | Some d, None -> [ d; "/usr/include/" ^ multiarch (); "/usr/include" ]
           | None, _ -> failwith "cannot find include/ next to the executable" in
       let extras = List.map (fun d ->
           let d = String.sub d 2 (String.length d - 2) in
@@ -282,11 +290,11 @@ let assemble o input output =
    does; the dynamic forms are in [link] below. *)
 let system_lib_dirs () =
   let gcc_dirs =
-    let root = "/usr/lib/gcc/x86_64-linux-gnu" in
+    let root = "/usr/lib/gcc/" ^ multiarch () in
     if Sys.file_exists root && Sys.is_directory root then
       List.map (Filename.concat root) (List.sort (fun a b -> compare (int_of_string_opt b) (int_of_string_opt a)) (Array.to_list (Sys.readdir root)))
     else [] in
-  gcc_dirs @ [ "/usr/lib/x86_64-linux-gnu"; "/lib/x86_64-linux-gnu"; "/usr/lib64"; "/usr/lib" ]
+  gcc_dirs @ [ "/usr/lib/" ^ multiarch (); "/lib/" ^ multiarch (); "/usr/lib64"; "/usr/lib" ]
 
 let find_file dirs name =
   match List.find_opt (fun d -> Sys.file_exists (Filename.concat d name)) dirs with
