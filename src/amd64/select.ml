@@ -205,22 +205,6 @@ let file_index st name =
       Hashtbl.replace st.files name n;
       n
 
-(* What DWARF is told about a C type: scalars exactly, aggregates by name. *)
-let dwarf_type (t : Ctype.t) : dwarf_type =
-  match t.u with
-  | Ctype.Void -> Dw_void
-  | Ctype.Integer k ->
-      let size = Target.size_of_ikind k in
-      let enc = match k with
-        | Ctype.Bool -> 2 | Ctype.Char | Ctype.SChar -> 6 | Ctype.UChar -> 8
-        | k when Ctype.is_signed k -> 5 | _ -> 7 in
-      Dw_base (Ctype.ikind_to_string k, enc, size)
-  | Ctype.Floating k -> Dw_base (Ctype.fkind_to_string k, 4, Target.size_of_fkind k)
-  | Ctype.Enum _ -> Dw_base ("unsigned int", 7, 4)
-  | Ctype.Pointer _ | Ctype.Array _ | Ctype.Vla _ | Ctype.Func _ -> Dw_pointer
-  | Ctype.Struct tag -> Dw_struct (Option.value tag.name ~default:"<anonymous>")
-  | Ctype.Union tag -> Dw_union (Option.value tag.name ~default:"<anonymous>")
-
 (* ---- Calling convention (ABI 3.2.3) ------------------------------------------- *)
 
 (* [Ir.passing] is the general form, a list of pieces with offsets and
@@ -1037,10 +1021,10 @@ let func st (f : Ir.func) : func =
       (* parameters live in frame slots at rbp+off; the frame base for
          DWARF is the CFA, which is rbp+16 *)
       let where = function
-        | Ir.P_scalar (_, r) -> (match location st r with `Reg p -> In_register (dwarf_reg p) | `Mem off -> At_cfa_offset (off - 16))
-        | Ir.P_aggregate (k, _, _) -> At_cfa_offset (st.slots.(k) - 16) in
-      let dparams = List.map2 (fun p (pname, ty) -> { pname; ptype = dwarf_type ty; ploc = where p }) f.params f.params_dbg in
-      Some { dfile = file_index st f.loc.Loc.file; dline = f.loc.Loc.line; dparams; dret = dwarf_type f.ret_dbg }
+        | Ir.P_scalar (_, r) -> (match location st r with `Reg p -> Dwarf.In_register (dwarf_reg p) | `Mem off -> Dwarf.At_cfa_offset (off - 16))
+        | Ir.P_aggregate (k, _, _) -> Dwarf.At_cfa_offset (st.slots.(k) - 16) in
+      let dparams = List.map2 (fun p (pname, ty) -> { Dwarf.pname; ptype = Dwarf.of_ctype ty; ploc = where p }) f.params f.params_dbg in
+      Some { Dwarf.dfile = file_index st f.loc.Loc.file; dline = f.loc.Loc.line; dparams; dret = Dwarf.of_ctype f.ret_dbg }
     end in
   Peephole.func { name = f.name; global = f.global; weak = f.flink.weak; hidden = f.flink.hidden; body = prologue @ body @ epilogue; debug }
 

@@ -63,26 +63,7 @@ type instr =
   | File of int * string (* .file N "name", for the line table *)
   | Loc of int * int (* .loc N line *)
 
-(* DWARF types, as much as parameters and results need (see doc/phases.md). *)
-type dwarf_type =
-  | Dw_void
-  | Dw_base of string * int * int (* name, DW_ATE encoding, byte size *)
-  | Dw_pointer (* to void: pointee types are not described *)
-  | Dw_struct of string
-  | Dw_union of string
-
-type dbg_location = At_cfa_offset of int (* DW_OP_fbreg *) | In_register of int (* DW_OP_regN, DWARF number *)
-
-type dbg_param = { pname : string; ptype : dwarf_type; ploc : dbg_location }
-
-type dbg_func = {
-  dfile : int; (* index in the .file table *)
-  dline : int;
-  dparams : dbg_param list;
-  dret : dwarf_type;
-}
-
-type func = { name : string; global : bool; weak : bool; hidden : bool; body : instr list; debug : dbg_func option }
+type func = { name : string; global : bool; weak : bool; hidden : bool; body : instr list; debug : Dwarf.func option }
 
 type data_item =
   | Bytes of string | Zeros of int | Quad_sym of string * int64 | Quad of int64 | Long of int32
