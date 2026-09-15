@@ -842,10 +842,26 @@ and include_file st path =
 
 (* ---- Predefined macros ------------------------------------------------------------ *)
 
+(* What names the machine, which is the one part of this list that is
+   not the same everywhere.  The values are those the machine's own gcc
+   defines, read from `gcc -dM -E'; the extensions named are the ones
+   this compiler generates code for -- integer, multiply, atomic, float
+   and double -- and not the compressed instructions, which it does not
+   emit. *)
+let machine_predefined () =
+  match !Target.machine with
+  | Target.Amd64 -> [ "__x86_64__ 1"; "__x86_64 1"; "__amd64__ 1"; "__amd64 1" ]
+  | Target.Riscv64 ->
+      [ "__riscv 1"; "__riscv_xlen 64"; "__riscv_flen 64"; "__riscv_arch_test 1";
+        "__riscv_i 2001000"; "__riscv_m 2000000"; "__riscv_a 2001000";
+        "__riscv_f 2002000"; "__riscv_d 2002000";
+        "__riscv_mul 1"; "__riscv_div 1"; "__riscv_muldiv 1"; "__riscv_atomic 1";
+        "__riscv_fdiv 1"; "__riscv_fsqrt 1"; "__riscv_float_abi_double 1";
+        "__riscv_cmodel_medany 1" ]
+
 let predefined = [
   "__STDC__ 1"; "__STDC_VERSION__ 201112L"; "__STDC_HOSTED__ 1";
   "__STDC_UTF_16__ 1"; "__STDC_UTF_32__ 1";
-  "__x86_64__ 1"; "__x86_64 1"; "__amd64__ 1"; "__amd64 1";
   "__linux__ 1"; "__linux 1"; "__gnu_linux__ 1"; "__unix__ 1"; "__unix 1"; "__ELF__ 1";
   "__LP64__ 1"; "_LP64 1"; "__CHAR_BIT__ 8";
   "__SIZEOF_SHORT__ 2"; "__SIZEOF_INT__ 4"; "__SIZEOF_LONG__ 8"; "__SIZEOF_LONG_LONG__ 8";
@@ -873,7 +889,7 @@ let run cfg file =
              out_file = ""; out_line = 0; at_line_start = true; counter = 0; depth = 0; main_file = file; included = []; last_text = "" } in
   List.iter (fun n -> Hashtbl.replace st.macros n Builtin) builtin_names;
   let define_line line = parse_define st { Loc.file = "<built-in>"; line = 1; col = 1 } (tokens_of_string line) in
-  List.iter define_line predefined;
+  List.iter define_line (predefined @ machine_predefined ());
   List.iter (fun (name, value) ->
       (* -D NAME=VALUE, with NAME possibly "F(a,b)"; -D NAME means 1 *)
       define_line (name ^ " " ^ Option.value value ~default:"1")) cfg.defines;
