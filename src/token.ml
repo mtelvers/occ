@@ -70,7 +70,8 @@ let keywords : (string * keyword) list =
     "__signed__", Signed; "__signed", Signed; "__volatile__", Volatile; "__volatile", Volatile;
     "__const", Const; "__const__", Const; "__restrict__", Restrict; "__asm", Asm; "__attribute", Attribute;
     "__alignof__", Alignof; "__alignof", Alignof;
-    "typeof", Typeof; "__typeof__", Typeof; "__typeof", Typeof ]
+    "typeof", Typeof; "__typeof__", Typeof; "__typeof", Typeof;
+    "__thread", Thread_local ]
 
 let keyword_of_string s = List.assoc_opt s keywords
 
