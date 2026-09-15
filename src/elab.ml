@@ -1299,6 +1299,11 @@ and function_definition ctx (f : S.func_def) =
      visible for recursion but does not clash with a parameter *)
   let sym = Env.in_enclosing_scope ctx.env (fun () ->
       redeclare ctx loc name ty (T.Static { linkage; tls = false })) in
+  (* An assembler label and the GNU attributes belong to a definition as
+     much as to a declaration: `__attribute__((constructor)) static void
+     f(void) { ... }' says something about f that only this path sees. *)
+  (match r.asm_label with Some l -> sym.asm_name <- Some l | None -> ());
+  apply_attributes ctx sym (f.fspecs.S.attrs @ r.attrs);
   (match Hashtbl.find_opt ctx.globals sym.id with
    | Some { T.defined = true; _ } when List.exists (fun (fn : T.func) -> fn.fsym.id = sym.id) ctx.funcs -> error loc "redefinition of '%s'" name
    | _ -> ());
