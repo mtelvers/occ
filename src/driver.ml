@@ -339,7 +339,14 @@ let linker_value o name =
 
 let link o objects output =
   match mode Link with
-  | Delegate -> run o delegate_cc (o.passthrough @ objects @ o.link_args @ [ "-o"; output ])
+  | Delegate ->
+      (* This machine's gcc links position-independent executables by
+         default, and the code generated here addresses absolutely
+         unless -fPIC was asked for, so the link has to be told. *)
+      let pie =
+        if !Target.machine = Target.Riscv64 && not o.pic
+           && not (List.mem "-shared" (linker_words o)) then [ "-no-pie" ] else [] in
+      run o delegate_cc (pie @ o.passthrough @ objects @ o.link_args @ [ "-o"; output ])
   | Native ->
       let user_dirs = List.filter_map (fun a ->
           if String.length a > 2 && String.sub a 0 2 = "-L" then Some (String.sub a 2 (String.length a - 2)) else None) o.link_args in
