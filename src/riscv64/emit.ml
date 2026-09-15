@@ -23,6 +23,48 @@ let reg = function
   | FS n -> "fs" ^ string_of_int n
   | FA n -> "fa" ^ string_of_int n
 
+(* The reverse of [reg], for the register names inline assembly uses.
+   Both namings are accepted: the ABI's, which is what assembly is
+   written in, and the hardware's x0..x31 and f0..f31, which is what the
+   manual numbers them (RISC-V calling convention, register convention
+   tables). *)
+let reg_of_number n =
+  if n = 0 then Zero else if n = 1 then RA else if n = 2 then SP
+  else if n = 3 then GP else if n = 4 then TP
+  else if n <= 7 then T (n - 5)            (* x5..x7   = t0..t2 *)
+  else if n <= 9 then S (n - 8)            (* x8, x9   = s0, s1 *)
+  else if n <= 17 then A (n - 10)          (* x10..x17 = a0..a7 *)
+  else if n <= 27 then S (n - 16)          (* x18..x27 = s2..s11 *)
+  else T (n - 25)                          (* x28..x31 = t3..t6 *)
+
+let freg_of_number n =
+  if n <= 7 then FT n                      (* f0..f7   = ft0..ft7 *)
+  else if n <= 9 then FS (n - 8)           (* f8, f9   = fs0, fs1 *)
+  else if n <= 17 then FA (n - 10)         (* f10..f17 = fa0..fa7 *)
+  else if n <= 27 then FS (n - 16)         (* f18..f27 = fs2..fs11 *)
+  else FT (n - 20)                         (* f28..f31 = ft8..ft11 *)
+
+let reg_of_name name =
+  let after p =
+    let lp = String.length p in
+    if String.length name > lp && String.sub name 0 lp = p
+    then int_of_string_opt (String.sub name lp (String.length name - lp))
+    else None in
+  let pick p limit mk = match after p with Some n when n >= 0 && n <= limit -> Some (mk n) | _ -> None in
+  match name with
+  | "zero" -> Some Zero | "ra" -> Some RA | "sp" -> Some SP | "gp" -> Some GP | "tp" -> Some TP
+  | "fp" -> Some (S 0)                     (* the frame pointer's other name *)
+  | _ ->
+      List.find_map (fun f -> f ())
+        [ (fun () -> pick "ft" 11 (fun n -> FT n));
+          (fun () -> pick "fs" 11 (fun n -> FS n));
+          (fun () -> pick "fa" 7 (fun n -> FA n));
+          (fun () -> pick "t" 6 (fun n -> T n));
+          (fun () -> pick "s" 11 (fun n -> S n));
+          (fun () -> pick "a" 7 (fun n -> A n));
+          (fun () -> match after "x" with Some n when n >= 0 && n <= 31 -> Some (reg_of_number n) | _ -> None);
+          (fun () -> match after "f" with Some n when n >= 0 && n <= 31 -> Some (freg_of_number n) | _ -> None) ]
+
 let operand = function
   | Imm v -> Int64.to_string v
   | Reg r -> reg r

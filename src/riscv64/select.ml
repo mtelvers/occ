@@ -738,6 +738,102 @@ let memzero st (dst : Ir.operand) bytes =
   load_addr st dst (T 3);
   for i = 0 to bytes - 1 do op st "sb" [ Reg Zero; Mem (T 3, i) ] done
 
+(* ---- inline assembly ------------------------------------------------ *)
+
+(* The template is emitted as written, with its operands substituted:
+   the compiler chooses a register for each and the text refers to them
+   as %0, %1 and so on (doc/extensions.md).  The constraint letters are
+   the machine's: "r" for a general register, "f" for a floating-point
+   one, "m" or "A" for an address, "i" for a constant, a digit for the
+   register of an earlier operand, and "{name}" -- our own spelling --
+   for a variable bound to a named register.
+
+   Nothing in this back end keeps a value in a register between
+   instructions, so the registers offered are the caller-saved ones and
+   there is nothing of ours in them.  A callee-saved register the
+   template names is saved to a frame slot and put back, the frame
+   pointer included: the text may change it, and the outputs, which are
+   stored through it, are written after it is restored. *)
+let inline_asm st (a : Ir.asm) =
+  let n = Array.length a.operands in
+  let constr = function
+    | Ir.Asm_in (c, _, _) | Ir.Asm_out (c, _, _) | Ir.Asm_inout (c, _, _, _) | Ir.Asm_mem (c, _) -> c
+    | Ir.Asm_imm _ -> "i" in
+  let fixed c =
+    if String.length c > 2 && c.[0] = '{' then Emit.reg_of_name (String.sub c 1 (String.length c - 2))
+    else None in
+  let clobbered = List.filter_map Emit.reg_of_name a.clobbers in
+  let regs = Array.make n None in
+  Array.iteri (fun i o -> regs.(i) <- fixed (constr o)) a.operands;
+  let taken = List.filter_map Fun.id (Array.to_list regs) @ clobbered in
+  let free l = List.filter (fun r -> not (List.mem r taken)) l in
+  let pool = ref (free (List.init 7 (fun k -> T k) @ List.init 8 (fun k -> A k))) in
+  let fpool = ref (free (List.init 12 (fun k -> FT k) @ List.init 8 (fun k -> FA k))) in
+  let take pool = match !pool with r :: rest -> pool := rest; r | [] -> failwith "inline asm: out of registers" in
+  Array.iteri (fun i o ->
+      if regs.(i) = None then
+        match constr o, o with
+        | _, Ir.Asm_imm _ -> ()
+        | c, Ir.Asm_mem _ when String.contains c 'm' || String.contains c 'A' ->
+            regs.(i) <- Some (take pool)                     (* holds the address *)
+        | ("r" | "g" | "p"), _ -> regs.(i) <- Some (take pool)
+        | "f", _ -> regs.(i) <- Some (take fpool)
+        | c, _ when String.length c = 1 && c.[0] >= '0' && c.[0] <= '9' -> ()
+        | c, _ -> failwith ("inline asm: unsupported constraint " ^ c)) a.operands;
+  (* digits: the same register as the operand they name *)
+  Array.iteri (fun i o ->
+      let c = constr o in
+      if String.length c = 1 && c.[0] >= '0' && c.[0] <= '9' then regs.(i) <- regs.(Char.code c.[0] - 48))
+    a.operands;
+  let reg_of i = match regs.(i) with Some r -> r | None -> failwith "inline asm: operand without a register" in
+  let saved =
+    List.filter (function S _ | FS _ -> true | _ -> false)
+      (List.sort_uniq compare (clobbered @ List.filter_map Fun.id (Array.to_list regs))) in
+  let slots = List.map (fun r -> r, alloc st 8 8) saved in
+  List.iter (fun (r, off) ->
+      match r with
+      | FS _ -> op st "fsd" [ Reg r; addr st (S 0) off (T 0) ]
+      | _ -> op st "sd" [ Reg r; addr st (S 0) off (T 0) ]) slots;
+  (* the inputs *)
+  Array.iteri (fun i o ->
+      match o with
+      | Ir.Asm_in (_, ty, v) | Ir.Asm_inout (_, ty, _, v) ->
+          (match reg_of i with
+           | (FT _ | FS _ | FA _) as r -> load_float st ty v r
+           | r -> load_int st ty v r)
+      | Ir.Asm_mem (_, address) -> load_addr st address (reg_of i)
+      | Ir.Asm_out _ | Ir.Asm_imm _ -> ()) a.operands;
+  (* the text, with %0 .. %9 substituted *)
+  let text i =
+    match a.operands.(i) with
+    | Ir.Asm_imm v -> Int64.to_string v
+    | Ir.Asm_mem _ -> "0(" ^ Emit.reg (reg_of i) ^ ")"
+    | _ -> Emit.reg (reg_of i) in
+  let b = Buffer.create (String.length a.template) in
+  let t = a.template in
+  let len = String.length t in
+  let i = ref 0 in
+  while !i < len do
+    if t.[!i] = '%' && !i + 1 < len then begin
+      let c = t.[!i + 1] in
+      if c = '%' then (Buffer.add_char b '%'; i := !i + 2)
+      else if c >= '0' && c <= '9' then (Buffer.add_string b (text (Char.code c - 48)); i := !i + 2)
+      else (Buffer.add_char b '%'; incr i)
+    end else (Buffer.add_char b t.[!i]; incr i)
+  done;
+  List.iter (fun line -> if String.trim line <> "" then emit st (Raw ("\t" ^ String.trim line)))
+    (String.split_on_char '\n' (Buffer.contents b));
+  (* the saved registers back, before the outputs are stored through the
+     frame pointer *)
+  List.iter (fun (r, off) ->
+      match r with
+      | FS _ -> op st "fld" [ Reg r; addr st (S 0) off (T 0) ]
+      | _ -> op st "ld" [ Reg r; addr st (S 0) off r ]) slots;
+  Array.iteri (fun i o ->
+      match o with
+      | Ir.Asm_out (_, ty, r) | Ir.Asm_inout (_, ty, r, _) -> store st ty r (reg_of i)
+      | _ -> ()) a.operands
+
 let not_yet what = failwith ("Riscv64.Select: " ^ what ^ " is not implemented yet")
 
 let instr st (i : Ir.instr) =
@@ -980,7 +1076,7 @@ let instr st (i : Ir.instr) =
       op st "andi" [ Reg (T 0); Reg (T 0); Imm (-16L) ];
       op st "sub" [ Reg SP; Reg SP; Reg (T 0) ];
       store st Ir.I64 r SP
-  | Ir.Inline_asm _ -> not_yet "inline assembly"
+  | Ir.Inline_asm a -> inline_asm st a
 
 (* ---- a function ----------------------------------------------------- *)
 
