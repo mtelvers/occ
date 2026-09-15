@@ -738,6 +738,83 @@ let memzero st (dst : Ir.operand) bytes =
   load_addr st dst (T 3);
   for i = 0 to bytes - 1 do op st "sb" [ Reg Zero; Mem (T 3, i) ] done
 
+(* ---- an atomic narrower than a word --------------------------------- *)
+
+(* The A extension reserves and stores four bytes or eight, so a byte or
+   a halfword is changed by a loop over the word that contains it: read
+   the word, put the new field into it, and store it back only if the
+   reservation held.  The masking is the whole of the trick -- the
+   address is rounded down to the word, the byte position within it
+   becomes a shift, and a mask of the field's width keeps the neighbours
+   out of the way.  It is the sequence gcc writes here.
+
+   Bits above the field are not worth guarding: add and subtract only
+   carry upwards, the bitwise operations are masked afterwards, and
+   `sc.w' stores four bytes whatever else is in the register.
+
+   t2 holds the word's address, t3 the shift in bits, t4 the field's
+   mask and t5 its complement; t6 carries the operand into place. *)
+let subword_setup st (ty : Ir.ty) a =
+  load_addr st a (T 2);
+  op st "andi" [ Reg (T 3); Reg (T 2); Imm 3L ];
+  op st "andi" [ Reg (T 2); Reg (T 2); Imm (-4L) ];
+  op st "slli" [ Reg (T 3); Reg (T 3); Imm 3L ];
+  op st "li" [ Reg (T 4); Imm (if width ty = 1 then 0xffL else 0xffffL) ];
+  op st "sll" [ Reg (T 4); Reg (T 4); Reg (T 3) ];
+  op st "not" [ Reg (T 5); Reg (T 4) ]
+
+(* The read-modify-write forms, and the exchange, which is the same loop
+   with no arithmetic in it.  [combine] writes the new whole word into
+   a0 from the old one in t0 and the shifted operand in t6. *)
+let subword_rmw st (ty : Ir.ty) (r : int) a v order combine =
+  let aq = if order = Ir.Relaxed then "" else ".aqrl" in
+  let rl = if order = Ir.Relaxed then "" else ".rl" in
+  subword_setup st ty a;
+  load_int st ty v (T 6);
+  op st "sll" [ Reg (T 6); Reg (T 6); Reg (T 3) ];
+  let again = fresh_label st "amo" in
+  emit st (Label again);
+  op st ("lr.w" ^ aq) [ Reg (T 0); Mem (T 2, 0) ];
+  combine ();
+  op st "and" [ Reg (A 0); Reg (A 0); Reg (T 4) ];   (* the new field *)
+  op st "and" [ Reg (A 1); Reg (T 0); Reg (T 5) ];   (* everything else, kept *)
+  op st "or" [ Reg (A 0); Reg (A 0); Reg (A 1) ];
+  op st ("sc.w" ^ rl) [ Reg (T 1); Reg (A 0); Mem (T 2, 0) ];
+  op st "bnez" [ Reg (T 1); Sym (again, 0) ];
+  (* the old value, brought back down to where it came from *)
+  op st "srl" [ Reg (T 0); Reg (T 0); Reg (T 3) ];
+  store st ty r (T 0)
+
+let subword_cmpxchg st (ty : Ir.ty) (r : int) a expected desired order =
+  let aq = if order = Ir.Relaxed then "" else ".aqrl" in
+  let rl = if order = Ir.Relaxed then "" else ".rl" in
+  subword_setup st ty a;
+  (* what we expect, zero-extended so that shifting it leaves nothing
+     stray, and masked into place; a2 keeps its address for the write
+     back a failure owes the caller (7.17.7.4p3) *)
+  load_addr st expected (A 2);
+  op st (load_mnemonic ty false) [ Reg (A 1); Mem (A 2, 0) ];
+  op st "sll" [ Reg (A 1); Reg (A 1); Reg (T 3) ];
+  op st "and" [ Reg (A 1); Reg (A 1); Reg (T 4) ];
+  load_int st ty desired (T 6);
+  op st "sll" [ Reg (T 6); Reg (T 6); Reg (T 3) ];
+  op st "and" [ Reg (T 6); Reg (T 6); Reg (T 4) ];
+  let again = fresh_label st "cas" and out = fresh_label st "casout" in
+  emit st (Label again);
+  op st ("lr.w" ^ aq) [ Reg (T 0); Mem (T 2, 0) ];
+  op st "and" [ Reg (A 3); Reg (T 0); Reg (T 4) ];
+  op st "bne" [ Reg (A 3); Reg (A 1); Sym (out, 0) ];
+  op st "and" [ Reg (A 0); Reg (T 0); Reg (T 5) ];
+  op st "or" [ Reg (A 0); Reg (A 0); Reg (T 6) ];
+  op st ("sc.w" ^ rl) [ Reg (T 1); Reg (A 0); Mem (T 2, 0) ];
+  op st "bnez" [ Reg (T 1); Sym (again, 0) ];
+  emit st (Label out);
+  op st "sub" [ Reg (A 3); Reg (A 3); Reg (A 1) ];
+  op st "seqz" [ Reg (A 3); Reg (A 3) ];              (* whether it succeeded *)
+  op st "srl" [ Reg (T 0); Reg (T 0); Reg (T 3) ];
+  op st (store_mnemonic ty) [ Reg (T 0); Mem (A 2, 0) ];
+  store st Ir.I32 r (A 3)
+
 (* ---- inline assembly ------------------------------------------------ *)
 
 (* The template is emitted as written, with its operands substituted:
@@ -949,8 +1026,10 @@ let instr st (i : Ir.instr) =
      fence and no suffix.  The machine has these at four and eight bytes
      only; a narrower one would need a masked loop on the containing
      word, and nothing here asks for that yet. *)
+  (* A naturally aligned load or store of at most a register's width is
+     atomic on this machine already (RVWMO), so a narrow one needs the
+     fences and nothing else. *)
   | Ir.Atomic_load (ty, r, a, order) ->
-      if width ty < 4 then not_yet "an atomic narrower than four bytes";
       let ordered = order <> Ir.Relaxed in
       if ordered then op st "fence" [ Sym ("rw,rw", 0) ];
       load_addr st a (T 2);
@@ -958,13 +1037,20 @@ let instr st (i : Ir.instr) =
       if ordered then op st "fence" [ Sym ("r,rw", 0) ];
       store st ty r (if is_float ty then FT 0 else T 0)
   | Ir.Atomic_store (ty, a, v, order) ->
-      if width ty < 4 then not_yet "an atomic narrower than four bytes";
       load st ty v (T 0) (FT 0);
       load_addr st a (T 2);
       if order <> Ir.Relaxed then op st "fence" [ Sym ("rw,w", 0) ];
       op st (store_mnemonic ty) [ Reg (if is_float ty then FT 0 else T 0); Mem (T 2, 0) ]
+  | Ir.Atomic_rmw (b, ty, r, a, v, order) when width ty < 4 ->
+      subword_rmw st ty r a v order (fun () ->
+          match b with
+          | Ir.Add -> op st "add" [ Reg (A 0); Reg (T 0); Reg (T 6) ]
+          | Ir.Sub -> op st "sub" [ Reg (A 0); Reg (T 0); Reg (T 6) ]
+          | Ir.And -> op st "and" [ Reg (A 0); Reg (T 0); Reg (T 6) ]
+          | Ir.Or -> op st "or" [ Reg (A 0); Reg (T 0); Reg (T 6) ]
+          | Ir.Xor -> op st "xor" [ Reg (A 0); Reg (T 0); Reg (T 6) ]
+          | _ -> not_yet "that operation applied atomically")
   | Ir.Atomic_rmw (b, ty, r, a, v, order) ->
-      if width ty < 4 then not_yet "an atomic narrower than four bytes";
       let suffix = (if width ty = 4 then ".w" else ".d") ^ (if order = Ir.Relaxed then "" else ".aqrl") in
       load_int st ty v (T 1);
       load_addr st a (T 2);
@@ -978,15 +1064,18 @@ let instr st (i : Ir.instr) =
        | Some m -> op st (m ^ suffix) [ Reg (T 0); Reg (T 1); Mem (T 2, 0) ]
        | None -> not_yet "that operation applied atomically");
       store st ty r (T 0)
+  | Ir.Atomic_xchg (ty, r, a, v, order) when width ty < 4 ->
+      (* the same loop with no arithmetic in it *)
+      subword_rmw st ty r a v order (fun () -> op st "mv" [ Reg (A 0); Reg (T 6) ])
   | Ir.Atomic_xchg (ty, r, a, v, order) ->
-      if width ty < 4 then not_yet "an atomic narrower than four bytes";
       let suffix = (if width ty = 4 then ".w" else ".d") ^ (if order = Ir.Relaxed then "" else ".aqrl") in
       load_int st ty v (T 1);
       load_addr st a (T 2);
       op st ("amoswap" ^ suffix) [ Reg (T 0); Reg (T 1); Mem (T 2, 0) ];
       store st ty r (T 0)
+  | Ir.Atomic_cmpxchg (ty, r, a, expected, desired, order) when width ty < 4 ->
+      subword_cmpxchg st ty r a expected desired order
   | Ir.Atomic_cmpxchg (ty, r, a, expected, desired, order) ->
-      if width ty < 4 then not_yet "an atomic narrower than four bytes";
       (* the reserve-and-store loop: read, compare, try to store, and go
          round again only if the reservation was lost *)
       let w = if width ty = 4 then ".w" else ".d" in
