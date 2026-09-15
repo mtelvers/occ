@@ -21,6 +21,15 @@ let name = function Amd64 -> "x86_64" | Riscv64 -> "riscv64"
 
 let pointer_size = 8
 
+(* What a va_list is, which the C library's own declarations have to
+   agree with: a program that calls vsnprintf passes its va_list to code
+   the system compiled.  On x86-64 System V it is the one-element array
+   of the register-save-area descriptor (ABI 3.5.7), twenty-four bytes;
+   on RISC-V the psABI makes it a plain `void *', so that is what it must
+   be here too.  [Elab] declares __builtin_va_list accordingly and
+   [Lower] copies this many bytes for __builtin_va_copy. *)
+let va_list_size () = match !machine with Amd64 -> 24 | Riscv64 -> 8
+
 let size_of_ikind : Ctype.ikind -> int = function
   | Bool | Char | SChar | UChar -> 1
   | Short | UShort -> 2

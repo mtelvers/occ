@@ -48,6 +48,11 @@ env = dict(os.environ, OCC_NATIVE="cc")
 # no -g on either side: the hybrid has a single line table and file numbering
 subprocess.run([OCC] + [f for f in CFLAGS if f != "-g"] + ["-S", src, "-o", f"{work}/occ.s"], check=True, env=env)
 
+# BISECT_ORACLE: as in bisect-runtime.py, a command run with the relinked
+# ocamlrun as its first argument, for a symptom that is a wrong answer
+# rather than a failure
+ORACLE = os.environ.get("BISECT_ORACLE")
+
 def functions(path, rename=None):
     """Split assembly into (preamble/data, {name: body}) where body runs from
     the '.type name, @function' line to '.size name, .-name'."""
@@ -100,7 +105,9 @@ def works(occ_set):
     if os.path.exists(f"{work}/lib.a"): os.remove(f"{work}/lib.a")
     subprocess.run(["ar", "cr", f"{work}/lib.a"] + files, check=True)
     subprocess.run(["gcc", "-Wl,-E"] + LDFLAGS + ["-o", f"{work}/ocamlrun", "runtime/prims.o", f"{work}/lib.a"] + LIBS, check=True)
-    r = subprocess.run([f"{work}/ocamlrun"] + test_args, capture_output=True, timeout=120)
+    cmd = ([ORACLE, f"{work}/ocamlrun"] if ORACLE
+           else [f"{work}/ocamlrun"] + test_args)
+    r = subprocess.run(cmd, capture_output=True, timeout=120)
     return r.returncode == 0
 
 if not works(set()): print("the all-gcc hybrid fails: harness problem"); sys.exit(1)

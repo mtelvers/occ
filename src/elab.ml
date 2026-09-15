@@ -1326,16 +1326,24 @@ let translation_unit (tu : S.translation_unit) : Env.t * T.translation_unit =
     env = Env.create (); globals = Hashtbl.create 64; global_order = []; funcs = [];
     ret_type = C.void; labels = Hashtbl.create 16; gotos = []; switch_types = []; case_values = [];
     loops = 0; func_name = ""; vla_sizes = []; vla_pending = []; in_type_name = false; vla_count = 0 } in
-  Env.declare ctx.env "__builtin_va_list"
-    (Env.Typedef (C.array (C.unqualified (C.Struct (Env.new_tag ctx.env `Struct (Some "__va_list_tag")).tag)) (Some 1)));
-  (* the va_list tag: struct { unsigned gp_offset, fp_offset; void *overflow_arg_area, *reg_save_area; } (ABI 3.5.7) *)
-  (match Env.lookup ctx.env "__builtin_va_list" with
-   | Some (Env.Typedef { u = C.Array ({ u = C.Struct tag; _ }, _); _ }) ->
-       let info = Env.tag_info ctx.env tag in
-       info.layout <- Some (Env.layout_struct ctx.env ~is_union:false
-                              [ Some "gp_offset", C.uint, None, None; Some "fp_offset", C.uint, None, None;
-                                Some "overflow_arg_area", C.pointer C.void, None, None; Some "reg_save_area", C.pointer C.void, None, None ] Loc.none)
-   | _ -> assert false);
+  (* What a va_list is belongs to the machine's ABI, because the C
+     library's vsnprintf and friends are compiled from the same
+     declaration: on x86-64 System V it is a one-element array of the
+     register-save-area descriptor (ABI 3.5.7), and on RISC-V a plain
+     pointer. *)
+  (match !Target.machine with
+   | Target.Riscv64 -> Env.declare ctx.env "__builtin_va_list" (Env.Typedef (C.pointer C.void))
+   | Target.Amd64 ->
+       Env.declare ctx.env "__builtin_va_list"
+         (Env.Typedef (C.array (C.unqualified (C.Struct (Env.new_tag ctx.env `Struct (Some "__va_list_tag")).tag)) (Some 1)));
+       (* the va_list tag: struct { unsigned gp_offset, fp_offset; void *overflow_arg_area, *reg_save_area; } *)
+       (match Env.lookup ctx.env "__builtin_va_list" with
+        | Some (Env.Typedef { u = C.Array ({ u = C.Struct tag; _ }, _); _ }) ->
+            let info = Env.tag_info ctx.env tag in
+            info.layout <- Some (Env.layout_struct ctx.env ~is_union:false
+                                   [ Some "gp_offset", C.uint, None, None; Some "fp_offset", C.uint, None, None;
+                                     Some "overflow_arg_area", C.pointer C.void, None, None; Some "reg_save_area", C.pointer C.void, None, None ] Loc.none)
+        | _ -> assert false));
   let asm_blocks = ref [] in
   List.iter (function
       | S.Ext_decl d -> ignore (declaration ctx d)

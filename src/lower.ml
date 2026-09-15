@@ -280,7 +280,7 @@ and copy_into fn tu (dst : Ir.operand) (e : T.expr) =
   | T.Binop (Syntax.Comma, a, b) -> ignore (side_effect fn tu a); copy_into fn tu dst b
   | T.Compound_literal (_, init) -> initialise fn tu dst e.ty init
   | T.Va_arg (ap, ty) ->
-      emit fn (Ir.Va_arg_aggregate (dst, size, Abi.classify fn.env ty, value fn tu ap))
+      emit fn (Ir.Va_arg_aggregate (dst, size, Abi.classify fn.env ty, va_addr fn tu ap))
   | _ ->
       let src = address fn tu e in
       emit fn (Ir.Memcpy (dst, src, size))
@@ -540,7 +540,7 @@ and value fn tu (e : T.expr) : Ir.operand =
   | T.Compound_literal _ -> address fn tu e
   | T.Va_arg (ap, ty) ->
       let r = fresh fn in
-      emit fn (Ir.Va_arg (ir_type env ty, r, value fn tu ap)); Ir.Reg r
+      emit fn (Ir.Va_arg (ir_type env ty, r, va_addr fn tu ap)); Ir.Reg r
   | T.Builtin (name, args) -> builtin fn tu e.loc name args
   | T.Atomic_op (op, orders, args) -> atomic fn tu e.ty op orders args
 
@@ -595,6 +595,21 @@ and call_general fn tu ~dst (ret_ty : C.t) (f : T.expr) (args : T.expr list) : I
     Ir.Reg r
   end
 
+(* The address of the va_list the builtins are to walk, which depends on
+   what a va_list is on this machine (see [Target.va_list_size]).
+
+   Where it is the System V descriptor -- a one-element array -- reading
+   the expression already yields the descriptor's address, and a
+   parameter of that type, adjusted to a pointer, holds the address of
+   the caller's descriptor, which is the one va_arg must advance.  Where
+   it is a plain pointer the object is the pointer itself, so its address
+   is what the builtins need, and a parameter is the callee's own copy to
+   advance -- which is what the psABI asks for. *)
+and va_addr fn tu (e : T.expr) : Ir.operand =
+  match !Target.machine with
+  | Target.Amd64 -> value fn tu e
+  | Target.Riscv64 -> address fn tu e
+
 and builtin fn tu loc name (args : T.expr list) : Ir.operand =
   let env = fn.env in
   match name, args with
@@ -612,9 +627,10 @@ and builtin fn tu loc name (args : T.expr list) : Ir.operand =
       emit fn (Ir.Binop_overflow (op, ir_type env rty, is_signed env rty, r, flag, av, bv));
       emit fn (Ir.Store (ir_type env rty, addr, Ir.Reg r));
       Ir.Reg flag
-  | "__builtin_va_start", [ ap; _ ] -> emit fn (Ir.Va_start (value fn tu ap)); Ir.Imm 0L
+  | "__builtin_va_start", [ ap; _ ] -> emit fn (Ir.Va_start (va_addr fn tu ap)); Ir.Imm 0L
   | "__builtin_va_end", [ ap ] -> side_effect fn tu ap; Ir.Imm 0L
-  | "__builtin_va_copy", [ d; s ] -> emit fn (Ir.Memcpy (value fn tu d, value fn tu s, 24)); Ir.Imm 0L
+  | "__builtin_va_copy", [ d; s ] ->
+      emit fn (Ir.Memcpy (va_addr fn tu d, va_addr fn tu s, Target.va_list_size ())); Ir.Imm 0L
   | ("__builtin_setjmp" | "__builtin_longjmp"), _ ->
       let name = if name = "__builtin_setjmp" then "_setjmp" else "longjmp" in
       let args = List.map (fun (a : T.expr) -> Ir.Scalar (ir_type env a.ty, value fn tu a)) args in
@@ -849,8 +865,18 @@ let rec find_addressed fn (s : T.stmt) =
     | T.Cond (a, b, c) -> expr a; expr b; expr c
     | T.Call (f, args) -> expr f; List.iter expr args
     | T.Compound_literal (_, i) -> init i
-    | T.Va_arg (x, _) -> expr x
+    (* The builtins that walk a va_list work on the object rather than on
+       its value, so a variable holding one cannot live in a register.
+       This says nothing on x86-64, where a va_list is an array and so
+       never in one anyway. *)
+    | T.Va_arg (x, _) -> va_object x; expr x
+    | T.Builtin (("__builtin_va_start" | "__builtin_va_end"), (ap :: _ as args)) ->
+        va_object ap; List.iter expr args
+    | T.Builtin ("__builtin_va_copy", ([ d; s ] as args)) ->
+        va_object d; va_object s; List.iter expr args
     | T.Builtin (_, args) | T.Atomic_op (_, _, args) -> List.iter expr args
+  and va_object (e : T.expr) =
+    match e.e with T.Var s -> Hashtbl.replace fn.addressed s.id () | _ -> ()
   and init = function
     | T.Init_scalar e -> expr e
     | T.Init_agg items -> List.iter (fun (it : T.init_item) -> init it.init) items

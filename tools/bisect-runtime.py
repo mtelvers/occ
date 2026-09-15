@@ -32,12 +32,20 @@ for name in objs:
     if not os.path.exists(f"runtime/gcc/{name}.b.o"):
         subprocess.run(["gcc"] + CFLAGS + ["-c", f"runtime/{name}.c", "-o", f"runtime/gcc/{name}.b.o"], check=True)
 
+# BISECT_ORACLE: a command run with the relinked ocamlrun as its first
+# argument, whose exit status says whether the runtime is good.  Needed
+# when the symptom is a wrong answer rather than a failure -- a tool that
+# prints a pointer where an integer belongs and exits 0.
+ORACLE = os.environ.get("BISECT_ORACLE")
+
 def works(occ_set):
     if os.path.exists("runtime/bisect.a"): os.remove("runtime/bisect.a")
     files = [f"runtime/{'occ' if n in occ_set else 'gcc'}/{n}.b.o" for n in objs]
     subprocess.run(["ar", "cr", "runtime/bisect.a"] + files, check=True)
     subprocess.run(["gcc", "-Wl,-E"] + LDFLAGS + ["-o", "runtime/ocamlrun.bisect", "runtime/prims.o", "runtime/bisect.a"] + LIBS, check=True)
-    r = subprocess.run(["runtime/ocamlrun.bisect"] + test_args, capture_output=True, timeout=120)
+    cmd = ([ORACLE, "runtime/ocamlrun.bisect"] if ORACLE
+           else ["runtime/ocamlrun.bisect"] + test_args)
+    r = subprocess.run(cmd, capture_output=True, timeout=120)
     return r.returncode == 0
 
 if not works(set()):

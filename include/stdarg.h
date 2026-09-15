@@ -1,8 +1,11 @@
 /* C11 7.16  Variable arguments <stdarg.h>
  *
- * va_list is the compiler's built-in type (a one-element array of the
- * System V register-save-area descriptor, ABI 3.5.7).  The macros expand
- * to builtins because their expansion needs the callee's frame layout. */
+ * va_list is the compiler's built-in type, whose shape is the machine's:
+ * a one-element array of the System V register-save-area descriptor on
+ * x86-64 (ABI 3.5.7), a plain pointer on RISC-V.  It has to be the ABI's,
+ * because a program that calls vsnprintf hands its va_list to code the
+ * system compiled.  The macros expand to builtins because their expansion
+ * needs the callee's frame layout. */
 
 /* glibc's <stdio.h> and <wchar.h> include this header with
  * __need___va_list defined, wanting only the __gnuc_va_list name and no
