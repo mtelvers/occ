@@ -1032,8 +1032,11 @@ let instr st (i : Ir.instr) =
   | Ir.Switch (ty, o, cases, default) ->
       (* a chain of comparisons: a jump table can come later *)
       load_int st ty o (T 0);
+      (* each label's value in the form the machine keeps one of that
+         type in, as the switched value is: a case of 0x8495a6be in a
+         switch on a uint32 is otherwise never equal to it *)
       List.iter (fun (v, l) ->
-          op st "li" [ Reg (T 1); Imm v ];
+          op st "li" [ Reg (T 1); Imm (narrow ty v) ];
           op st "beq" [ Reg (T 0); Reg (T 1); Sym (l, 0) ]) cases;
       op st "j" [ Sym (default, 0) ]
   | Ir.Ret None -> op st "j" [ Sym (".Lreturn." ^ st.fname, 0) ]

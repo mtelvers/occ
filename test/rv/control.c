@@ -14,6 +14,27 @@ static int shortcircuit(int a, int b) { return (a && b) + 2 * (a || b); }
 static int ternary(int a) { return a > 0 ? a * 2 : -a; }
 static int breaker(void) { int s = 0; for (int i = 0; i < 10; i++) { if (i == 5) break; if (i % 2) continue; s += i; } return s; }
 
+/* A switch whose cases have their top bit set, which is what a
+   marshalling magic number looks like: the value and the constants must
+   be made the same way or none of them ever matches. */
+static int magic(unsigned m) {
+  switch (m) {
+  case 0x8495A6BEu: return 1;
+  case 0x8495A6BFu: return 2;
+  case 0x8495A6BDu: return 3;
+  case 0x7fffffffu: return 4;
+  default: return -1;
+  }
+}
+
+static int wide_magic(unsigned long m) {
+  switch (m) {
+  case 0xffffffffffffffffUL: return 1;
+  case 0x8000000000000000UL: return 2;
+  default: return -1;
+  }
+}
+
 int main(void) {
   yes("for", loops(5) == 10);
   yes("while", whileloop(4) == 10);
@@ -26,5 +47,11 @@ int main(void) {
   yes("short circuit", shortcircuit(1, 0) == 2 && shortcircuit(1, 1) == 3 && shortcircuit(0, 0) == 0);
   yes("ternary", ternary(3) == 6 && ternary(-3) == 3);
   yes("break and continue", breaker() == 6);
+  yes("switch on a value with its top bit set",
+      magic(0x8495A6BEu) == 1 && magic(0x8495A6BFu) == 2 && magic(0x8495A6BDu) == 3
+      && magic(0x7fffffffu) == 4 && magic(0) == -1);
+  yes("switch at the register's own width",
+      wide_magic(0xffffffffffffffffUL) == 1 && wide_magic(0x8000000000000000UL) == 2
+      && wide_magic(1) == -1);
   return 0;
 }
