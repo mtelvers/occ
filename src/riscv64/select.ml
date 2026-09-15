@@ -266,12 +266,14 @@ let conv st (c : Ir.conv) (r : int) (o : Ir.operand) =
   | Ir.Ftos (from, into) ->
       load_float st from o (FT 0);
       let s = if from = Ir.F32 then "s" else "d" and w = if width into <= 4 then "w" else "l" in
-      op st (Printf.sprintf "fcvt.%s.%s" w s) [ Reg (T 0); Reg (FT 0); Imm 0L ];
+      (* C rounds toward zero when it converts a float to an integer
+         (6.3.1.4p1), and the machine takes the mode as an operand *)
+      op st (Printf.sprintf "fcvt.%s.%s" w s) [ Reg (T 0); Reg (FT 0); Sym ("rtz", 0) ];
       store st into r (T 0)
   | Ir.Ftou (from, into) ->
       load_float st from o (FT 0);
       let s = if from = Ir.F32 then "s" else "d" and w = if width into <= 4 then "wu" else "lu" in
-      op st (Printf.sprintf "fcvt.%s.%s" w s) [ Reg (T 0); Reg (FT 0); Imm 0L ];
+      op st (Printf.sprintf "fcvt.%s.%s" w s) [ Reg (T 0); Reg (FT 0); Sym ("rtz", 0) ];
       store st into r (T 0)
   | Ir.Fconv _ -> failwith "Riscv64.Select: long double is not implemented yet"
 
