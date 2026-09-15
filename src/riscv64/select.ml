@@ -466,6 +466,12 @@ let assign_args ?(named = None) ~hidden (args : Ir.arg list) =
            integer registers or on the stack, never in a floating-point
            register: the machine has none that wide *)
         | Ir.Scalar (Ir.F80, _) ->
+            (* An argument whose alignment is two words starts at an
+               even-numbered register, the psABI's rule for a register
+               pair; long double is the one scalar that asks for it, and
+               printf's first such argument lands in a2 and a3 rather
+               than a1 and a2 because of it. *)
+            if !ni land 1 = 1 then incr ni;
             if !ni + 2 <= 8 then
               (let p = [ In_int !ni; In_int (!ni + 1) ] in ni := !ni + 2; p)
             else begin
