@@ -89,8 +89,7 @@ let program ~offset fixups_ref base seq =
            if i = 0 then begin
              (* DW_LNE_set_address to the first row's address *)
              Buffer.add_char b '\000'; Leb.uleb b 9; Buffer.add_char b '\002';
-             fixups_ref := { Encode.at = base + Buffer.length b; size = 8; target = Sym (first.at, None); pcrel = false;
-                             pcbase = 0; signed = false; relaxable = false; branch = false } :: !fixups_ref;
+             fixups_ref := Fixup.make ~at:(base + Buffer.length b) ~size:8 (Sym (first.at, None)) :: !fixups_ref;
              Leb.u64 b 0
            end;
            inc_line_addr b (e.line - !line) (offset e.at - !address);

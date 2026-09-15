@@ -110,8 +110,8 @@ let generate ~offset frames =
       Leb.u32 out (finish - start - 4);
       let here = Buffer.length out in
       Leb.u32 out (here - cie_off);                     (* CIE pointer: distance back to the CIE *)
-      fixups := { Encode.at = Buffer.length out; size = 4; target = Sym (f.start, None); pcrel = true;
-                  pcbase = Buffer.length out; signed = true; relaxable = false; branch = false } :: !fixups;
+      fixups := Fixup.make ~at:(Buffer.length out) ~size:4 ~pcrel:true
+                  ~pcbase:(Buffer.length out) ~signed:true (Sym (f.start, None)) :: !fixups;
       Leb.u32 out 0;                                    (* pc_begin, pc-relative *)
       Leb.u32 out (offset f.finish - offset f.start);   (* pc_range *)
       Leb.uleb out 0;                                   (* augmentation data length *)

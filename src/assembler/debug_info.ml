@@ -26,7 +26,7 @@ type input = {
 }
 
 (* an absolute reference to a symbol plus offset *)
-let fixup at size target = { Encode.at; size; target; pcrel = false; pcbase = 0; signed = false; relaxable = false; branch = false }
+let fixup at size target = Fixup.make ~at ~size target
 
 let abbrev =
   let b = Buffer.create 64 in

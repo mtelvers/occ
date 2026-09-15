@@ -15,16 +15,7 @@ open Gas
 
 (* ---- Fixups ------------------------------------------------------------- *)
 
-type fixup = {
-  at : int;              (* offset of the field within the instruction *)
-  size : int;            (* 1, 2, 4 or 8 bytes *)
-  target : expr;         (* symbol plus offset; its @modifier picks the relocation *)
-  pcrel : bool;          (* relative to [pcbase] (rip-relative, call) *)
-  pcbase : int;          (* offset the value is relative to: the end of the instruction *)
-  signed : bool;         (* a 32-bit absolute value is sign-extended (R_X86_64_32S) *)
-  relaxable : bool;      (* a GOTPCREL load the linker may relax to a direct reference *)
-  branch : bool;         (* the target of a call or jump: relocates as PLT32 *)
-}
+type fixup = Fixup.t
 
 (* jmp and jcc to a label in the same section have a 2-byte form with an
    8-bit displacement and a longer form with a 32-bit one; the assembler
@@ -103,7 +94,7 @@ let emit_modrm b ~reg_field ~relaxable rm =
         (match m.disp, disp_const with
          | _, Some v -> imm_bytes b v 4
          | Some e, None ->
-             b.fixups <- { at = Buffer.length b.buf; size = 4; target = e; pcrel; pcbase = 0; signed = true; relaxable; branch = false } :: b.fixups;
+             b.fixups <- Fixup.make ~at:(Buffer.length b.buf) ~size:4 ~pcrel ~signed:true ~relaxable e :: b.fixups;
              imm_bytes b 0L 4
          | None, None -> assert false) in
       (* mod for a base register: 00 if no displacement (not for rbp/r13),
@@ -167,10 +158,10 @@ let build p =
        (match const e with
         | Some v -> imm_bytes b v n
         | None ->
-            b.fixups <- { at = Buffer.length b.buf; size = n; target = e; pcrel = false; pcbase = 0; signed; relaxable = false; branch = false } :: b.fixups;
+            b.fixups <- Fixup.make ~at:(Buffer.length b.buf) ~size:n ~signed e :: b.fixups;
             imm_bytes b 0L n));
   let len = Buffer.length b.buf in
-  Fixed (Buffer.contents b.buf, List.rev_map (fun f -> { f with pcbase = len }) b.fixups)
+  Fixed (Buffer.contents b.buf, List.rev_map (fun (f : Fixup.t) -> { f with Fixup.pcbase = len }) b.fixups)
 
 (* ---- Operand helpers ----------------------------------------------------- *)
 
@@ -413,7 +404,7 @@ let call op =
       build { default with legacy = seg; reg = 2; rm = Some rm; opcode = [ 0xFF ]; relaxable = true }
   | _ ->
       let e = target_of op in
-      Fixed ("\xE8\000\000\000\000", [ { at = 1; size = 4; target = e; pcrel = true; pcbase = 5; signed = true; relaxable = false; branch = true } ])
+      Fixed ("\xE8\000\000\000\000", [ Fixup.make ~at:1 ~size:4 ~pcrel:true ~pcbase:5 ~signed:true ~branch:true e ])
 
 let jmp op =
   match op with
@@ -746,5 +737,5 @@ let instruction (i : instruction) =
   | Fixed (s, fixups) when prefix = "" -> Fixed (s, fixups)
   | Fixed (s, fixups) ->
       let k = String.length prefix in
-      Fixed (prefix ^ s, List.map (fun f -> { f with at = f.at + k; pcbase = f.pcbase + k }) fixups)
+      Fixed (prefix ^ s, List.map (fun (f : Fixup.t) -> { f with Fixup.at = f.at + k; pcbase = f.pcbase + k }) fixups)
   | Branch _ as b -> if prefix = "" then b else bad "prefix on a branch"

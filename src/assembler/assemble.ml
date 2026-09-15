@@ -23,7 +23,7 @@
 
 open Gas
 
-type fixup = Encode.fixup
+type fixup = Fixup.t
 
 type chunk =
   | Bytes of string * fixup list * int                (* content, fixups, source line *)
@@ -206,7 +206,7 @@ let data_item width e =
       Buffer.contents b, []
   | None ->
       String.make width '\000',
-      [ { Encode.at = 0; size = width; target = e; pcrel = false; pcbase = 0; signed = false; relaxable = false; branch = false } ]
+      [ Fixup.make ~at:0 ~size:width e ]
 
 let constant st e =
   match Encode.const (substitute st e) with
@@ -618,7 +618,7 @@ let section_body st (sec : section) =
           let at = String.length opcode in
           let bytes = Bytes.make (at + size) '\000' in
           Bytes.blit_string opcode 0 bytes 0 at;
-          let f = { Encode.at; size; target = b.target; pcrel = true; pcbase = at + size; signed = true; relaxable = false; branch = true } in
+          let f = Fixup.make ~at ~size ~pcrel:true ~pcbase:(at + size) ~signed:true ~branch:true b.target in
           (match resolve st sec ~pos:(off + at) ~base:(off + at + size) ~rex:false ~relaxed:true f with
            | Value v -> check_fits st size true v; patch bytes at size v
            | Reloc (t, target, addend) -> relocs := (off + at, t, target, addend) :: !relocs);
