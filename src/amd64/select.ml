@@ -223,6 +223,18 @@ let dwarf_type (t : Ctype.t) : dwarf_type =
 
 (* ---- Calling convention (ABI 3.2.3) ------------------------------------------- *)
 
+(* [Ir.passing] is the general form, a list of pieces with offsets and
+   sizes, because RISC-V cuts an aggregate by its members.  On x86-64
+   every piece is a whole eightbyte in order, so this back end reads it
+   back as one flag per eightbyte -- true for a floating-point register
+   -- and [None] for an object that travels in memory. *)
+let eightbytes : Ir.passing -> bool list option = function
+  | Ir.In_memory -> None
+  | Ir.In_registers ps -> Some (List.map (fun (q : Ir.piece) -> q.Ir.pfloat) ps)
+
+let in_memory p = eightbytes p = None
+let classes_of p = match eightbytes p with Some l -> l | None -> []
+
 let int_arg_regs = [| RDI; RSI; RDX; RCX; R8; R9 |]
 
 (* Assign registers to a list of arguments, returning for each either the
@@ -244,15 +256,15 @@ let assign_args ~(hidden : bool) (args : Ir.arg list) : place list * int * int *
           if !ni < 6 then (let r = int_arg_regs.(!ni) in incr ni; In_regs [ r ])
           else (let o = !stack in stack := !stack + 8; On_stack o)
       | Ir.Aggregate a ->
-          let need_i = List.length (List.filter (( = ) Ir.Integer) a.classes)
-          and need_f = List.length (List.filter (( = ) Ir.Sse) a.classes) in
-          if List.mem Ir.Memory a.classes || !ni + need_i > 6 || !nf + need_f > 8 then
+          let cs = classes_of a.passing in
+          let need_i = List.length (List.filter not cs)
+          and need_f = List.length (List.filter (fun f -> f) cs) in
+          if in_memory a.passing || !ni + need_i > 6 || !nf + need_f > 8 then
             (let o = !stack in stack := !stack + round_up a.size 8; On_stack o)
           else
             In_regs (List.map (function
-                | Ir.Integer -> let r = int_arg_regs.(!ni) in incr ni; r
-                | Ir.Sse -> let r = XMM !nf in incr nf; r
-                | Ir.Memory -> assert false) a.classes)) args in
+                | false -> let r = int_arg_regs.(!ni) in incr ni; r
+                | true -> let r = XMM !nf in incr nf; r) cs)) args in
   places, !ni, !nf, !stack
 
 (* Move eightbyte [i] of the object at [base] (a register holding its
@@ -289,7 +301,7 @@ let eightbyte_store st base i (r : reg) size =
 let memcpy st = emit st Rep_movsb (* rdi, rsi, rcx set by the caller *)
 
 let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) variadic =
-  let hidden = match res with Some (Ir.Ret_aggregate a) -> List.mem Ir.Memory a.classes | _ -> false in
+  let hidden = match res with Some (Ir.Ret_aggregate a) -> in_memory a.passing | _ -> false in
   let places, _ni, nf, stack_bytes = assign_args ~hidden args in
   let area = round_up stack_bytes 16 in
   if area > 0 then emit st (Alu ("sub", Q, Imm (Int64.of_int area), Reg RSP));
@@ -338,10 +350,9 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
       let ni = ref 0 and nf = ref 0 in
       List.iteri (fun i c ->
           let r = match c with
-            | Ir.Integer -> let r = [| RAX; RDX |].(!ni) in incr ni; r
-            | Ir.Sse -> let r = XMM !nf in incr nf; r
-            | Ir.Memory -> assert false in
-          eightbyte_store st R11 i r a.size) a.classes
+            | false -> let r = [| RAX; RDX |].(!ni) in incr ni; r
+            | true -> let r = XMM !nf in incr nf; r in
+          eightbyte_store st R11 i r a.size) (classes_of a.passing)
 
 (* ---- Conversions -------------------------------------------------------------- *)
 
@@ -781,7 +792,7 @@ let instr st (i : Ir.instr) =
        | Some (Ir.Rv_scalar (Ir.F80, op)) -> fpush st op
        | Some (Ir.Rv_scalar (ty, op)) -> load st ty op (if is_float ty then XMM 0 else RAX)
        | Some (Ir.Rv_aggregate a) ->
-           if List.mem Ir.Memory a.classes then begin
+           if in_memory a.passing then begin
              emit st (Mov (Q, Mem (RBP, st.hidden_ptr), Reg RDI));
              load_addr st a.addr RSI;
              emit st (Mov (Q, Imm (Int64.of_int a.size), Reg RCX));
@@ -792,10 +803,9 @@ let instr st (i : Ir.instr) =
              let ni = ref 0 and nf = ref 0 in
              List.iteri (fun i c ->
                  let r = match c with
-                   | Ir.Integer -> let r = [| RAX; RDX |].(!ni) in incr ni; r
-                   | Ir.Sse -> let r = XMM !nf in incr nf; r
-                   | Ir.Memory -> assert false in
-                 eightbyte_load st R11 i r a.size) a.classes
+                   | false -> let r = [| RAX; RDX |].(!ni) in incr ni; r
+                   | true -> let r = XMM !nf in incr nf; r in
+                 eightbyte_load st R11 i r a.size) (classes_of a.passing)
            end);
       emit st (Jmp (".L" ^ st.fname ^ ".ret"))
   | Ir.Atomic_load (ty, r, addr, _) ->
@@ -883,15 +893,17 @@ let instr st (i : Ir.instr) =
       emit st (Alu ("sub", Q, Reg RAX, Reg RSP));
       emit st (Mov (Q, Reg RSP, Reg RAX));
       store_int st Ir.I64 r RAX
-  | Ir.Va_arg_aggregate (dst, size, classes, ap) ->
+  | Ir.Va_arg_aggregate (dst, size, passing, ap) ->
       (* ABI 3.5.7 step by step: an aggregate whose eightbytes all fit in the
          remaining register save area is copied from there, one class at a
          time; otherwise it is taken from the overflow area *)
       load_addr st ap RCX;
       load_addr st dst RDI;
       let overflow = fresh_label st "vaov" and done_ = fresh_label st "vad" in
-      let n_int = List.length (List.filter (( = ) Ir.Integer) classes) and n_sse = List.length (List.filter (( = ) Ir.Sse) classes) in
-      if List.mem Ir.Memory classes || size > 16 then emit st (Jmp overflow)
+      let classes = classes_of passing in
+      let n_int = List.length (List.filter not classes)
+      and n_sse = List.length (List.filter (fun f -> f) classes) in
+      if in_memory passing || size > 16 then emit st (Jmp overflow)
       else begin
         if n_int > 0 then begin
           emit st (Mov (L, Mem (RCX, 0), Reg RAX));
@@ -903,11 +915,11 @@ let instr st (i : Ir.instr) =
         end;
         emit st (Mov (Q, Mem (RCX, 16), Reg RSI));   (* reg_save_area *)
         List.iteri (fun i cls ->
-            let field = if cls = Ir.Integer then 0 else 4 in
+            let field = if not cls then 0 else 4 in
             emit st (Mov (L, Mem (RCX, field), Reg RAX));
             emit st (Mov (Q, Mem_index (RSI, RAX, 1), Reg R8));
             emit st (Mov (Q, Reg R8, Mem (RDI, 8 * i)));
-            emit st (Alu ("add", L, Imm (if cls = Ir.Integer then 8L else 16L), Mem (RCX, field)))) classes;
+            emit st (Alu ("add", L, Imm (if not cls then 8L else 16L), Mem (RCX, field)))) classes;
         emit st (Jmp done_)
       end;
       emit st (Label overflow);
@@ -944,10 +956,10 @@ let func st (f : Ir.func) : func =
   st.alloc <- Regalloc.allocate f;
   st.saved <- List.map (fun p -> p, alloc st 8 8) st.alloc.used;
   (* parameters arrive per the same assignment a caller makes *)
-  let hidden = match f.returns_aggregate with Some (_, classes) -> List.mem Ir.Memory classes | None -> false in
+  let hidden = match f.returns_aggregate with Some (_, passing) -> in_memory passing | None -> false in
   let as_args = List.map (function
       | Ir.P_scalar (ty, r) -> Ir.Scalar (ty, Ir.Reg r)
-      | Ir.P_aggregate (slot, size, classes) -> Ir.Aggregate { Ir.addr = Ir.Slot slot; size; classes }) f.params in
+      | Ir.P_aggregate (slot, size, passing) -> Ir.Aggregate { Ir.addr = Ir.Slot slot; size; passing }) f.params in
   let places, ni, nf, stack_bytes = assign_args ~hidden as_args in
   st.va_gp <- ni; st.va_fp <- nf; st.va_stack <- stack_bytes;
   if hidden then (st.hidden_ptr <- alloc st 8 8);

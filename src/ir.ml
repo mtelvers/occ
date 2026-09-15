@@ -39,14 +39,27 @@ type conv =
   | Fconv of ty * ty (* any conversion involving F80 *)
   | Stof of ty * ty | Utof of ty * ty | Ftos of ty * ty | Ftou of ty * ty
 
-(* How the calling convention treats each eightbyte of an aggregate
-   (System V ABI 3.2.3), decided by [Abi] from the C type: [Memory] means
-   the whole object is passed on the stack. *)
-type cls = Integer | Sse | Memory
+(* How the calling convention carries an aggregate, decided by [Abi]
+   from the C type.  Either the whole object goes in memory and its
+   address is what travels, or it is cut into pieces and each piece goes
+   in a register.
+
+   A piece says where it starts in the object, how many bytes of it
+   there are, and whether it wants a floating-point register.  The two
+   machines cut differently and that is the whole reason this is a list
+   of pieces rather than a class per eightbyte: x86-64's pieces are the
+   eightbytes of System V ABI 3.2.3, so `{float,float}' is one piece of
+   eight bytes in one register, while RISC-V's are the flattened
+   members, so the same struct is two pieces of four in two registers. *)
+type piece = { poff : int; psize : int; pfloat : bool }
+
+type passing =
+  | In_memory                   (* the address is what is passed *)
+  | In_registers of piece list
 
 (* Arguments and results as the calling convention sees them: scalars by
-   value, aggregates by address with their size and classification. *)
-type agg = { addr : operand; size : int; classes : cls list }
+   value, aggregates by address with their size and how they travel. *)
+type agg = { addr : operand; size : int; passing : passing }
 
 type arg = Scalar of ty * operand | Aggregate of agg
 
@@ -84,7 +97,7 @@ type instr =
   (* extensions the runtime needs; see doc/extensions.md *)
   | Va_start of operand (* address of the va_list *)
   | Va_arg of ty * reg * operand
-  | Va_arg_aggregate of operand * int * cls list * operand (* destination, size, classes, address of the va_list *)
+  | Va_arg_aggregate of operand * int * passing * operand (* destination, size, how it travels, address of the va_list *)
   | Alloca of reg * operand (* the address of that many fresh bytes of stack, for variable length arrays *)
   | Trap
   | Return_address of reg
@@ -110,7 +123,7 @@ and asm_operand =
 
 type slot = { size : int; align : int }
 
-type param = P_scalar of ty * reg | P_aggregate of int * int * cls list (* slot, size, classes *)
+type param = P_scalar of ty * reg | P_aggregate of int * int * passing (* slot, size, how it travels *)
 
 (* linkage facts carried to the assembler: weak binding, an alias target
    (this symbol is defined equal to it), and ELF visibility *)
@@ -122,7 +135,7 @@ type func = {
   name : string;
   params : param list;
   variadic : bool;
-  returns_aggregate : (int * cls list) option; (* size and classes of an aggregate result *)
+  returns_aggregate : (int * passing) option; (* size and how an aggregate result travels *)
   slots : slot array;
   body : instr list;
   global : bool;

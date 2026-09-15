@@ -32,8 +32,13 @@ let conv = function
   | Stof (a, b) -> Printf.sprintf "stof %s->%s" (ty a) (ty b) | Utof (a, b) -> Printf.sprintf "utof %s->%s" (ty a) (ty b)
   | Ftos (a, b) -> Printf.sprintf "ftos %s->%s" (ty a) (ty b) | Ftou (a, b) -> Printf.sprintf "ftou %s->%s" (ty a) (ty b)
 
-let cls = function Integer -> "int" | Sse -> "sse" | Memory -> "mem"
-let agg (a : agg) = Printf.sprintf "agg[%d:%s] %s" a.size (String.concat "," (List.map cls a.classes)) (operand a.addr)
+let piece (p : piece) = Printf.sprintf "%d:%d%s" p.poff p.psize (if p.pfloat then "f" else "i")
+
+let passing = function
+  | In_memory -> "mem"
+  | In_registers ps -> String.concat "," (List.map piece ps)
+
+let agg (a : agg) = Printf.sprintf "agg[%d:%s] %s" a.size (passing a.passing) (operand a.addr)
 
 let arg = function
   | Scalar (t, o) -> Printf.sprintf "%s %s" (ty t) (operand o)
@@ -94,9 +99,9 @@ let instr ppf i =
 let func ppf (f : func) =
   Format.fprintf ppf "%sfunction %s(%s)%s%s@."
     (if f.global then "global " else "") f.name
-    (String.concat ", " (List.map (function P_scalar (t, r) -> Printf.sprintf "%s %%%d" (ty t) r | P_aggregate (k, s, c) -> Printf.sprintf "agg[%d:%s] slot%d" s (String.concat "," (List.map cls c)) k) f.params))
+    (String.concat ", " (List.map (function P_scalar (t, r) -> Printf.sprintf "%s %%%d" (ty t) r | P_aggregate (k, s, c) -> Printf.sprintf "agg[%d:%s] slot%d" s (passing c) k) f.params))
     (if f.variadic then ", ..." else "")
-    (match f.returns_aggregate with Some (n, c) -> Printf.sprintf " returns agg[%d:%s]" n (String.concat "," (List.map cls c)) | None -> "");
+    (match f.returns_aggregate with Some (n, c) -> Printf.sprintf " returns agg[%d:%s]" n (passing c) | None -> "");
   Array.iteri (fun i (s : slot) -> Format.fprintf ppf "  slot%d: %d bytes align %d@." i s.size s.align) f.slots;
   List.iter (fun i -> instr ppf i; Format.fprintf ppf "@.") f.body
 

@@ -576,14 +576,14 @@ and call_general fn tu ~dst (ret_ty : C.t) (f : T.expr) (args : T.expr list) : I
   let env = fn.env in
   let fty = match f.ty.u with C.Pointer { u = C.Func ft; _ } -> ft | _ -> assert false in
   let callee = value fn tu f in
-  let agg (a : T.expr) addr = { Ir.addr; size = size_of env a.ty; classes = Abi.classify env a.ty } in
+  let agg (a : T.expr) addr = { Ir.addr; size = size_of env a.ty; passing = Abi.classify env a.ty } in
   let args = List.map (fun (a : T.expr) ->
       if is_aggregate a.ty then Ir.Aggregate (agg a (address fn tu a))
       else Ir.Scalar (ir_type env a.ty, value fn tu a)) args in
   if ret_ty.u = C.Void then (emit fn (Ir.Call (None, callee, args, fty.variadic)); Ir.Imm 0L)
   else if is_aggregate ret_ty then begin
     let dst = match dst with Some d -> d | None -> Ir.Slot (new_slot fn (size_of env ret_ty) (align_of env ret_ty)) in
-    emit fn (Ir.Call (Some (Ir.Ret_aggregate { Ir.addr = dst; size = size_of env ret_ty; classes = Abi.classify env ret_ty }), callee, args, fty.variadic));
+    emit fn (Ir.Call (Some (Ir.Ret_aggregate { Ir.addr = dst; size = size_of env ret_ty; passing = Abi.classify env ret_ty }), callee, args, fty.variadic));
     dst
   end else begin
     let r = fresh fn in
@@ -771,7 +771,7 @@ let rec stmt fn tu (s : T.stmt) =
   | T.Return None -> emit fn (Ir.Ret None)
   | T.Return (Some e) ->
       if is_aggregate e.ty then
-        emit fn (Ir.Ret (Some (Ir.Rv_aggregate { Ir.addr = address fn tu e; size = size_of fn.env e.ty; classes = Abi.classify fn.env e.ty })))
+        emit fn (Ir.Ret (Some (Ir.Rv_aggregate { Ir.addr = address fn tu e; size = size_of fn.env e.ty; passing = Abi.classify fn.env e.ty })))
       else emit fn (Ir.Ret (Some (Ir.Rv_scalar (ir_type fn.env e.ty, value fn tu e))))
   | T.Asm a -> inline_asm fn tu a
 

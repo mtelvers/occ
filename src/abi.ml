@@ -25,25 +25,29 @@ let rec leaves env (t : Ctype.t) base acc =
        | None -> acc)
   | Ctype.Array (_, None) | Ctype.Vla _ | Ctype.Void | Ctype.Func _ -> acc
 
-let classify_amd64 env (t : Ctype.t) : Ir.cls list =
+(* x86-64 System V 3.2.3: one class per eightbyte.  Every piece is a
+   whole eightbyte, the last one included, which is what the back end
+   has always loaded and stored. *)
+let classify_amd64 env (t : Ctype.t) : Ir.passing =
   let size = Env.size_of env Loc.none t in
-  if size > 16 || size = 0 then [ Ir.Memory ]
+  if size > 16 || size = 0 then Ir.In_memory
   else begin
     let ls = leaves env t 0 [] in
-    if List.exists (fun (_, k) -> k = X87_leaf) ls then [ Ir.Memory ]
+    if List.exists (fun (_, k) -> k = X87_leaf) ls then Ir.In_memory
     else begin
       let n = (size + 7) / 8 in
-      let classes = Array.make n Ir.Sse in
-      List.iter (fun (off, k) -> if k = Int_leaf then classes.(off / 8) <- Ir.Integer) ls;
+      let float_piece = Array.make n true in
+      List.iter (fun (off, k) -> if k = Int_leaf then float_piece.(off / 8) <- false) ls;
       (* an eightbyte with no leaves (padding only) is INTEGER, ABI 3.2.3p4 *)
       for i = 0 to n - 1 do
-        if not (List.exists (fun (off, _) -> off / 8 = i) ls) then classes.(i) <- Ir.Integer
+        if not (List.exists (fun (off, _) -> off / 8 = i) ls) then float_piece.(i) <- false
       done;
-      Array.to_list classes
+      Ir.In_registers
+        (List.init n (fun i -> { Ir.poff = 8 * i; psize = 8; pfloat = float_piece.(i) }))
     end
   end
 
-let classify env (t : Ctype.t) : Ir.cls list =
+let classify env (t : Ctype.t) : Ir.passing =
   match !Target.machine with
   | Target.Amd64 -> classify_amd64 env t
   | Target.Riscv64 -> classify_amd64 env t   (* replaced when that backend lands *)
