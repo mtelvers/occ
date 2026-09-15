@@ -528,8 +528,73 @@ let instr st (i : Ir.instr) =
   | Ir.Fence _ -> op st "fence" [ Sym ("rw, rw", 0) ]
   | Ir.Return_address r -> store st Ir.I64 r RA
   | Ir.Binop_overflow _ -> not_yet "an operation with an overflow flag"
-  | Ir.Atomic_load _ | Ir.Atomic_store _ | Ir.Atomic_rmw _
-  | Ir.Atomic_xchg _ | Ir.Atomic_cmpxchg _ -> not_yet "the atomic operations"
+  (* 7.17, mapped onto the A extension the way the machine's own
+     compiler does it: a fence on each side of a sequentially consistent
+     load, a fence before such a store, and the acquire-release forms of
+     the read-modify-write instructions.  A relaxed operation needs no
+     fence and no suffix.  The machine has these at four and eight bytes
+     only; a narrower one would need a masked loop on the containing
+     word, and nothing here asks for that yet. *)
+  | Ir.Atomic_load (ty, r, a, order) ->
+      if width ty < 4 then not_yet "an atomic narrower than four bytes";
+      let ordered = order <> Ir.Relaxed in
+      if ordered then op st "fence" [ Sym ("rw,rw", 0) ];
+      load_addr st a (T 2);
+      op st (load_mnemonic ty true) [ Reg (if is_float ty then FT 0 else T 0); Mem (T 2, 0) ];
+      if ordered then op st "fence" [ Sym ("r,rw", 0) ];
+      store st ty r (if is_float ty then FT 0 else T 0)
+  | Ir.Atomic_store (ty, a, v, order) ->
+      if width ty < 4 then not_yet "an atomic narrower than four bytes";
+      load st ty v (T 0) (FT 0);
+      load_addr st a (T 2);
+      if order <> Ir.Relaxed then op st "fence" [ Sym ("rw,w", 0) ];
+      op st (store_mnemonic ty) [ Reg (if is_float ty then FT 0 else T 0); Mem (T 2, 0) ]
+  | Ir.Atomic_rmw (b, ty, r, a, v, order) ->
+      if width ty < 4 then not_yet "an atomic narrower than four bytes";
+      let suffix = (if width ty = 4 then ".w" else ".d") ^ (if order = Ir.Relaxed then "" else ".aqrl") in
+      load_int st ty v (T 1);
+      load_addr st a (T 2);
+      let mnemonic =
+        match b with
+        | Ir.Add -> Some "amoadd"
+        | Ir.Sub -> op st "neg" [ Reg (T 1); Reg (T 1) ]; Some "amoadd"
+        | Ir.And -> Some "amoand" | Ir.Or -> Some "amoor" | Ir.Xor -> Some "amoxor"
+        | _ -> None in
+      (match mnemonic with
+       | Some m -> op st (m ^ suffix) [ Reg (T 0); Reg (T 1); Mem (T 2, 0) ]
+       | None -> not_yet "that operation applied atomically");
+      store st ty r (T 0)
+  | Ir.Atomic_xchg (ty, r, a, v, order) ->
+      if width ty < 4 then not_yet "an atomic narrower than four bytes";
+      let suffix = (if width ty = 4 then ".w" else ".d") ^ (if order = Ir.Relaxed then "" else ".aqrl") in
+      load_int st ty v (T 1);
+      load_addr st a (T 2);
+      op st ("amoswap" ^ suffix) [ Reg (T 0); Reg (T 1); Mem (T 2, 0) ];
+      store st ty r (T 0)
+  | Ir.Atomic_cmpxchg (ty, r, a, expected, desired, order) ->
+      if width ty < 4 then not_yet "an atomic narrower than four bytes";
+      (* the reserve-and-store loop: read, compare, try to store, and go
+         round again only if the reservation was lost *)
+      let w = if width ty = 4 then ".w" else ".d" in
+      let aq = if order = Ir.Relaxed then "" else ".aqrl" in
+      let rl = if order = Ir.Relaxed then "" else ".rl" in
+      let again = fresh_label st "cas" and out = fresh_label st "casout" in
+      load_addr st a (T 2);
+      load_addr st expected (T 4);
+      op st (load_mnemonic ty true) [ Reg (T 5); Mem (T 4, 0) ];   (* what we expect *)
+      load_int st ty desired (T 6);
+      emit st (Label again);
+      op st ("lr" ^ w ^ aq) [ Reg (T 0); Mem (T 2, 0) ];
+      op st "bne" [ Reg (T 0); Reg (T 5); Sym (out, 0) ];
+      op st ("sc" ^ w ^ rl) [ Reg (T 1); Reg (T 6); Mem (T 2, 0) ];
+      op st "bnez" [ Reg (T 1); Sym (again, 0) ];
+      emit st (Label out);
+      (* the result is whether it succeeded, and a failure writes back
+         what was there (7.17.7.4p3) *)
+      op st "sub" [ Reg (T 1); Reg (T 0); Reg (T 5) ];
+      op st "seqz" [ Reg (T 1); Reg (T 1) ];
+      op st (store_mnemonic ty) [ Reg (T 0); Mem (T 4, 0) ];
+      store st Ir.I32 r (T 1)
   | Ir.Va_start ap ->
       (* the list is one pointer, at the first saved argument register *)
       op st "addi" [ Reg (T 0); Reg (S 0); Imm (Int64.of_int (- st.va_bytes)) ];
