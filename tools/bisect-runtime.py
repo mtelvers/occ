@@ -15,7 +15,13 @@ tree = os.path.abspath(sys.argv[1])
 test_args = sys.argv[2:] or ["boot/ocamlc", "-version"]
 os.chdir(tree)
 OCC = os.environ.get("OCC", os.path.expanduser("~/occ/_build/default/bin/main.exe"))
-CFLAGS = "-O -g -mprfchw -pthread -I ./runtime -DCAMLDLLIMPORT= -DIN_CAML_RUNTIME".split()
+# the flags the tree was configured with; BISECT_CFLAGS and BISECT_LIBS
+# override them, which another machine needs (-mprfchw is x86's, and
+# zstd is not always configured in)
+CFLAGS = os.environ.get("BISECT_CFLAGS",
+    "-O -g -mprfchw -pthread -I ./runtime -DCAMLDLLIMPORT= -DIN_CAML_RUNTIME").split()
+LIBS = os.environ.get("BISECT_LIBS", "-lzstd -lm").split()
+LDFLAGS = os.environ.get("BISECT_LDFLAGS", "").split()
 
 objs = sorted(os.path.basename(o)[:-4] for o in glob.glob("runtime/*.b.o"))
 os.makedirs("runtime/gcc", exist_ok=True)
@@ -30,7 +36,7 @@ def works(occ_set):
     if os.path.exists("runtime/bisect.a"): os.remove("runtime/bisect.a")
     files = [f"runtime/{'occ' if n in occ_set else 'gcc'}/{n}.b.o" for n in objs]
     subprocess.run(["ar", "cr", "runtime/bisect.a"] + files, check=True)
-    subprocess.run(["gcc", "-Wl,-E", "-o", "runtime/ocamlrun.bisect", "runtime/prims.o", "runtime/bisect.a", "-lzstd", "-lm"], check=True)
+    subprocess.run(["gcc", "-Wl,-E"] + LDFLAGS + ["-o", "runtime/ocamlrun.bisect", "runtime/prims.o", "runtime/bisect.a"] + LIBS, check=True)
     r = subprocess.run(["runtime/ocamlrun.bisect"] + test_args, capture_output=True, timeout=120)
     return r.returncode == 0
 

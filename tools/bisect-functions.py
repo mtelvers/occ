@@ -26,13 +26,24 @@ tree = os.path.abspath(args[0]); src = args[1]
 test_args = args[2:] or ["boot/ocamlc", "-version"]
 os.chdir(tree)
 OCC = os.environ.get("OCC", os.path.expanduser("~/occ/_build/default/bin/main.exe"))
-CFLAGS = "-O -g -mprfchw -pthread -I ./runtime -DCAMLDLLIMPORT= -DIN_CAML_RUNTIME".split()
-if native:
+# BISECT_CFLAGS, BISECT_LIBS and BISECT_LDFLAGS override the flags the
+# x86-64 tree is configured with, which another machine needs
+CFLAGS = os.environ.get("BISECT_CFLAGS",
+    "-O -g -mprfchw -pthread -I ./runtime -DCAMLDLLIMPORT= -DIN_CAML_RUNTIME").split()
+LIBS = os.environ.get("BISECT_LIBS", "-lzstd -lm").split()
+LDFLAGS = os.environ.get("BISECT_LDFLAGS", "").split()
+if native and "BISECT_CFLAGS" not in os.environ:
     CFLAGS = "-O -g -mprfchw -pthread -I ./runtime -DNATIVE_CODE -DTARGET_amd64 -DMODEL_default -DSYS_linux -DCAMLDLLIMPORT= -DIN_CAML_RUNTIME".split()
 name = os.path.basename(src)[:-2]
 work = "runtime/fbisect"; os.makedirs(work, exist_ok=True)
 
-subprocess.run(["gcc", "-O0"] + [f for f in CFLAGS[1:] if f != "-g"] + ["-fno-asynchronous-unwind-tables", "-fno-dwarf2-cfi-asm", "-S", src, "-o", f"{work}/gcc.s"], check=True)
+# BISECT_GCCFLAGS: on x86-64 the label form of the unwind tables keeps
+# them out of the way; a machine whose gcc emits .cfi directives whatever
+# it is asked wants the directive form instead, which is self-contained
+# within each function body and so splices cleanly
+GCCFLAGS = os.environ.get("BISECT_GCCFLAGS",
+    "-fno-asynchronous-unwind-tables -fno-dwarf2-cfi-asm").split()
+subprocess.run(["gcc", "-O0"] + [f for f in CFLAGS[1:] if f != "-g"] + GCCFLAGS + ["-S", src, "-o", f"{work}/gcc.s"], check=True)
 env = dict(os.environ, OCC_NATIVE="cc")
 # no -g on either side: the hybrid has a single line table and file numbering
 subprocess.run([OCC] + [f for f in CFLAGS if f != "-g"] + ["-S", src, "-o", f"{work}/occ.s"], check=True, env=env)
@@ -83,12 +94,12 @@ def works(occ_set):
     # may end in another section
     hybrid = gcc_rest + "\n".join("\t.text\n" + (gcc_funcs[n] if n not in occ_set else occ_funcs[n]) for n in gcc_funcs) + "\n" + occ_data + "\n"
     open(f"{work}/hybrid.s", "w").write(hybrid)
-    subprocess.run(["gcc", "-c", f"{work}/hybrid.s", "-o", f"{work}/hybrid.o"], check=True)
+    subprocess.run(["gcc", "-c"] + [f for f in LDFLAGS if f == "-fPIC"] + [f"{work}/hybrid.s", "-o", f"{work}/hybrid.o"], check=True)
     if native: return works_native()
     files = [f"runtime/gcc/{n}.b.o" if n != name else f"{work}/hybrid.o" for n in objs]
     if os.path.exists(f"{work}/lib.a"): os.remove(f"{work}/lib.a")
     subprocess.run(["ar", "cr", f"{work}/lib.a"] + files, check=True)
-    subprocess.run(["gcc", "-Wl,-E", "-o", f"{work}/ocamlrun", "runtime/prims.o", f"{work}/lib.a", "-lzstd", "-lm"], check=True)
+    subprocess.run(["gcc", "-Wl,-E"] + LDFLAGS + ["-o", f"{work}/ocamlrun", "runtime/prims.o", f"{work}/lib.a"] + LIBS, check=True)
     r = subprocess.run([f"{work}/ocamlrun"] + test_args, capture_output=True, timeout=120)
     return r.returncode == 0
 
