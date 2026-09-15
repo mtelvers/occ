@@ -680,6 +680,19 @@ let instr st (i : Ir.instr) =
       if is_float ty then (load_float st ty op (XMM 0); store_float st ty r (XMM 0))
       else (load_int st ty op RAX; store_int st ty r RAX)
   | Ir.Binop (op, ty, r, a, b) -> binop st op ty r a b
+  | Ir.Binop_overflow (Ir.Mul, ty, true, r, flag, a, b) when width_of ty = B ->
+      (* There is no two-operand byte multiply: IMUL with a register
+         destination starts at sixteen bits (SDM, IMUL).  So the product
+         is taken at sixteen and the question becomes whether it fits
+         back into eight, which is the same question the flag answers. *)
+      load_int st ty a RAX; load_int st ty b RCX;
+      emit st (Movsx (B, W, Reg RAX, Reg RAX));
+      emit st (Movsx (B, W, Reg RCX, Reg RCX));
+      emit st (Alu ("imul", W, Reg RCX, Reg RAX));
+      emit st (Movsx (B, W, Reg RAX, Reg RDX));
+      emit st (Alu ("cmp", W, Reg RDX, Reg RAX));
+      store_int st ty r RAX;
+      set_flag st CNE flag
   | Ir.Binop_overflow (op, ty, signed, r, flag, a, b) ->
       load_int st ty a RAX; load_int st ty b RCX;
       let w = width_of ty in

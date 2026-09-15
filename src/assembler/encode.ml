@@ -357,6 +357,12 @@ let shift ext size count dst =
 let imul size ops =
   match ops with
   | [ src ] -> group3 5 size src
+  | _ when size = S8 ->
+      (* The SDM gives IMUL r16, IMUL r32 and IMUL r64 with a register
+         destination and nothing narrower: a byte multiply is the
+         one-operand F6 /5, whose product is sixteen bits wide.  gas
+         rejects `imulb %cl, %al'; so does this. *)
+      bad "no byte form of imul with more than one operand"
   | [ src; dst ] when not (is_imm src) ->
       let r = gpr dst in
       let rm, seg, _ = rm_of size src in
