@@ -462,6 +462,17 @@ let assign_args ?(named = None) ~hidden (args : Ir.arg list) =
         let ellipsis = by_ellipsis () in
         incr index;
         match a with
+        (* long double is sixteen bytes and travels as two words, in
+           integer registers or on the stack, never in a floating-point
+           register: the machine has none that wide *)
+        | Ir.Scalar (Ir.F80, _) ->
+            if !ni + 2 <= 8 then
+              (let p = [ In_int !ni; In_int (!ni + 1) ] in ni := !ni + 2; p)
+            else begin
+              stack := round_up !stack 16;
+              let p = [ On_stack !stack; On_stack (!stack + 8) ] in
+              stack := !stack + 16; p
+            end
         | Ir.Scalar (ty, _) when is_float ty && ellipsis ->
             if !ni < 8 then (let p = In_int !ni in incr ni; [ p ])
             else (let p = On_stack !stack in stack := !stack + 8; [ p ])
@@ -497,6 +508,11 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
   (* the arguments, into their registers or onto the stack *)
   List.iter2 (fun (a : Ir.arg) ps ->
       match a, ps with
+      | Ir.Scalar (Ir.F80, o), [ In_int i; In_int j ] -> load_wide st o (A i) (A j)
+      | Ir.Scalar (Ir.F80, o), [ On_stack a; On_stack b ] ->
+          load_wide st o (T 0) (T 1);
+          op st "sd" [ Reg (T 0); Mem (SP, a) ];
+          op st "sd" [ Reg (T 1); Mem (SP, b) ]
       | Ir.Scalar (ty, o), [ In_int i ] when is_float ty ->
           (* a floating-point value in an integer register: its bits *)
           load_float st ty o (FT 0);
@@ -556,6 +572,7 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
   (* and its result *)
   match res with
   | None -> ()
+  | Some (Ir.Ret_scalar (Ir.F80, r)) -> store_wide st r (A 0) (A 1)
   | Some (Ir.Ret_scalar (ty, r)) -> store st ty r (if is_float ty then FA 0 else A 0)
   | Some (Ir.Ret_aggregate a) ->
       (match a.passing with
@@ -653,6 +670,9 @@ let instr st (i : Ir.instr) =
           op st "beq" [ Reg (T 0); Reg (T 1); Sym (l, 0) ]) cases;
       op st "j" [ Sym (default, 0) ]
   | Ir.Ret None -> op st "j" [ Sym (".Lreturn." ^ st.fname, 0) ]
+  | Ir.Ret (Some (Ir.Rv_scalar (Ir.F80, o))) ->
+      load_wide st o (A 0) (A 1);
+      op st "j" [ Sym (".Lreturn." ^ st.fname, 0) ]
   | Ir.Ret (Some (Ir.Rv_scalar (ty, o))) ->
       load st ty o (A 0) (FA 0);
       op st "j" [ Sym (".Lreturn." ^ st.fname, 0) ]
@@ -779,7 +799,14 @@ let instr st (i : Ir.instr) =
            op st "ld" [ Reg (T 0); Mem (T 3, 0) ];
            op st "fmv.d.x" [ Reg (FT 0); Reg (T 0) ];
            store st ty r (FT 0)
-       | Ir.F80 -> not_yet "long double through an ellipsis"
+       | Ir.F80 ->
+           (* aligned to sixteen in the list, as the ABI asks *)
+           op st "addi" [ Reg (T 3); Reg (T 3); Imm 15L ];
+           op st "andi" [ Reg (T 3); Reg (T 3); Imm (-16L) ];
+           op st "ld" [ Reg (T 0); Mem (T 3, 0) ];
+           op st "ld" [ Reg (T 1); Mem (T 3, 8) ];
+           store_wide st r (T 0) (T 1);
+           op st "addi" [ Reg (T 3); Reg (T 3); Imm 8L ]  (* the other eight below *)
        | _ ->
            op st (load_mnemonic ty true) [ Reg (T 0); Mem (T 3, 0) ];
            store st ty r (T 0));
@@ -853,6 +880,11 @@ let func st (f : Ir.func) : func =
   if hidden then op st "sd" [ Reg (A 0); addr st (S 0) st.hidden_ptr (T 2) ];
   List.iter2 (fun (p : Ir.param) ps ->
       match p, ps with
+      | Ir.P_scalar (Ir.F80, r), [ In_int i; In_int j ] -> store_wide st r (A i) (A j)
+      | Ir.P_scalar (Ir.F80, r), [ On_stack a; On_stack b ] ->
+          op st "ld" [ Reg (T 0); Mem (S 0, a) ];
+          op st "ld" [ Reg (T 1); Mem (S 0, b) ];
+          store_wide st r (T 0) (T 1)
       | Ir.P_scalar (ty, r), [ In_int i ] -> store st ty r (A i)
       | Ir.P_scalar (ty, r), [ In_float i ] -> store st ty r (FA i)
       | Ir.P_scalar (ty, r), [ On_stack off ] ->
