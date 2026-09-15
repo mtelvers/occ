@@ -580,14 +580,18 @@ and call_general fn tu ~dst (ret_ty : C.t) (f : T.expr) (args : T.expr list) : I
   let args = List.map (fun (a : T.expr) ->
       if is_aggregate a.ty then Ir.Aggregate (agg a (address fn tu a))
       else Ir.Scalar (ir_type env a.ty, value fn tu a)) args in
-  if ret_ty.u = C.Void then (emit fn (Ir.Call (None, callee, args, fty.variadic)); Ir.Imm 0L)
+  (* how many arguments the callee named, for the back end that needs it *)
+  let named =
+    if fty.variadic then Some (match fty.params with Some ps -> List.length ps | None -> 0)
+    else None in
+  if ret_ty.u = C.Void then (emit fn (Ir.Call (None, callee, args, named)); Ir.Imm 0L)
   else if is_aggregate ret_ty then begin
     let dst = match dst with Some d -> d | None -> Ir.Slot (new_slot fn (size_of env ret_ty) (align_of env ret_ty)) in
-    emit fn (Ir.Call (Some (Ir.Ret_aggregate { Ir.addr = dst; size = size_of env ret_ty; passing = Abi.classify env ret_ty }), callee, args, fty.variadic));
+    emit fn (Ir.Call (Some (Ir.Ret_aggregate { Ir.addr = dst; size = size_of env ret_ty; passing = Abi.classify env ret_ty }), callee, args, named));
     dst
   end else begin
     let r = fresh fn in
-    emit fn (Ir.Call (Some (Ir.Ret_scalar (ir_type env ret_ty, r)), callee, args, fty.variadic));
+    emit fn (Ir.Call (Some (Ir.Ret_scalar (ir_type env ret_ty, r)), callee, args, named));
     Ir.Reg r
   end
 
@@ -615,7 +619,7 @@ and builtin fn tu loc name (args : T.expr list) : Ir.operand =
       let name = if name = "__builtin_setjmp" then "_setjmp" else "longjmp" in
       let args = List.map (fun (a : T.expr) -> Ir.Scalar (ir_type env a.ty, value fn tu a)) args in
       let r = fresh fn in
-      emit fn (Ir.Call (Some (Ir.Ret_scalar (Ir.I32, r)), Ir.Sym name, args, false)); Ir.Reg r
+      emit fn (Ir.Call (Some (Ir.Ret_scalar (Ir.I32, r)), Ir.Sym name, args, None)); Ir.Reg r
   | _ -> Diag.error loc "internal: unknown builtin %s" name
 
 and atomic fn tu (ty : C.t) (op : T.atomic_op) (orders : Ir.memory_order list) (args : T.expr list) : Ir.operand =

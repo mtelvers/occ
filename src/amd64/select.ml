@@ -737,7 +737,7 @@ let instr st (i : Ir.instr) =
       emit st (Mov (L, Imm 0L, Reg RAX));
       emit st (Mov (Q, Imm (Int64.of_int n), Reg RCX));
       emit st Rep_stosb
-  | Ir.Call (res, callee, args, variadic) -> call st res callee args variadic
+  | Ir.Call (res, callee, args, named) -> call st res callee args (named <> None)
   | Ir.Inline_asm a -> inline_asm st a
   | Ir.Label l -> emit st (Label l)
   | Ir.Jump l -> emit st (Jmp l)

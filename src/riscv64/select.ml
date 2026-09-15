@@ -47,6 +47,12 @@ type st = {
   mutable float_consts : ((int64 * bool) * string) list;  (* bits and whether four bytes *)
   mutable const_count : int;
   mutable hidden_ptr : int;           (* where the aggregate-return pointer was saved *)
+  (* A va_list here is one pointer walking upwards, so the argument
+     registers a variadic function saves have to sit immediately below
+     the arguments its caller pushed: the save area is the top of the
+     frame, and the return address and frame pointer go below it. *)
+  mutable va_bytes : int;             (* size of that area, 0 if not variadic *)
+  mutable named_int : int;            (* integer registers the named parameters took *)
 }
 
 let emit st i = st.code <- i :: st.code
@@ -61,9 +67,12 @@ let width = function Ir.I8 -> 1 | Ir.I16 -> 2 | Ir.I32 -> 4 | Ir.F32 -> 4 | _ ->
 
 (* ---- the frame ------------------------------------------------------ *)
 
-(* The first sixteen bytes below s0 hold the return address and the
-   caller's frame pointer, so a local starts below them. *)
+(* Below s0 come the varargs save area (nothing, usually), then the
+   return address and the caller's frame pointer, then the locals. *)
 let saved_bytes = 16
+
+let ra_offset st = - (st.va_bytes + 8)
+let fp_offset st = - (st.va_bytes + 16)
 
 let alloc st size align =
   st.frame <- round_up (st.frame + size) align;
@@ -294,11 +303,23 @@ let conv st (c : Ir.conv) (r : int) (o : Ir.operand) =
    the ABI asks for and what makes a va_list a plain pointer. *)
 type place = In_int of int | In_float of int | On_stack of int
 
-let assign_args ~hidden (args : Ir.arg list) =
+let assign_args ?(named = None) ~hidden (args : Ir.arg list) =
   let ni = ref (if hidden then 1 else 0) and nf = ref 0 and stack = ref 0 in
+  let index = ref 0 in
+  (* an argument matching the ellipsis takes an integer register even if
+     it is a floating-point value (the psABI's hardware floating-point
+     calling convention) *)
+  let by_ellipsis () =
+    let i = !index in
+    match named with Some n -> i >= n | None -> false in
   let places =
     List.map (fun (a : Ir.arg) ->
+        let ellipsis = by_ellipsis () in
+        incr index;
         match a with
+        | Ir.Scalar (ty, _) when is_float ty && ellipsis ->
+            if !ni < 8 then (let p = In_int !ni in incr ni; [ p ])
+            else (let p = On_stack !stack in stack := !stack + 8; [ p ])
         | Ir.Scalar (ty, _) when is_float ty && !nf < 8 -> let p = In_float !nf in incr nf; [ p ]
         | Ir.Scalar (ty, _) when not (is_float ty) && !ni < 8 -> let p = In_int !ni in incr ni; [ p ]
         | Ir.Scalar _ -> let p = On_stack !stack in stack := !stack + 8; [ p ]
@@ -324,14 +345,17 @@ let assign_args ~hidden (args : Ir.arg list) =
       args in
   (places, !ni, !nf, !stack)
 
-let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) variadic =
-  ignore variadic;
+let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) named =
   let hidden = match res with Some (Ir.Ret_aggregate a) -> a.passing = Ir.In_memory | _ -> false in
-  let places, _, _, stack_bytes = assign_args ~hidden args in
+  let places, _, _, stack_bytes = assign_args ~named ~hidden args in
   if stack_bytes > st.outgoing then st.outgoing <- round_up stack_bytes 16;
   (* the arguments, into their registers or onto the stack *)
   List.iter2 (fun (a : Ir.arg) ps ->
       match a, ps with
+      | Ir.Scalar (ty, o), [ In_int i ] when is_float ty ->
+          (* a floating-point value in an integer register: its bits *)
+          load_float st ty o (FT 0);
+          op st (if ty = Ir.F32 then "fmv.x.w" else "fmv.x.d") [ Reg (A i); Reg (FT 0) ]
       | Ir.Scalar (ty, o), [ In_int i ] -> load_int st ty o (A i)
       | Ir.Scalar (ty, o), [ In_float i ] -> load_float st ty o (FA i)
       | Ir.Scalar (ty, o), [ On_stack off ] ->
@@ -451,7 +475,7 @@ let instr st (i : Ir.instr) =
       op st (store_mnemonic ty) [ Reg (if is_float ty then FT 0 else T 0); Mem (T 2, 0) ]
   | Ir.Memcpy (dst, src, n) -> memcopy st dst src n
   | Ir.Memzero (dst, n) -> memzero st dst n
-  | Ir.Call (res, callee, args, variadic) -> call st res callee args variadic
+  | Ir.Call (res, callee, args, named) -> call st res callee args named
   | Ir.Label l -> emit st (Label l)
   | Ir.Jump l -> op st "j" [ Sym (l, 0) ]
   | Ir.Branch (o, t, e) ->
@@ -506,7 +530,56 @@ let instr st (i : Ir.instr) =
   | Ir.Binop_overflow _ -> not_yet "an operation with an overflow flag"
   | Ir.Atomic_load _ | Ir.Atomic_store _ | Ir.Atomic_rmw _
   | Ir.Atomic_xchg _ | Ir.Atomic_cmpxchg _ -> not_yet "the atomic operations"
-  | Ir.Va_start _ | Ir.Va_arg _ | Ir.Va_arg_aggregate _ -> not_yet "variable arguments"
+  | Ir.Va_start ap ->
+      (* the list is one pointer, at the first saved argument register *)
+      op st "addi" [ Reg (T 0); Reg (S 0); Imm (Int64.of_int (- st.va_bytes)) ];
+      load_addr st ap (T 2);
+      op st "sd" [ Reg (T 0); Mem (T 2, 0) ]
+  | Ir.Va_arg (ty, r, ap) ->
+      (* read where the pointer points, then advance it by one word: the
+         saved registers and the arguments on the stack are contiguous,
+         so nothing here has to know which it read *)
+      load_addr st ap (T 2);
+      op st "ld" [ Reg (T 3); Mem (T 2, 0) ];
+      (match ty with
+       | Ir.F32 ->
+           (* a float matching an ellipsis arrived as the low bits of a word *)
+           op st "lw" [ Reg (T 0); Mem (T 3, 0) ];
+           op st "fmv.w.x" [ Reg (FT 0); Reg (T 0) ];
+           store st ty r (FT 0)
+       | Ir.F64 ->
+           op st "ld" [ Reg (T 0); Mem (T 3, 0) ];
+           op st "fmv.d.x" [ Reg (FT 0); Reg (T 0) ];
+           store st ty r (FT 0)
+       | Ir.F80 -> not_yet "long double through an ellipsis"
+       | _ ->
+           op st (load_mnemonic ty true) [ Reg (T 0); Mem (T 3, 0) ];
+           store st ty r (T 0));
+      op st "addi" [ Reg (T 3); Reg (T 3); Imm 8L ];
+      op st "sd" [ Reg (T 3); Mem (T 2, 0) ]
+  | Ir.Va_arg_aggregate (dst, size, passing, ap) ->
+      load_addr st ap (T 2);
+      op st "ld" [ Reg (T 3); Mem (T 2, 0) ];
+      let words =
+        match passing with
+        | Ir.In_memory -> 1                (* a pointer to it was passed *)
+        | Ir.In_registers _ -> (size + 7) / 8 in
+      (match passing with
+       | Ir.In_memory ->
+           op st "ld" [ Reg (T 4); Mem (T 3, 0) ];
+           load_addr st dst (T 5);
+           for k = 0 to size - 1 do
+             op st "lbu" [ Reg (T 0); Mem (T 4, k) ];
+             op st "sb" [ Reg (T 0); Mem (T 5, k) ]
+           done
+       | Ir.In_registers _ ->
+           load_addr st dst (T 5);
+           for k = 0 to size - 1 do
+             op st "lbu" [ Reg (T 0); Mem (T 3, k) ];
+             op st "sb" [ Reg (T 0); Mem (T 5, k) ]
+           done);
+      op st "addi" [ Reg (T 3); Reg (T 3); Imm (Int64.of_int (8 * words)) ];
+      op st "sd" [ Reg (T 3); Mem (T 2, 0) ]
   | Ir.Alloca _ -> not_yet "a variable length array"
   | Ir.Inline_asm _ -> not_yet "inline assembly"
 
@@ -525,19 +598,29 @@ let instr st (i : Ir.instr) =
 let func st (f : Ir.func) : func =
   st.code <- []; st.regs <- Hashtbl.create 64; st.frame <- saved_bytes; st.outgoing <- 0;
   st.fname <- f.name; st.label_count <- 0; st.hidden_ptr <- 0;
-  st.slots <- Array.map (fun (s : Ir.slot) -> alloc st s.size (max s.align 1)) f.slots;
   let hidden = match f.returns_aggregate with Some (_, p) -> p = Ir.In_memory | None -> false in
-  if hidden then st.hidden_ptr <- alloc st 8 8;
   (* the parameters arrive where a caller would have put them *)
   let as_args = List.map (function
       | Ir.P_scalar (ty, r) -> Ir.Scalar (ty, Ir.Reg r)
       | Ir.P_aggregate (slot, size, passing) -> Ir.Aggregate { Ir.addr = Ir.Slot slot; size; passing })
       f.params in
-  let places, _, _, _ = assign_args ~hidden as_args in
+  let places, named_int, _, _ = assign_args ~hidden as_args in
+  st.named_int <- named_int;
+  (* a variadic function saves the argument registers its named
+     parameters did not take, immediately below s0 *)
+  st.va_bytes <- if f.variadic then 8 * (8 - min 8 named_int) else 0;
+  st.frame <- max st.frame (st.va_bytes + saved_bytes);
   (* the body first, so that the frame's size is known before the
      prologue that establishes it is written *)
+  (* the slots come after the save area, whose size is now known *)
+  st.slots <- Array.map (fun (s : Ir.slot) -> alloc st s.size (max s.align 1)) f.slots;
+  if hidden then st.hidden_ptr <- alloc st 8 8;
   let saved = st.code in
   st.code <- [];
+  if f.variadic then
+    for i = min 8 named_int to 7 do
+      op st "sd" [ Reg (A i); Mem (S 0, - st.va_bytes + 8 * (i - min 8 named_int)) ]
+    done;
   if hidden then op st "sd" [ Reg (A 0); addr st (S 0) st.hidden_ptr (T 2) ];
   List.iter2 (fun (p : Ir.param) ps ->
       match p, ps with
@@ -588,13 +671,13 @@ let func st (f : Ir.func) : func =
     @ (if f.global then [ Directive ("globl", [ f.name ]) ] else [])
     @ [ Directive ("type", [ f.name; "@function" ]); Label f.name;
         Op ("addi", [ Reg SP; Reg SP; Imm (Int64.of_int (- size)) ]);
-        Op ("sd", [ Reg RA; Mem (SP, size - 8) ]);
-        Op ("sd", [ Reg (S 0); Mem (SP, size - 16) ]);
+        Op ("sd", [ Reg RA; Mem (SP, size + ra_offset st) ]);
+        Op ("sd", [ Reg (S 0); Mem (SP, size + fp_offset st) ]);
         Op ("addi", [ Reg (S 0); Reg SP; Imm (Int64.of_int size) ]) ] in
   let epilogue =
     [ Label (".Lreturn." ^ f.name);
-      Op ("ld", [ Reg RA; Mem (SP, size - 8) ]);
-      Op ("ld", [ Reg (S 0); Mem (SP, size - 16) ]);
+      Op ("ld", [ Reg RA; Mem (SP, size + ra_offset st) ]);
+      Op ("ld", [ Reg (S 0); Mem (SP, size + fp_offset st) ]);
       Op ("addi", [ Reg SP; Reg SP; Imm (Int64.of_int size) ]);
       Op ("ret", []) ]
     @ (if f.global then [ Directive ("size", [ f.name; ".-" ^ f.name ]) ] else []) in
@@ -644,7 +727,7 @@ let data_of_global (g : Ir.global) : instr list =
 let program ~pic ~debug (p : Ir.program) : program =
   let st = { pic; debug; code = []; regs = Hashtbl.create 64; slots = [||]; frame = 0;
              outgoing = 0; fname = ""; label_count = 0; float_consts = []; const_count = 0;
-             hidden_ptr = 0 } in
+             hidden_ptr = 0; va_bytes = 0; named_int = 0 } in
   let funcs = List.map (fun f -> func st f) (List.filter (fun (f : Ir.func) -> not f.discardable || true) p.funcs) in
   let data = List.concat_map data_of_global p.globals in
   { funcs; data }

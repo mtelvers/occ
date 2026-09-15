@@ -80,7 +80,13 @@ type instr =
   | Store of ty * operand * operand (* addr, value *)
   | Memcpy of operand * operand * int (* dst, src, bytes *)
   | Memzero of operand * int
-  | Call of result option * operand * arg list * bool (* callee, args, variadic *)
+  (* callee, arguments, and how many of them the callee declared: None
+     for a function that is not variadic, and [Some n] for one whose
+     ellipsis follows n named parameters.  The count matters because a
+     machine may pass an argument matching the ellipsis differently from
+     a named one -- RISC-V passes a floating-point value in an integer
+     register there. *)
+  | Call of result option * operand * arg list * int option
   | Label of string
   | Jump of string
   | Branch of operand * string * string (* if nonzero then else *)

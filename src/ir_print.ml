@@ -62,7 +62,9 @@ let instr ppf i =
       let res = match res with
         | None -> "" | Some (Ret_scalar (t, r)) -> Printf.sprintf "%%%d:%s = " r (ty t)
         | Some (Ret_aggregate a) -> agg a ^ " = " in
-      p "  %scall%s %s(%s)" res (if va then ".variadic" else "") (operand f) (String.concat ", " (List.map arg args))
+      p "  %scall%s %s(%s)" res
+        (match va with None -> "" | Some n -> Printf.sprintf ".variadic(%d named)" n)
+        (operand f) (String.concat ", " (List.map arg args))
   | Label l -> p "%s:" l
   | Jump l -> p "  jump %s" l
   | Branch (c, a, b) -> p "  branch %s ? %s : %s" (operand c) a b
