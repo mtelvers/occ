@@ -27,8 +27,13 @@ int main(void) {
   yes("from long", from_long(-42) == -42.0L);
   yes("to long", to_long(1e10L) == 10000000000L);
   yes("negate", negate(2.5L) == -2.5L);
-  yes("more precision than a double",
-      (long double)1.0 + (long double)1e-20 != (long double)1.0);
+  /* The arithmetic has to happen at run time to test this machine:
+     occ folds a constant long double expression at double precision,
+     which loses a bit this format keeps.  That is a limitation of the
+     constant folder rather than of the code generated, and it is the
+     same on both machines -- see doc/riscv.md. */
+  volatile long double one = 1.0L, tiny = 1e-20L;
+  yes("more precision than a double", one + tiny != one);
   printf("printed %.5Lf %.20Lg\n", 3.5L, 1.0L / 3.0L);
   return 0;
 }
