@@ -5,6 +5,15 @@ type mode = Native | Delegate
    assembly and linking, whether the output is a static executable, a
    dynamic one, or a shared object.  OCC_NATIVE overrides the set
    ("none" delegates everything, for use as a pure wrapper). *)
+(* The machine to compile for, before the command line is read: the one
+   this compiler was built for unless OCC_TARGET says otherwise. *)
+let () =
+  match Sys.getenv_opt "OCC_TARGET" with
+  | Some ("riscv64" | "riscv" | "rv64") -> Target.machine := Target.Riscv64
+  | Some ("x86_64" | "amd64" | "x86-64") -> Target.machine := Target.Amd64
+  | Some m -> failwith ("unknown OCC_TARGET " ^ m)
+  | None -> Target.machine := Host.machine
+
 let native_stages =
   match Sys.getenv_opt "OCC_NATIVE" with
   | None | Some "" -> [ "pp"; "cc"; "as"; "ld" ]
@@ -93,12 +102,22 @@ let parse_args argv =
      | "-o" -> o.output <- Some (next a)
      | "-v" -> o.verbose <- true
      | "-fPIC" | "-fpic" | "-fPIE" | "-fpie" -> o.pic <- true; o.passthrough <- o.passthrough @ [ a ]
+     (* Which machine to compile for.  The default is the one this
+        compiler was built for, and OCC_TARGET says otherwise for a
+        build whose scripts cannot be given a flag. *)
+     | _ when String.length a > 9 && String.sub a 0 9 = "--target=" ->
+         (match String.sub a 9 (String.length a - 9) with
+          | "x86_64" | "amd64" | "x86-64" -> Target.machine := Target.Amd64
+          | "riscv64" | "riscv" | "rv64" -> Target.machine := Target.Riscv64
+          | m -> failwith ("unknown target " ^ m))
      | "-MD" | "-MMD" -> o.deps <- true; o.passthrough <- o.passthrough @ [ a ]
      | "-g" | "-g1" | "-g2" | "-g3" | "-ggdb" | "-gdwarf-4" | "-gdwarf-5" -> o.debug <- true; o.passthrough <- o.passthrough @ [ a ]
      | "-g0" -> o.debug <- false; o.passthrough <- o.passthrough @ [ a ]
      | "-MF" -> let f = next a in o.deps_file <- Some f; o.passthrough <- o.passthrough @ [ a; f ]
      | "-MT" -> let t = next a in o.deps_target <- Some t; o.passthrough <- o.passthrough @ [ a; t ]
      | _ when String.length a > 7 && String.sub a 0 7 = "--dump=" -> o.dump <- Some (split "--dump="); o.stop_after <- Assemble
+     | "-dumpmachine" ->
+         print_string (Target.name !Target.machine ^ "-unknown-linux-gnu\n"); exit 0
      | "--version" ->
          print_string "occ 0.1 (C11, x86-64 Linux; native preprocess, compile, assemble and link; \
                        gcc for shared objects)\n";

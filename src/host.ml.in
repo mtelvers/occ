@@ -1,0 +1,5 @@
+(* The machine this compiler was built for, which is the one it compiles
+   for unless told otherwise.  Generated at build time from the OCaml
+   compiler's own idea of the architecture, since a compiler that had to
+   be told where it is running would be a nuisance. *)
+let machine = Target.ARCHITECTURE

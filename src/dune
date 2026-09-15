@@ -6,3 +6,17 @@
  (name occ)
  (flags
   (:standard -w +a-4-9-40-41-42-44-45-70 -strict-sequence)))
+
+; The machine this build is for, asked of the OCaml compiler rather than
+; assumed: "amd64" or "riscv" comes back from -config-var, and host.ml is
+; written from it.
+(rule
+ (targets host.ml)
+ (deps host.ml.in)
+ (action
+  (with-stdout-to
+   host.ml
+   (progn
+    (echo "(* Generated from host.ml.in: see the rule in src/dune. *)\n")
+    (bash
+     "arch=$(ocamlopt -config-var architecture); case $arch in riscv*) m=Riscv64;; *) m=Amd64;; esac; sed \"s/Target.ARCHITECTURE/Target.$m/\" host.ml.in")))))
