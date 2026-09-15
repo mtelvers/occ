@@ -225,18 +225,28 @@ let compile o ~src input output =
         |> dump "typed" (fun ppf ((_, tu) : Env.t * Typed.translation_unit) -> Typed_print.translation_unit ppf tu)
         |> (fun (env, tu) -> Lower.program ~source:src env tu)
         |> dump "ir" Ir_print.program
-        |> Select.program ~pic:o.pic ~debug:o.debug (* register allocation happens inside *)
-        |> dump "asm" Emit.program in
+        |> (fun ir ->
+              (* the backend for the machine being compiled for; the two
+                 answer the same three questions and nothing above here
+                 knows which is which *)
+              match !Target.machine with
+              | Target.Amd64 ->
+                  let asm = Amd64.Select.program ~pic:o.pic ~debug:o.debug ir in
+                  fun ppf -> Amd64.Emit.program ppf asm
+              | Target.Riscv64 ->
+                  let asm = Riscv64.Select.program ~pic:o.pic ~debug:o.debug ir in
+                  fun ppf -> Riscv64.Emit.program ppf asm)
+        |> dump "asm" (fun ppf print -> print ppf) in
       Out_channel.with_open_bin output (fun oc ->
           let ppf = Format.formatter_of_out_channel oc in
-          Emit.program ppf asm; Format.pp_print_flush ppf ())
+          asm ppf; Format.pp_print_flush ppf ())
 
 let assemble o input output =
   match mode Assemble with
   | Delegate -> run o delegate_cc ([ "-c" ] @ o.passthrough @ [ input; "-o"; output ])
   | Native ->
       if o.verbose then Printf.eprintf "occas %s -o %s\n" input output;
-      Assemble.files [ input ] output
+      Assembler.Assemble.files [ input ] output
 
 (* Where the C runtime's start files and libraries live.  A static
    executable links crt1.o, crti.o, crtbeginT.o, the objects, then
@@ -299,11 +309,11 @@ let link o objects output =
           if String.length a > 2 && String.sub a 0 2 = "-L" then Some (String.sub a 2 (String.length a - 2)) else None) o.link_args in
       let search = user_dirs @ (match sysroot () with Some d -> [ Filename.concat d "lib" ] | None -> system_lib_dirs ()) in
       let items = List.filter_map (fun a ->
-          if String.length a > 2 && String.sub a 0 2 = "-l" then Some (Link.Library (String.sub a 2 (String.length a - 2)))
-          else if Filename.check_suffix a ".a" then Some (Link.Archive a)
-          else if Filename.check_suffix a ".o" then Some (Link.Object a)
+          if String.length a > 2 && String.sub a 0 2 = "-l" then Some (Linker.Link.Library (String.sub a 2 (String.length a - 2)))
+          else if Filename.check_suffix a ".a" then Some (Linker.Link.Archive a)
+          else if Filename.check_suffix a ".o" then Some (Linker.Link.Object a)
           else None) (objects @ o.link_args) in
-      let crt name = Link.Object (find_file search name) in
+      let crt name = Linker.Link.Object (find_file search name) in
       let kind = link_kind o in
       (* The start files and the compiler's own library differ with the
          kind of output, as they do for gcc: an executable starts at
@@ -313,28 +323,28 @@ let link o objects output =
       let items =
         match kind, sysroot () with
         | _, Some _ ->
-            [ crt "crt1.o"; crt "crti.o" ] @ items @ [ Link.Library "c"; crt "crtn.o" ]
+            [ crt "crt1.o"; crt "crti.o" ] @ items @ [ Linker.Link.Library "c"; crt "crtn.o" ]
         | Static_exe, None ->
             [ crt "crt1.o"; crt "crti.o"; crt "crtbeginT.o" ] @ items
-            @ [ Link.Library "gcc"; Link.Library "gcc_eh"; Link.Library "c"; crt "crtend.o"; crt "crtn.o" ]
+            @ [ Linker.Link.Library "gcc"; Linker.Link.Library "gcc_eh"; Linker.Link.Library "c"; crt "crtend.o"; crt "crtn.o" ]
         | Dynamic_exe, None ->
             [ crt "crt1.o"; crt "crti.o"; crt "crtbegin.o" ] @ items
-            @ [ Link.Library "gcc"; Link.Library "gcc_s"; Link.Library "c";
-                Link.Library "gcc"; Link.Library "gcc_s"; crt "crtend.o"; crt "crtn.o" ]
+            @ [ Linker.Link.Library "gcc"; Linker.Link.Library "gcc_s"; Linker.Link.Library "c";
+                Linker.Link.Library "gcc"; Linker.Link.Library "gcc_s"; crt "crtend.o"; crt "crtn.o" ]
         | Shared_object, None ->
             [ crt "crti.o"; crt "crtbeginS.o" ] @ items
-            @ [ Link.Library "gcc"; Link.Library "gcc_s"; Link.Library "c";
-                Link.Library "gcc"; Link.Library "gcc_s"; crt "crtendS.o"; crt "crtn.o" ] in
+            @ [ Linker.Link.Library "gcc"; Linker.Link.Library "gcc_s"; Linker.Link.Library "c";
+                Linker.Link.Library "gcc"; Linker.Link.Library "gcc_s"; crt "crtendS.o"; crt "crtn.o" ] in
       if o.verbose then prerr_endline ("occld -o " ^ output);
       let rpath = match linker_value o "-rpath" with Some d -> d | None -> "" in
       let soname = match linker_value o "-soname" with Some n -> n | None -> "" in
       match kind with
-      | Static_exe -> Link.link ~output ~entry:(Some "_start") ~search items
+      | Static_exe -> Linker.Link.link ~output ~entry:(Some "_start") ~search items
       | Dynamic_exe ->
-          Link.link ~export_all:true ~prefer_shared:true ~rpath ~output
+          Linker.Link.link ~export_all:true ~prefer_shared:true ~rpath ~output
             ~entry:(Some "_start") ~search items
       | Shared_object ->
-          Link.link ~shared:true ~soname ~prefer_shared:true ~rpath ~output
+          Linker.Link.link ~shared:true ~soname ~prefer_shared:true ~rpath ~output
             ~entry:None ~search items
 
 (* ---- Main --------------------------------------------------------------- *)

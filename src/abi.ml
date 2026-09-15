@@ -1,4 +1,12 @@
-(* Flatten an object into (offset, kind) leaves, then merge per eightbyte. *)
+(* How an aggregate is passed and returned, which is the one part of a
+   calling convention the front end has to know: it decides the shape of
+   the IR for a call before any machine code is in sight.
+
+   The answer is a list of classes, one per eightbyte, and both machines
+   are asked the same question even though their rules differ (x86-64
+   System V 3.2.3; RISC-V calling convention "Hardware floating-point
+   calling convention").  Flatten an object into (offset, kind) leaves,
+   then merge per eightbyte. *)
 type leaf = Int_leaf | Float_leaf | X87_leaf
 
 let rec leaves env (t : Ctype.t) base acc =
@@ -17,7 +25,7 @@ let rec leaves env (t : Ctype.t) base acc =
        | None -> acc)
   | Ctype.Array (_, None) | Ctype.Vla _ | Ctype.Void | Ctype.Func _ -> acc
 
-let classify env (t : Ctype.t) : Ir.cls list =
+let classify_amd64 env (t : Ctype.t) : Ir.cls list =
   let size = Env.size_of env Loc.none t in
   if size > 16 || size = 0 then [ Ir.Memory ]
   else begin
@@ -34,3 +42,8 @@ let classify env (t : Ctype.t) : Ir.cls list =
       Array.to_list classes
     end
   end
+
+let classify env (t : Ctype.t) : Ir.cls list =
+  match !Target.machine with
+  | Target.Amd64 -> classify_amd64 env t
+  | Target.Riscv64 -> classify_amd64 env t   (* replaced when that backend lands *)

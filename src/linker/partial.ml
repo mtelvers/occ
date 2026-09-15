@@ -150,7 +150,7 @@ let load st ~search items =
         let f = match item with Link.Library name -> Link.find_library search name | _ -> f in
         let text = Link.read_file f in
         if String.length text >= 8 && String.sub text 0 8 = "!<arch>\n" then
-          archives := (f, Ar.read text) :: !archives
+          archives := (f, Archiver.Ar.read text) :: !archives
         else if Elf_in.is_object text then add_object st (Elf_in.read f text)
         else List.iter add (Link.script_items text) in
   List.iter add items;
@@ -167,17 +167,17 @@ let load st ~search items =
         end) obj.symbols in
   List.iter note_object st.objects;
   let pending = List.rev_map (fun (name, members) ->
-      (name, Array.of_list (List.map (fun (m : Ar.member) ->
-           (m, Elf_read.exported_symbols m.body, ref false)) members))) !archives in
+      (name, Array.of_list (List.map (fun (m : Archiver.Ar.member) ->
+           (m, Archiver.Elf_read.exported_symbols m.body, ref false)) members))) !archives in
   let changed = ref true in
   while !changed do
     changed := false;
     List.iter (fun (aname, members) ->
-        Array.iter (fun ((m : Ar.member), syms, loaded) ->
+        Array.iter (fun ((m : Archiver.Ar.member), syms, loaded) ->
             if not !loaded && List.exists (fun s -> Hashtbl.mem undefined s) syms then begin
               loaded := true;
               changed := true;
-              let obj = Elf_in.read (Printf.sprintf "%s(%s)" aname m.Ar.name) m.Ar.body in
+              let obj = Elf_in.read (Printf.sprintf "%s(%s)" aname m.Archiver.Ar.name) m.Archiver.Ar.body in
               add_object st obj;
               note_object obj
             end) members) pending

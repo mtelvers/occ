@@ -21,7 +21,7 @@ let () =
     | a :: rest when String.length a > 8 && String.sub a 0 8 = "-soname=" ->
         soname := String.sub a 8 (String.length a - 8); go rest
     | "-L" :: d :: rest -> search := !search @ [ d ]; go rest
-    | "-l" :: l :: rest -> items := Occ.Link.Library l :: !items; go rest
+    | "-l" :: l :: rest -> items := Occ.Linker.Link.Library l :: !items; go rest
     | ("-E" | "--export-dynamic") :: rest -> export_all := true; go rest
     | ("-rpath" | "--rpath" | "-rpath-link") :: d :: rest -> rpath := d; go rest
     | "-static" :: rest -> static := true; go rest
@@ -30,23 +30,23 @@ let () =
          | arg :: rest' when (List.mem (List.hd rest) [ "-z"; "--hash-style"; "-m" ]) -> ignore arg; go rest'
          | _ -> go rest)
     | a :: rest when String.length a > 2 && String.sub a 0 2 = "-L" -> search := !search @ [ String.sub a 2 (String.length a - 2) ]; go rest
-    | a :: rest when String.length a > 2 && String.sub a 0 2 = "-l" -> items := Occ.Link.Library (String.sub a 2 (String.length a - 2)) :: !items; go rest
+    | a :: rest when String.length a > 2 && String.sub a 0 2 = "-l" -> items := Occ.Linker.Link.Library (String.sub a 2 (String.length a - 2)) :: !items; go rest
     | "--version" :: _ -> print_string "occld (occ) 0.1\n"; exit 0
     | a :: _ when String.length a > 0 && a.[0] = '-' -> Printf.eprintf "occld: unknown option %s\n%s" a usage; exit 2
     | a :: rest ->
         items :=
-          (if Filename.check_suffix a ".a" then Occ.Link.Archive a
-           else if Filename.check_suffix a ".so" then Occ.Link.Shared a
-           else Occ.Link.Object a) :: !items;
+          (if Filename.check_suffix a ".a" then Occ.Linker.Link.Archive a
+           else if Filename.check_suffix a ".so" then Occ.Linker.Link.Shared a
+           else Occ.Linker.Link.Object a) :: !items;
         go rest in
   go (List.tl (Array.to_list Sys.argv));
   if !items = [] then begin prerr_string usage; exit 2 end;
   try
-    if !relocatable then Occ.Partial.link ~output:!output ~search:!search (List.rev !items)
+    if !relocatable then Occ.Linker.Partial.link ~output:!output ~search:!search (List.rev !items)
     else if !shared then
-      Occ.Link.link ~shared:true ~soname:!soname ~export_all:true ~rpath:!rpath
+      Occ.Linker.Link.link ~shared:true ~soname:!soname ~export_all:true ~rpath:!rpath
         ~output:!output ~entry:None ~search:!search (List.rev !items)
     else
-      Occ.Link.link ~export_all:!export_all ~prefer_shared:(not !static) ~rpath:!rpath
+      Occ.Linker.Link.link ~export_all:!export_all ~prefer_shared:(not !static) ~rpath:!rpath
         ~output:!output ~entry:(Some !entry) ~search:!search (List.rev !items)
   with Failure msg -> prerr_endline ("occld: " ^ msg); exit 1

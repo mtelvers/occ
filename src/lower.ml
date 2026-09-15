@@ -796,7 +796,7 @@ and inline_asm fn tu (a : T.asm) =
   let strip c = String.of_seq (Seq.filter (fun ch -> ch <> '=' && ch <> '+' && ch <> '&') (String.to_seq c)) in
   let hard (e : T.expr) =
     match e.e with
-    | T.Var s when (match s.asm_name with Some r -> Gas.register_of_name r <> None | None -> false) ->
+    | T.Var s when (match s.asm_name with Some r -> Assembler.Gas.register_of_name r <> None | None -> false) ->
         Some ("{" ^ Option.get s.asm_name ^ "}")
     | _ -> None in
   let register_class c e = match hard e with Some r -> r | None -> c in

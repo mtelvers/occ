@@ -538,9 +538,9 @@ let inline_asm st (a : Ir.asm) =
   let constr = function
     | Ir.Asm_in (c, _, _) | Ir.Asm_out (c, _, _) | Ir.Asm_inout (c, _, _, _) | Ir.Asm_mem (c, _) -> c
     | Ir.Asm_imm _ -> "i" in
-  let named name = match Gas.register_of_name name with
-    | Some { Gas.rclass = Gas.Gpr; rnum; _ } -> Some reg_of_num.(rnum)
-    | Some { Gas.rclass = Gas.Xmm; rnum; _ } -> Some (XMM rnum)
+  let named name = match Assembler.Gas.register_of_name name with
+    | Some { Assembler.Gas.rclass = Assembler.Gas.Gpr; rnum; _ } -> Some reg_of_num.(rnum)
+    | Some { Assembler.Gas.rclass = Assembler.Gas.Xmm; rnum; _ } -> Some (XMM rnum)
     | _ -> None in
   let fixed c =
     match c with

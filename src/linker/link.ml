@@ -287,7 +287,7 @@ let find_library ?(shared = false) search name =
   | None -> error "cannot find -l%s (searched %s)" name (String.concat ", " search)
 
 (* an archive's members with the symbols each defines, read once *)
-type archive = { aname : string; members : (Ar.member * string list) array; loaded : bool array }
+type archive = { aname : string; members : (Archiver.Ar.member * string list) array; loaded : bool array }
 
 (* Some "libraries" are tiny GNU ld scripts naming the real files, such
    as Ubuntu's libm.a: GROUP ( libm-2.39.a libmvec.a ), and its
@@ -338,7 +338,7 @@ let load st ~search items =
         let f = match item with Library name -> find_library ~shared:st.prefer_shared search name | _ -> f in
         let text = read_file f in
         if starts_with "!<arch>\n" text then begin
-          let members = Array.of_list (List.map (fun (m : Ar.member) -> m, Elf_read.exported_symbols m.body) (Ar.read text)) in
+          let members = Array.of_list (List.map (fun (m : Archiver.Ar.member) -> m, Archiver.Elf_read.exported_symbols m.body) (Archiver.Ar.read text)) in
           archives := { aname = f; members; loaded = Array.make (Array.length members) false } :: !archives
         end else if Elf_in.is_object text then add_object st (Elf_in.read f text)
         else if Elf_in.is_shared text then shareds := Elf_in.read_shared f text :: !shareds
@@ -357,7 +357,7 @@ let load st ~search items =
             if not a.loaded.(i) && List.exists needed syms then begin
               a.loaded.(i) <- true;
               changed := true;
-              add_object st (Elf_in.read (Printf.sprintf "%s(%s)" a.aname m.Ar.name) m.Ar.body)
+              add_object st (Elf_in.read (Printf.sprintf "%s(%s)" a.aname m.Archiver.Ar.name) m.Archiver.Ar.body)
             end) a.members) archives
   done;
   (* [shared] What the shared objects offer settles the rest.  Order on

@@ -1,0 +1,46 @@
+(* An abstract syntax for RV64 assembly in the spelling GNU as accepts.
+
+   As on the other machine, the code generator builds this rather than
+   printing strings, so that [Emit] is the only place that knows how the
+   assembler spells things.  What differs from x86-64 is the shape of the
+   machine rather than the shape of this file: every instruction is a
+   fixed 32 bits, the only addressing mode is a register plus a signed
+   twelve-bit offset, and arithmetic is three-address.
+
+   The register names are the ABI's (RISC-V calling convention), not the
+   hardware's x0..x31: sp, ra, a0..a7, t0..t6, s0..s11 read as what they
+   are used for. *)
+
+type reg =
+  (* the integer registers, by their ABI names *)
+  | Zero                        (* x0, always zero *)
+  | RA | SP | GP | TP           (* return address, stack, global, thread *)
+  | T of int                    (* t0..t6, caller-saved scratch *)
+  | S of int                    (* s0..s11, callee-saved *)
+  | A of int                    (* a0..a7, arguments and results *)
+  (* the floating-point registers *)
+  | FT of int                   (* ft0..ft11 *)
+  | FS of int                   (* fs0..fs11 *)
+  | FA of int                   (* fa0..fa7 *)
+
+(* The width an instruction acts on.  RV64 spells these in the mnemonic
+   -- lb, lh, lw, ld -- rather than in a suffix on the operands. *)
+type width = B | H | W | D
+
+(* An instruction's operands.  There is no memory operand in the x86
+   sense: a load or a store names a register and an offset, and nothing
+   else reaches memory. *)
+type operand =
+  | Imm of int64
+  | Reg of reg
+  | Mem of reg * int            (* offset(reg), the offset a signed 12 bits *)
+  | Sym of string * int         (* a symbol and an addend, for %hi/%lo pairs *)
+
+type instr =
+  | Op of string * operand list (* a mnemonic and its operands, source last *)
+  | Label of string
+  | Directive of string * string list
+
+type func = { name : string; body : instr list }
+
+type program = { funcs : func list; data : instr list }

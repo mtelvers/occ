@@ -1,6 +1,6 @@
 ; The compiler proper.  Stdlib only: every dependency joins the trusted base
 ; and the reading list, so there are none.
-(include_subdirs unqualified)
+(include_subdirs qualified)
 
 (library
  (name occ)

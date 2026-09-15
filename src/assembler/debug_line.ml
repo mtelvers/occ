@@ -17,6 +17,14 @@ let line_base = -5 and line_range = 14 and opcode_base = 13
 
 (* The file table splits each name into a directory, numbered by first
    appearance, and a base name; a name with no directory uses entry 0. *)
+(* the position of a name in the list, counting from one, which is how
+   the table numbers its directories *)
+let position name list =
+  let rec go i = function
+    | [] -> 0
+    | x :: rest -> if x = name then i else go (i + 1) rest in
+  go 1 list
+
 let header files =
   let last = List.fold_left (fun m (n, _) -> max m n) 0 files in
   let dirs = ref [] in
@@ -25,7 +33,7 @@ let header files =
       let dir = Filename.dirname name in
       if String.contains name '/' then begin
         if not (List.mem dir !dirs) then dirs := !dirs @ [ dir ];
-        Filename.basename name, 1 + Option.get (List.find_index (( = ) dir) !dirs)
+        Filename.basename name, position dir !dirs
       end else name, 0) in
   let b = Buffer.create 64 in
   Buffer.add_char b '\001';                  (* minimum_instruction_length *)

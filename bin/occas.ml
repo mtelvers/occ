@@ -14,5 +14,5 @@ let () =
     | f :: rest -> inputs := f :: !inputs; go rest in
   go (List.tl (Array.to_list Sys.argv));
   if !inputs = [] then begin prerr_string usage; exit 2 end;
-  try Occ.Assemble.files (List.rev !inputs) !output
+  try Occ.Assembler.Assemble.files (List.rev !inputs) !output
   with Occ.Diag.Error (loc, msg) -> Occ.Diag.report loc msg; exit 1
