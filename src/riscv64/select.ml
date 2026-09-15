@@ -44,7 +44,7 @@ type st = {
   mutable outgoing : int;             (* bytes above sp for arguments that do not fit in registers *)
   mutable fname : string;
   mutable label_count : int;
-  mutable float_consts : (int64 * string) list;
+  mutable float_consts : ((int64 * bool) * string) list;  (* bits and whether four bytes *)
   mutable const_count : int;
   mutable hidden_ptr : int;           (* where the aggregate-return pointer was saved *)
 }
@@ -104,14 +104,21 @@ let store_mnemonic ty =
   | Ir.F32 -> "fsw" | Ir.F64 | Ir.F80 -> "fsd"
   | _ -> "sd"
 
-let float_const st (v : float) =
-  let bits = Int64.bits_of_float v in
-  match List.assoc_opt bits st.float_consts with
+(* A floating-point constant goes in the read-only section and is
+   loaded from there, since the machine has no instruction that takes
+   one.  The width matters: a float is four bytes of its own encoding,
+   not the top half of the double with the same value, and loading four
+   bytes of a double's encoding gives a different number entirely --
+   which is how the tests found this. *)
+let float_const st (ty : Ir.ty) (v : float) =
+  let narrow = ty = Ir.F32 in
+  let bits = if narrow then Int64.of_int32 (Int32.bits_of_float v) else Int64.bits_of_float v in
+  match List.assoc_opt (bits, narrow) st.float_consts with
   | Some l -> l
   | None ->
       st.const_count <- st.const_count + 1;
       let l = Printf.sprintf ".LC%s.%d" st.fname st.const_count in
-      st.float_consts <- (bits, l) :: st.float_consts;
+      st.float_consts <- ((bits, narrow), l) :: st.float_consts;
       l
 
 (* The address of a symbol.  Without position independence that is the
@@ -148,7 +155,7 @@ let load_addr st o dst =
 let load_float st (ty : Ir.ty) (o : Ir.operand) (dst : reg) =
   match o with
   | Ir.Fimm f ->
-      let l = float_const st f in
+      let l = float_const st ty f in
       load_sym st l (T 2);
       op st (load_mnemonic ty true) [ Reg dst; Mem (T 2, 0) ]
   | Ir.Reg r -> op st (load_mnemonic ty true) [ Reg dst; addr st (S 0) (reg_slot st r) (T 2) ]
@@ -593,9 +600,11 @@ let func st (f : Ir.func) : func =
     @ (if f.global then [ Directive ("size", [ f.name; ".-" ^ f.name ]) ] else []) in
   (* the floating-point constants this function needed *)
   let consts =
-    List.concat_map (fun (bits, l) ->
-        [ Directive ("section", [ ".rodata" ]); Directive ("align", [ "3" ]);
-          Label l; Directive ("quad", [ Int64.to_string bits ]) ])
+    List.concat_map (fun ((bits, narrow), l) ->
+        [ Directive ("section", [ ".rodata" ]);
+          Directive ("align", [ if narrow then "2" else "3" ]);
+          Label l;
+          Directive ((if narrow then "word" else "quad"), [ Int64.to_string bits ]) ])
       st.float_consts in
   st.float_consts <- [];
   { name = f.name; body = prologue @ body @ epilogue @ consts }
