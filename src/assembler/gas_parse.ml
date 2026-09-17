@@ -108,10 +108,17 @@ let constant st =
 
 (* ---- Operands ------------------------------------------------------------- *)
 
+(* Registers are named differently on the two machines, and written
+   differently: %rax against a0.  [Gas] holds both tables. *)
+let register_by_name name =
+  match !Target.machine with
+  | Target.Amd64 -> register_of_name name
+  | Target.Riscv64 -> riscv_register_of_name name
+
 let register st name =
-  match register_of_name name with
+  match register_by_name name with
   | Some r -> r
-  | None -> error st "unknown register %%%s" name
+  | None -> error st "unknown register %s" name
 
 (* "(base,index,scale)" with the opening parenthesis already consumed *)
 let addressing st seg disp =
@@ -165,13 +172,61 @@ and memory st seg =
   if accept st LPAREN then addressing st seg disp
   else Mem { seg; disp; base = None; index = None; scale = 1 }
 
+(* RISC-V operands, which are a smaller language than x86's: a register
+   by its bare name, an expression, or the machine's one addressing mode,
+   offset(base).
+
+   A relocation function -- %hi(sym), %pcrel_lo(sym), %tprel_add(sym) --
+   becomes the symbol carrying that name as its modifier, which is how
+   the assembler already says "this symbol, relocated that way".  The
+   lexer reads %hi as a register token, since that is what a % starts on
+   the other machine; here the parenthesis that follows tells it apart.
+
+   A bare word that is not a register is left as an expression: a
+   rounding mode (rtz) and a fence ordering (rw) reach the encoder that
+   way, and it knows which of its mnemonics take one. *)
+let rec rv_operand st =
+  match st.tok with
+  | IDENT name when register_by_name name <> None -> advance st; Reg (register st name)
+  | _ ->
+      let disp = if st.tok = LPAREN then None else Some (rv_expr st) in
+      if accept st LPAREN then begin
+        let base =
+          match st.tok with
+          | IDENT n -> advance st; register st n
+          | _ -> error st "expected a base register" in
+        expect st RPAREN ")";
+        Mem { seg = None; disp; base = Some base; index = None; scale = 1 }
+      end else
+        match disp with Some e -> Imm e | None -> error st "expected an operand"
+
+(* an expression, with the relocation functions recognised in it *)
+and rv_expr st =
+  match st.tok with
+  | REG m ->
+      (* %hi(...) and its relatives: the modifier belongs to the symbol *)
+      advance st;
+      expect st LPAREN "( after a relocation function";
+      let e = expr st in
+      expect st RPAREN ")";
+      let rec attach = function
+        | Sym (name, None) -> Sym (name, Some m)
+        | Bin (op, a, b) -> Bin (op, attach a, b)
+        | Num _ as e when m = "lo" || m = "hi" -> e   (* %hi of a constant *)
+        | _ -> error st "%%%s must name a symbol" m in
+      attach e
+  | _ -> expr st
+
 let operands st =
   match st.tok with
   | NEWLINE | EOF -> []
   | _ ->
+      let one () = match !Target.machine with
+        | Target.Amd64 -> operand st
+        | Target.Riscv64 -> rv_operand st in
       let rec more acc =
-        if accept st COMMA then more (operand st :: acc) else List.rev acc in
-      more [ operand st ]
+        if accept st COMMA then more (one () :: acc) else List.rev acc in
+      more [ one () ]
 
 (* ---- Directives ----------------------------------------------------------- *)
 
@@ -206,6 +261,10 @@ let cfi_register st =
        | Xmm -> 17 + r.rnum
        | Rip -> 16
        | X87 -> 33 + r.rnum
+       (* RISC-V numbers its registers as the hardware does, the
+          floating-point ones following the integer ones *)
+       | Ireg -> r.rnum
+       | Freg -> 32 + r.rnum
        | Segment -> error st "no DWARF number for %%%s" r.rname)
   | _ -> constant st
 
@@ -262,9 +321,13 @@ let directive st name =
       let align = if accept st COMMA then Some (expr st) else None in
       [ Directive (Local s); Directive (Comm (s, size, align)) ]
   | ".byte" -> one (Data (1, expr_list st))
-  | ".word" | ".value" | ".short" | ".2byte" -> one (Data (2, expr_list st))
+  | ".value" | ".short" | ".2byte" | ".half" -> one (Data (2, expr_list st))
+  (* ".word" is two bytes on x86 and four on RISC-V, which is a trap worth
+     naming: the same directive means different widths on the two
+     machines, and gas reads it by the machine it was built for. *)
+  | ".word" -> one (Data ((match !Target.machine with Target.Amd64 -> 2 | Target.Riscv64 -> 4), expr_list st))
   | ".long" | ".int" | ".4byte" -> one (Data (4, expr_list st))
-  | ".quad" | ".8byte" -> one (Data (8, expr_list st))
+  | ".quad" | ".8byte" | ".dword" -> one (Data (8, expr_list st))
   | ".ascii" -> one (Ascii (string_list st))
   | ".asciz" | ".string" -> one (Asciz (string_list st))
   | ".zero" | ".space" | ".skip" ->
@@ -275,7 +338,12 @@ let directive st name =
   | ".sleb128" -> one (Sleb128 (expr_list st))
   | ".align" | ".balign" | ".p2align" ->
       let n = constant st in
-      let n = if name = ".p2align" then 1 lsl n else n in
+      (* ".align" counts bytes on x86 and powers of two on RISC-V, which
+         is why the code generators spell the same alignment differently.
+         ".balign" is always bytes and ".p2align" always a power. *)
+      let n =
+        if name = ".p2align" || (name = ".align" && !Target.machine = Target.Riscv64)
+        then 1 lsl n else n in
       let fill = if accept st COMMA then (if st.tok = COMMA then None else Some (constant st)) else None in
       if accept st COMMA then ignore (constant st);   (* max skip: not honoured *)
       one (Align (n, fill))
@@ -316,6 +384,12 @@ let directive st name =
   | ".cfi_sections" -> while st.tok <> NEWLINE && st.tok <> EOF do advance st done; one (Ignored name)
   | ".ident" -> one (Ident (string_arg st))
   | ".noexecstack" | ".addrsig" | ".addrsig_sym" | ".build_attributes" ->
+      while st.tok <> NEWLINE && st.tok <> EOF do advance st done; one (Ignored name)
+  (* RISC-V.  ".option" chooses between addressing models and turns
+     relaxation on and off, and ".attribute" records which extensions the
+     file was built for; neither changes a byte of what we assemble, since
+     this assembler emits the fixed sequences and never relaxes. *)
+  | ".option" | ".attribute" | ".insn" ->
       while st.tok <> NEWLINE && st.tok <> EOF do advance st done; one (Ignored name)
   | _ -> error st "unknown directive %s" name
 

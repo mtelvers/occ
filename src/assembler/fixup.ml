@@ -51,3 +51,14 @@ type form = { fbytes : string; ffixups : t list; fbits : int }
 let fits_signed bits v =
   bits >= 64 || (let half = Int64.shift_left 1L (bits - 1) in
                  Int64.compare v (Int64.neg half) >= 0 && Int64.compare v half < 0)
+
+(* What an encoder makes of one instruction: bytes with fixups in them,
+   or, for a branch, the two forms to choose between after layout. *)
+type result =
+  | Fixed of string * t list
+  | Relaxable of { short : form; long : form }
+
+(* An instruction neither encoder can make sense of. *)
+exception Bad of string
+
+let bad fmt = Printf.ksprintf (fun s -> raise (Bad s)) fmt

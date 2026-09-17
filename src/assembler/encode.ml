@@ -20,12 +20,12 @@ type fixup = Fixup.t
 (* jmp and jcc to a label in the same section have a 2-byte form with an
    8-bit displacement and a longer form with a 32-bit one; the assembler
    picks after layout ("branch relaxation"). *)
-type encoded =
+type encoded = Fixup.result =
   | Fixed of string * fixup list
   | Relaxable of { short : Fixup.form; long : Fixup.form }
 
-exception Bad of string
-let bad fmt = Printf.ksprintf (fun s -> raise (Bad s)) fmt
+exception Bad = Fixup.Bad
+let bad = Fixup.bad
 
 (* ---- Sizes and condition codes ----------------------------------------- *)
 

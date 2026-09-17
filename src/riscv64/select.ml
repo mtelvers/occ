@@ -677,6 +677,12 @@ let assign_args ?(named = None) ~hidden (args : Ir.arg list) =
             if !ni < 8 then (let p = In_int !ni in incr ni; [ p ])
             else (let p = On_stack !stack in stack := !stack + 8; [ p ])
         | Ir.Scalar (ty, _) when is_float ty && !nf < 8 -> let p = In_float !nf in incr nf; [ p ]
+        (* With the floating-point registers used up, a floating-point
+           value takes an integer register next -- its bits, not its
+           value -- and only when those are gone does it go on the stack.
+           The psABI says so, and gcc puts the ninth of sixteen doubles
+           in a0; a test in OCaml's own suite is what found this. *)
+        | Ir.Scalar (ty, _) when is_float ty && !ni < 8 -> let p = In_int !ni in incr ni; [ p ]
         | Ir.Scalar (ty, _) when not (is_float ty) && !ni < 8 -> let p = In_int !ni in incr ni; [ p ]
         | Ir.Scalar _ -> let p = On_stack !stack in stack := !stack + 8; [ p ]
         | Ir.Aggregate a ->
@@ -1270,6 +1276,11 @@ let func st (f : Ir.func) : func =
           op st "ld" [ Reg (T 0); Mem (S 0, a) ];
           op st "ld" [ Reg (T 1); Mem (S 0, b) ];
           store_wide st r (T 0) (T 1)
+      (* a floating-point value that arrived in an integer register is
+         its bits, so they are put away with an integer store *)
+      | Ir.P_scalar (ty, r), [ In_int i ] when is_float ty ->
+          op st (store_mnemonic (if ty = Ir.F32 then Ir.I32 else Ir.I64))
+            [ Reg (A i); addr st (S 0) (reg_slot st r) (T 2) ]
       | Ir.P_scalar (ty, r), [ In_int i ] -> store st ty r (A i)
       | Ir.P_scalar (ty, r), [ In_float i ] -> store st ty r (FA i)
       | Ir.P_scalar (ty, r), [ On_stack off ] ->

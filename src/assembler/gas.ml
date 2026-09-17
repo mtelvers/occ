@@ -16,6 +16,9 @@ type reg_class =
   | Segment       (* fs, gs: only as segment overrides on memory operands *)
   | Rip           (* only as the base of rip-relative addressing *)
   | X87           (* st, st(0) .. st(7): the FPU register stack *)
+  (* RISC-V, where a register is written by its bare name *)
+  | Ireg          (* x0 .. x31, and the ABI names for them *)
+  | Freg          (* f0 .. f31 *)
 
 type reg = {
   rclass : reg_class;
@@ -162,3 +165,49 @@ let register_of_name name =
 
 (* DWARF register numbers for .cfi directives (System V ABI, figure 3.36) *)
 let dwarf_number_of_gpr = [| 0; 2; 1; 3; 7; 6; 4; 5; 8; 9; 10; 11; 12; 13; 14; 15 |]
+
+(* ---- The RISC-V register table -------------------------------------------- *)
+
+(* Both namings are accepted, as gas accepts them: the hardware's x0..x31
+   and f0..f31, and the ABI's, which is what assembly is actually written
+   in (RISC-V calling convention, register convention tables).  The
+   number is the hardware's either way, since that is what the encoding
+   holds. *)
+
+let riscv_ireg_names = [|
+  "zero"; "ra"; "sp"; "gp"; "tp"; "t0"; "t1"; "t2";
+  "s0"; "s1"; "a0"; "a1"; "a2"; "a3"; "a4"; "a5";
+  "a6"; "a7"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7";
+  "s8"; "s9"; "s10"; "s11"; "t3"; "t4"; "t5"; "t6";
+|]
+
+let riscv_freg_names = [|
+  "ft0"; "ft1"; "ft2"; "ft3"; "ft4"; "ft5"; "ft6"; "ft7";
+  "fs0"; "fs1"; "fa0"; "fa1"; "fa2"; "fa3"; "fa4"; "fa5";
+  "fa6"; "fa7"; "fs2"; "fs3"; "fs4"; "fs5"; "fs6"; "fs7";
+  "fs8"; "fs9"; "fs10"; "fs11"; "ft8"; "ft9"; "ft10"; "ft11";
+|]
+
+let riscv_register_of_name name =
+  let numbered prefix names rclass =
+    let lp = String.length prefix in
+    if String.length name > lp && String.sub name 0 lp = prefix then
+      match int_of_string_opt (String.sub name lp (String.length name - lp)) with
+      | Some n when n >= 0 && n < 32 -> ignore names; Some { rclass; rnum = n; rwidth = 64; rname = name }
+      | _ -> None
+    else None in
+  let by_abi names rclass =
+    let found = ref None in
+    Array.iteri (fun n s -> if s = name then found := Some { rclass; rnum = n; rwidth = 64; rname = name }) names;
+    !found in
+  match by_abi riscv_ireg_names Ireg with
+  | Some r -> Some r
+  | None ->
+      match by_abi riscv_freg_names Freg with
+      | Some r -> Some r
+      | None ->
+          (* "fp" is another name for s0, the frame pointer *)
+          if name = "fp" then Some { rclass = Ireg; rnum = 8; rwidth = 64; rname = name }
+          else match numbered "x" riscv_ireg_names Ireg with
+            | Some r -> Some r
+            | None -> numbered "f" riscv_freg_names Freg
