@@ -68,7 +68,13 @@ let cie out signal =
 (* the call frame instructions of one frame *)
 let instructions ~offset f =
   let b = Buffer.create 32 in
-  let loc = ref (offset f.start) and cfa = ref 8 and stack = ref [] in
+  (* The canonical frame address's offset at entry, which is where
+     ".cfi_adjust_cfa_offset" counts from: on x86-64 the call pushed the
+     return address, so it is already eight bytes past the stack
+     pointer, and on RISC-V nothing was pushed. *)
+  let loc = ref (offset f.start)
+  and cfa = ref (match !Target.machine with Target.Amd64 -> 8 | Target.Riscv64 -> 0)
+  and stack = ref [] in
   let advance pos =
     let d = pos - !loc in
     if d < 0 then failwith "cfi directive before its function";
@@ -79,6 +85,21 @@ let instructions ~offset f =
       else begin Buffer.add_char b '\004'; Leb.u32 b d end
     end;
     loc := pos in
+  (* The frame address's offset from the stack pointer.  It is normally
+     positive and DW_CFA_def_cfa_offset takes it unsigned -- but a
+     function with two exits adjusts down once per exit while adjusting
+     up once, so the running offset can go below zero, and then the
+     signed factored form is the one that can say it.  gas writes
+     DW_CFA_def_cfa_offset_sf there too; OCaml's runtime/riscv.S is where
+     this turns up. *)
+  let def_cfa_offset n =
+    let align = (machine_cie ()).data_align in
+    if n >= 0 && n mod align = 0 then begin Buffer.add_char b '\x0e'; Leb.uleb b n end
+    else begin
+      (* DW_CFA_def_cfa_offset_sf, whose operand is factored by the data
+         alignment (DWARF 4, 6.4.2.2) *)
+      Buffer.add_char b '\x13'; Leb.sleb b (n / align)
+    end in
   let saved_at reg off =
     (* DW_CFA_offset with the factored offset when it is a non-negative
        multiple of the data alignment, else the signed extended form *)
@@ -92,8 +113,8 @@ let instructions ~offset f =
       | Cfi_startproc _ | Cfi_endproc | Cfi_signal_frame -> ()
       | Cfi_def_cfa (r, off) -> Buffer.add_char b '\x0c'; Leb.uleb b r; Leb.uleb b off; cfa := off
       | Cfi_def_cfa_register r -> Buffer.add_char b '\x0d'; Leb.uleb b r
-      | Cfi_def_cfa_offset n -> Buffer.add_char b '\x0e'; Leb.uleb b n; cfa := n
-      | Cfi_adjust_cfa_offset n -> cfa := !cfa + n; Buffer.add_char b '\x0e'; Leb.uleb b !cfa
+      | Cfi_def_cfa_offset n -> def_cfa_offset n; cfa := n
+      | Cfi_adjust_cfa_offset n -> cfa := !cfa + n; def_cfa_offset !cfa
       | Cfi_offset (r, off) -> saved_at r off
       | Cfi_rel_offset (r, off) -> saved_at r (off - !cfa)
       | Cfi_restore r -> if r < 64 then Buffer.add_char b (Char.chr (0xc0 lor r)) else begin Buffer.add_char b '\x06'; Leb.uleb b r end

@@ -185,11 +185,27 @@ and memory st seg =
    A bare word that is not a register is left as an expression: a
    rounding mode (rtz) and a fence ordering (rw) reach the encoder that
    way, and it knows which of its mnemonics take one. *)
+(* Does the "(" ahead start this machine's one addressing mode, or a
+   parenthesised expression?  Only a register followed by ")" is an
+   address, which is what tells "(t0)" from the "(8*field)" that the
+   OCaml runtime's assembly writes before one. *)
+let rv_addressing_ahead st =
+  st.tok = LPAREN && begin
+    let saved = Gas_lex.save st.lx and tok = st.tok in
+    advance st;
+    let yes =
+      (match st.tok with
+       | IDENT name when register_by_name name <> None -> advance st; st.tok = RPAREN
+       | _ -> false) in
+    Gas_lex.restore st.lx saved; st.tok <- tok;
+    yes
+  end
+
 let rec rv_operand st =
   match st.tok with
   | IDENT name when register_by_name name <> None -> advance st; Reg (register st name)
   | _ ->
-      let disp = if st.tok = LPAREN then None else Some (rv_expr st) in
+      let disp = if rv_addressing_ahead st then None else Some (rv_expr st) in
       if accept st LPAREN then begin
         let base =
           match st.tok with
@@ -427,6 +443,10 @@ let statement st =
   | _ -> error st "expected a statement"
 
 let parse file text =
+  (* Macros are expanded before anything is parsed, as gas does it, so
+     that a macro may hold labels, directives and instructions alike
+     without the parser knowing they exist ([Gas_macro]). *)
+  let text = if String.length text > 0 then Gas_macro.expand text else text in
   let lx = Gas_lex.make file text in
   let st = { lx; tok = EOF; pending_prefixes = []; numeric = Hashtbl.create 8 } in
   advance st;
