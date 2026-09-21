@@ -23,6 +23,7 @@ type field =
   | Rv_branch             (* B-type: a signed thirteen-bit displacement *)
   | Rv_jal                (* J-type: a signed twenty-one-bit displacement *)
   | Rv_call               (* auipc and jalr together: the pair takes one relocation *)
+  | Rv_none               (* a relocation that names an instruction and changes no bits *)
 
 type t = {
   at : int;              (* offset of the field within the instruction *)

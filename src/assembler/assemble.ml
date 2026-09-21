@@ -300,7 +300,10 @@ let statement st (l : line) =
   | Directive d -> directive st d
   | Instruction i ->
       let i = { i with operands = List.map (substitute_operand st) i.operands } in
-      (match Encode.instruction i with
+      let encode = match !Target.machine with
+        | Target.Amd64 -> Encode.instruction
+        | Target.Riscv64 -> Encode_riscv.instruction in
+      (match encode i with
        | Encode.Fixed (bytes, fixups) -> add_chunk st (Bytes (bytes, fixups, st.line))
        | Encode.Relaxable { short; long } ->
            let target = match short.Fixup.ffixups with f :: _ -> f.Fixup.target | [] -> assert false in
@@ -499,6 +502,10 @@ let generate_debug st =
 type resolved =
   | Value of int64
   | Reloc of int * [ `Sym of symbol | `Section of section ] * int64   (* type, against, addend *)
+  (* RISC-V both fills in a displacement it can work out and relocates
+     it, since the linker may move things about afterwards; gas does the
+     same, and the relocation overwrites the field with the same value. *)
+  | Value_and_reloc of int64 * int * [ `Sym of symbol | `Section of section ] * int64
 
 let reloc_type st ~modifier ~pcrel ~size ~signed ~branch ~relaxable ~rex =
   let open Elf in
@@ -518,11 +525,24 @@ let reloc_type st ~modifier ~pcrel ~size ~signed ~branch ~relaxable ~rex =
    mergeable sections, whose contents the linker may rearrange. *)
 let against st rtype (sy : symbol) =
   let open Elf in
-  let per_symbol = List.mem rtype [ r_x86_64_plt32; r_x86_64_gotpcrel; r_x86_64_gotpcrelx; r_x86_64_rex_gotpcrelx;
-                                    r_x86_64_gottpoff; r_x86_64_tpoff32 ] in
+  let per_symbol =
+    match !Target.machine with
+    | Target.Amd64 ->
+        List.mem rtype [ r_x86_64_plt32; r_x86_64_gotpcrel; r_x86_64_gotpcrelx; r_x86_64_rex_gotpcrelx;
+                         r_x86_64_gottpoff; r_x86_64_tpoff32 ]
+    (* RISC-V names the symbol itself, always.  It has to: a PCREL_LO12
+       is paired with its PCREL_HI20 by the address of the label between
+       them, and a relaxing linker moves code about, so a relocation
+       reduced to a section and an offset would no longer say what it
+       meant.  gas keeps the local labels in the symbol table for it. *)
+    | Target.Riscv64 -> true in
   (* a symbol referenced through a TLS relocation is a TLS symbol, and the
      linker checks that its definition agrees *)
-  if rtype = r_x86_64_gottpoff || rtype = r_x86_64_tpoff32 then sy.typ <- stt_tls;
+  if List.mem rtype [ r_x86_64_gottpoff; r_x86_64_tpoff32 ] && !Target.machine = Target.Amd64 then sy.typ <- stt_tls;
+  if !Target.machine = Target.Riscv64
+     && List.mem rtype [ r_riscv_tls_got_hi20; r_riscv_tls_gd_hi20; r_riscv_tprel_hi20;
+                         r_riscv_tprel_lo12_i; r_riscv_tprel_lo12_s; r_riscv_tprel_add ]
+  then sy.typ <- stt_tls;
   match sy.def with
   | At (sec, i) when not per_symbol && sec.flags land shf_merge = 0
                      && sy.binding <> Some Elf.stb_global && sy.binding <> Some Elf.stb_weak ->
@@ -541,11 +561,24 @@ let against st rtype (sy : symbol) =
 let resolve st (sec : section) ~pos ~base ~rex ?(relaxed = false) (f : fixup) =
   let v = eval st f.target in
   let modifier = modifier_of f.target in
-  let rtype () = reloc_type st ~modifier ~pcrel:f.pcrel ~size:f.size ~signed:f.signed ~branch:f.branch ~relaxable:f.relaxable ~rex in
+  let rtype () =
+    match !Target.machine with
+    | Target.Riscv64 ->
+        (try Encode_riscv.reloc_type ~field:f.field ~modifier ~size:f.size ~pcrel:f.pcrel
+         with Fixup.Bad m -> error st "%s" m)
+    | Target.Amd64 ->
+        reloc_type st ~modifier ~pcrel:f.pcrel ~size:f.size ~signed:f.signed
+          ~branch:f.branch ~relaxable:f.relaxable ~rex in
   let is_global (sy : symbol) = sy.binding = Some Elf.stb_global || sy.binding = Some Elf.stb_weak in
   (* may a same-section pc-relative reference be resolved here? *)
   let resolvable sy = match modifier with
-    | None -> relaxed || not (is_global sy)
+    | None ->
+        (* On RISC-V a call is a pair of instructions the linker fills in
+           together, so it keeps its relocation even when the target is
+           in reach; a branch or a jump does not. *)
+        (match !Target.machine, f.field with
+         | Target.Riscv64, Fixup.Rv_call -> false
+         | _ -> relaxed || not (is_global sy))
     | Some ("PLT" | "plt") -> not (is_global sy)
     | Some _ -> false in
   match v.sym, v.minus with
@@ -553,16 +586,45 @@ let resolve st (sec : section) ~pos ~base ~rex ?(relaxed = false) (f : fixup) =
   | Some sy, None ->
       (match offset_of sy with
        | Some (sec', off) when f.pcrel && sec' == sec && resolvable sy ->
-           Value (Int64.add v.addend (Int64.of_int (off - base)))
+           let value = Int64.add v.addend (Int64.of_int (off - base)) in
+           (match !Target.machine with
+            | Target.Amd64 -> Value value
+            | Target.Riscv64 ->
+                let rtype = rtype () in
+                let target, extra = against st rtype sy in
+                Value_and_reloc (value, rtype, target, Int64.add v.addend extra))
        | _ ->
            let rtype = rtype () in
            let target, extra = against st rtype sy in
            let addend = if f.pcrel then Int64.sub v.addend (Int64.of_int (base - pos)) else v.addend in
-           Reloc (rtype, target, Int64.add addend extra))
+           let addend = Int64.add addend extra in
+           (match !Target.machine with
+            | Target.Amd64 -> Reloc (rtype, target, addend)
+            | Target.Riscv64 ->
+                (* gas writes into the field the value the relocation
+                   would give if the symbol were at address zero, and
+                   lets the linker overwrite it.  A field that is paired
+                   with another instruction's -- a %pcrel_lo, which is
+                   computed from the auipc it belongs to rather than from
+                   here -- is left alone, since nothing at this point can
+                   work it out. *)
+                match f.field, modifier with
+                (* a call is the one pc-relative field gas leaves alone:
+                   the linker fills in both halves of the pair together *)
+                | Fixup.Rv_call, _ -> Reloc (rtype, target, addend)
+                | (Fixup.Rv_branch | Fixup.Rv_jal), _ ->
+                    Value_and_reloc (Int64.sub v.addend (Int64.of_int base), rtype, target, addend)
+                | (Fixup.Rv_hi20 | Fixup.Rv_lo12_i | Fixup.Rv_lo12_s),
+                  (None | Some ("hi" | "lo" | "HI" | "LO")) ->
+                    Value_and_reloc (v.addend, rtype, target, addend)
+                | _ -> Reloc (rtype, target, addend)))
   | Some sy, Some (msec, moff) ->
       if msec != sec then error st "difference of addresses in different sections";
-      let target, extra = against st Elf.r_x86_64_pc32 sy in
-      Reloc (Elf.r_x86_64_pc32, target, Int64.add (Int64.add v.addend (Int64.of_int (pos - moff))) extra)
+      let pcrel32 = match !Target.machine with
+        | Target.Amd64 -> Elf.r_x86_64_pc32
+        | Target.Riscv64 -> Elf.r_riscv_32_pcrel in
+      let target, extra = against st pcrel32 sy in
+      Reloc (pcrel32, target, Int64.add (Int64.add v.addend (Int64.of_int (pos - moff))) extra)
   | None, Some _ -> error st "negative address in expression"
 
 (* gas's multi-byte nops for padding in code sections *)
@@ -572,15 +634,23 @@ let nops = [|
   "\x66\x2e\x0f\x1f\x84\x00\x00\x00\x00\x00"; "\x66\x66\x2e\x0f\x1f\x84\x00\x00\x00\x00\x00" |]
 
 let padding (sec : section) n fill =
-  match fill with
-  | Some f -> String.make n (Char.chr (f land 0xff))
-  | None when sec.flags land Elf.shf_execinstr <> 0 ->
+  match fill, !Target.machine with
+  | Some f, _ -> String.make n (Char.chr (f land 0xff))
+  | None, Target.Amd64 when sec.flags land Elf.shf_execinstr <> 0 ->
       let b = Buffer.create n in
       let rest = ref n in
       while !rest > 11 do Buffer.add_string b nops.(10); rest := !rest - 11 done;
       if !rest > 0 then Buffer.add_string b nops.(!rest - 1);
       Buffer.contents b
-  | None -> String.make n '\000'
+  | None, Target.Riscv64 when sec.flags land Elf.shf_execinstr <> 0 ->
+      (* whole nop instructions where they fit; a remainder too small to
+         hold one is zeros, which cannot be reached anyway *)
+      let b = Buffer.create n in
+      let rest = ref n in
+      while !rest >= 4 do Buffer.add_string b "\x13\x00\x00\x00"; rest := !rest - 4 done;
+      Buffer.add_string b (String.make !rest '\000');
+      Buffer.contents b
+  | None, _ -> String.make n '\000'
 
 let patch bytes at size v =
   for i = 0 to size - 1 do
@@ -595,6 +665,15 @@ let check_fits st size signed v =
     | 2, _ -> v >= -32768L && v <= 65535L
     | _ -> v >= -128L && v <= 255L in
   if not ok then error st "value %Ld does not fit in %d bytes" v size
+
+(* A value the assembler worked out for itself, put where the fixup says.
+   Whole bytes are the usual case; a RISC-V instruction has the value
+   scattered across its fields, and the encoder that knows the formats
+   does that and checks the reach. *)
+let store_value st bytes (f : fixup) v =
+  match f.field with
+  | Fixup.Whole -> check_fits st f.size f.signed v; patch bytes f.at f.size v
+  | field -> (try Encode_riscv.patch bytes f.at field v with Fixup.Bad m -> error st "%s" m)
 
 (* the bytes of a section and its relocations *)
 let section_body st (sec : section) =
@@ -611,8 +690,11 @@ let section_body st (sec : section) =
           let bytes = Bytes.of_string s in
           List.iter (fun (f : fixup) ->
               match resolve st sec ~pos:(off + f.at) ~base:(off + f.pcbase) ~rex:(has_rex bytes f.at) f with
-              | Value v -> check_fits st f.size f.signed v; patch bytes f.at f.size v
-              | Reloc (t, target, addend) -> relocs := (off + f.at, t, target, addend) :: !relocs) fixups;
+              | Value v -> store_value st bytes f v
+              | Reloc (t, target, addend) -> relocs := (off + f.at, t, target, addend) :: !relocs
+              | Value_and_reloc (v, t, target, addend) ->
+                  store_value st bytes f v;
+                  relocs := (off + f.at, t, target, addend) :: !relocs) fixups;
           Buffer.add_bytes body bytes
       | Branch b ->
           st.line <- b.bline;
@@ -620,8 +702,11 @@ let section_body st (sec : section) =
           let bytes = Bytes.of_string form.Fixup.fbytes in
           List.iter (fun (f : Fixup.t) ->
               match resolve st sec ~pos:(off + f.at) ~base:(off + f.pcbase) ~rex:false ~relaxed:true f with
-              | Value v -> check_fits st f.size f.signed v; patch bytes f.at f.size v
-              | Reloc (t, target, addend) -> relocs := (off + f.at, t, target, addend) :: !relocs)
+              | Value v -> store_value st bytes f v
+              | Reloc (t, target, addend) -> relocs := (off + f.at, t, target, addend) :: !relocs
+              | Value_and_reloc (v, t, target, addend) ->
+                  store_value st bytes f v;
+                  relocs := (off + f.at, t, target, addend) :: !relocs)
             form.Fixup.ffixups;
           Buffer.add_bytes body bytes) sec.arr;
   Buffer.contents body, List.rev !relocs
@@ -630,6 +715,33 @@ let section_body st (sec : section) =
 
 let is_local_label name = starts_with ".L" name
 
+(* The instruction set the RISC-V objects we make belong to: the base
+   integer set with multiplication, atomics and both floating-point
+   widths, at the versions this machine's binutils names them by.  It
+   goes in two places -- the ".riscv.attributes" section, which the
+   linker reads to check that what it is joining agrees, and a symbol
+   marking the start of each code section for the disassembler -- and it
+   is the string gas writes when it is told nothing else. *)
+let riscv_arch = "rv64i2p0_m2p0_a2p0_f2p0_d2p0_zmmul1p0"
+
+(* the section as the psABI describes it: a format byte, then one
+   vendor sub-section holding one file attribute, the architecture *)
+let riscv_attributes () =
+  let b = Buffer.create 64 in
+  let tag = Buffer.create 48 in
+  Buffer.add_char tag '\001';                     (* Tag_File *)
+  let body = Buffer.create 48 in
+  Buffer.add_char body '\005';                    (* Tag_RISCV_arch *)
+  Buffer.add_string body riscv_arch;
+  Buffer.add_char body '\000';
+  Elf.add_u32 tag (Buffer.length body + 5);       (* the sub-section's own length *)
+  Buffer.add_buffer tag body;
+  Buffer.add_char b 'A';                          (* the format version *)
+  Elf.add_u32 b (Buffer.length tag + 4 + 6);
+  Buffer.add_string b "riscv\000";
+  Buffer.add_buffer b tag;
+  Buffer.contents b
+
 let run file text =
   let lines = Gas_parse.parse file text in
   let text_section = new_section ".text" (Elf.shf_alloc lor Elf.shf_execinstr) Elf.sht_progbits in
@@ -637,9 +749,22 @@ let run file text =
              symbol_order = []; current = text_section; previous = None; files = []; file_symbol = None;
              frame = None; counter = 0; line = 0 } in
   Hashtbl.replace st.sections ".text" text_section;
+  (* RISC-V marks each code section with the instruction set its
+     contents belong to, so that a disassembler knows how to read them;
+     gas writes the symbol first, before anything the file says. *)
+  if !Target.machine = Target.Riscv64 then define_label st ("$x" ^ riscv_arch);
   (* pass 1 *)
   List.iter (statement st) lines;
   if st.frame <> None then error st "missing .cfi_endproc";
+  if !Target.machine = Target.Riscv64 then begin
+    let sec = find_section st ".riscv.attributes" in
+    sec.typ <- 0x70000003;                        (* SHT_RISCV_ATTRIBUTES *)
+    sec.flags <- 0;
+    let saved = st.current in
+    st.current <- sec;
+    add_chunk st (Bytes (riscv_attributes (), [], 0));
+    st.current <- saved
+  end;
   (* pass 2 *)
   let sections = List.rev st.section_order in
   List.iter (layout st) sections;
@@ -648,10 +773,20 @@ let run file text =
   let sections = List.rev st.section_order in
   (* pass 4: bodies and relocations first, since they mark referenced symbols *)
   let bodies = List.map (fun (sec : section) -> sec, section_body st sec) sections in
-  (* like gas, a file using the GOT declares _GLOBAL_OFFSET_TABLE_, which the linker defines *)
+  (* Like gas, a file using the GOT declares _GLOBAL_OFFSET_TABLE_, which
+     the linker defines.  The test has to know which machine's numbers it
+     is reading, and not only because the lists differ: RISC-V's
+     PCREL_HI20 is 23, which is x86-64's TPOFF32, so a file that merely
+     took the address of a local symbol was declaring a global offset
+     table it never used. *)
+  let got_relocs = match !Target.machine with
+    | Target.Amd64 ->
+        Elf.[ r_x86_64_gotpcrel; r_x86_64_gotpcrelx; r_x86_64_rex_gotpcrelx; r_x86_64_gottpoff; r_x86_64_tpoff32 ]
+    (* RISC-V declares nothing: the relocation names the table, and gas
+       leaves no _GLOBAL_OFFSET_TABLE_ in an object that reads it *)
+    | Target.Riscv64 -> [] in
   let uses_got = List.exists (fun (_, (_, relocs)) ->
-      List.exists (fun (_, t, _, _) ->
-          List.mem t Elf.[ r_x86_64_gotpcrel; r_x86_64_gotpcrelx; r_x86_64_rex_gotpcrelx; r_x86_64_gottpoff; r_x86_64_tpoff32 ]) relocs) bodies in
+      List.exists (fun (_, t, _, _) -> List.mem t got_relocs) relocs) bodies in
   if uses_got then begin
     let sy = symbol st "_GLOBAL_OFFSET_TABLE_" in
     if sy.def = Undefined then sy.referenced <- true

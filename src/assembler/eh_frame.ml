@@ -6,8 +6,11 @@
    call frame instructions interleaved with DW_CFA_advance_loc, computed
    from the distance between the labels at which the directives appeared.
    All FDEs share one Common Information Entry describing the initial
-   state at function entry: the CFA is rsp+8 and the return address is at
-   CFA-8.  Signal frames get a second CIE whose augmentation carries "S". *)
+   state at function entry, which is the machine's: on x86-64 the call
+   pushed the return address, so the CFA is rsp+8 and the address is at
+   CFA-8; on RISC-V nothing was pushed -- the CFA is sp and the return
+   address is in ra -- so the entry says only which register the CFA is.
+   Signal frames get a second CIE whose augmentation carries "S". *)
 
 open Gas
 
@@ -20,6 +23,22 @@ type frame = {
 
 let dw_eh_pe_pcrel_sdata4 = 0x1b
 
+(* What the machine puts in the CIE.  The data alignment factor is the
+   unit the register-save offsets are counted in, which is the size of
+   what a push or a store moves: eight bytes on x86-64, four on RISC-V.
+   The version and the initial instructions are what each machine's gas
+   writes, measured. *)
+type machine_cie = { version : char; data_align : int; ret_column : int; initial : string }
+
+let machine_cie () =
+  match !Target.machine with
+  | Target.Amd64 ->
+      { version = '\001'; data_align = -8; ret_column = 16;
+        initial = "\x0c\x07\x08" (* DW_CFA_def_cfa rsp, 8 *) ^ "\x90\x01" (* DW_CFA_offset rip, cfa-8 *) }
+  | Target.Riscv64 ->
+      { version = '\003'; data_align = -4; ret_column = 1;
+        initial = "\x0d\x02" (* DW_CFA_def_cfa_register sp *) }
+
 (* Entries are padded with DW_CFA_nop to 4 bytes, except the last FDE,
    which gas pads to the address size; matching that keeps the sections
    byte-identical. *)
@@ -29,16 +48,16 @@ let align_up n a = (n + a - 1) / a * a
 (* A CIE for the given augmentation; returns its offset in the section. *)
 let cie out signal =
   let start = Buffer.length out in
+  let m = machine_cie () in
   let b = Buffer.create 32 in
-  Buffer.add_char b '\001';                         (* version *)
+  Buffer.add_char b m.version;
   Buffer.add_string b (if signal then "zRS\000" else "zR\000");
   Leb.uleb b 1;                                     (* code alignment factor *)
-  Leb.sleb b (-8);                                  (* data alignment factor *)
-  Leb.uleb b 16;                                    (* return address register: rip *)
+  Leb.sleb b m.data_align;
+  Leb.uleb b m.ret_column;                          (* the return address's register *)
   Leb.uleb b 1;                                     (* augmentation data length *)
   Buffer.add_char b (Char.chr dw_eh_pe_pcrel_sdata4);
-  Buffer.add_string b "\x0c\x07\x08";               (* DW_CFA_def_cfa rsp, 8 *)
-  Buffer.add_string b "\x90\x01";                   (* DW_CFA_offset rip, cfa-8 *)
+  Buffer.add_string b m.initial;
   let finish = align_up (start + 4 + 4 + Buffer.length b) 4 in
   Leb.u32 out (finish - start - 4);                 (* length: everything after this field *)
   Leb.u32 out 0;                                    (* CIE id *)
@@ -64,7 +83,7 @@ let instructions ~offset f =
     (* DW_CFA_offset with the factored offset when it is a non-negative
        multiple of the data alignment, else the signed extended form *)
     if off mod 8 <> 0 then failwith "cfi offset is not a multiple of 8";
-    let factored = off / -8 in
+    let factored = off / (machine_cie ()).data_align in
     if factored >= 0 && reg < 64 then begin Buffer.add_char b (Char.chr (0x80 lor reg)); Leb.uleb b factored end
     else begin Buffer.add_char b '\x11'; Leb.uleb b reg; Leb.sleb b factored end in
   List.iter (fun (label, op) ->

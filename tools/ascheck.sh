@@ -6,6 +6,13 @@
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 OCCAS="$HERE/_build/default/bin/occas.exe"
+# The flags gas needs to be the same assembler as ours: sixty-four bits on
+# x86-64, and no relaxation on RISC-V, since occas emits the fixed
+# sequences and no R_RISCV_RELAX (see doc/riscv.md).
+case $(uname -m) in
+  riscv64) ASFLAGS=${ASFLAGS:--mno-relax};;
+  *) ASFLAGS=${ASFLAGS:---64};;
+esac
 tmp=$(mktemp -d)
 n=0; fail=0
 # named sections with file content (not NOBITS, not empty), except the tables
@@ -26,7 +33,8 @@ symbols() {
 for d in "$@"; do
   for f in $(find "$d" -name '*.s' | sort); do
     n=$((n+1))
-    as --64 "$f" -o "$tmp/ref.o" 2>/dev/null || { echo "SKIP (gas rejects) $f"; continue; }
+    # shellcheck disable=SC2086
+    as $ASFLAGS "$f" -o "$tmp/ref.o" 2>/dev/null || { echo "SKIP (gas rejects) $f"; continue; }
     if ! "$OCCAS" "$f" -o "$tmp/occ.o" 2>"$tmp/err"; then
       fail=$((fail+1)); echo "FAIL (occas error) $f: $(head -1 "$tmp/err")"; continue
     fi

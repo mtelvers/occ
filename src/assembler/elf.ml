@@ -23,6 +23,20 @@ and r_x86_64_32 = 10 and r_x86_64_32s = 11 and r_x86_64_16 = 12 and r_x86_64_pc1
 and r_x86_64_8 = 14 and r_x86_64_pc8 = 15 and r_x86_64_gottpoff = 22 and r_x86_64_tpoff32 = 23
 and r_x86_64_pc64 = 24 and r_x86_64_gotpcrelx = 41 and r_x86_64_rex_gotpcrelx = 42
 
+(* RISC-V relocation types (the psABI's "Relocations" table).  R_RISCV_ADD*
+   and R_RISCV_SUB* come in pairs and are what a difference of two labels
+   in the frame and debug tables becomes; R_RISCV_RELAX marks a place the
+   linker may shorten, which this assembler never asks for. *)
+let r_riscv_32 = 1 and r_riscv_64 = 2 and r_riscv_branch = 16 and r_riscv_jal = 17
+and r_riscv_call_plt = 19 and r_riscv_got_hi20 = 20 and r_riscv_tls_got_hi20 = 21
+and r_riscv_tls_gd_hi20 = 22 and r_riscv_pcrel_hi20 = 23
+and r_riscv_pcrel_lo12_i = 24 and r_riscv_pcrel_lo12_s = 25
+and r_riscv_hi20 = 26 and r_riscv_lo12_i = 27 and r_riscv_lo12_s = 28
+and r_riscv_tprel_hi20 = 29 and r_riscv_tprel_lo12_i = 30
+and r_riscv_tprel_lo12_s = 31 and r_riscv_tprel_add = 32
+and r_riscv_add32 = 35 and r_riscv_add64 = 36 and r_riscv_sub32 = 39 and r_riscv_sub64 = 40
+and r_riscv_relax = 51 and r_riscv_32_pcrel = 57
+
 (* ---- Little-endian encoding ------------------------------------------------ *)
 
 let add_u8 b v = Buffer.add_char b (Char.chr (v land 0xff))
@@ -110,13 +124,18 @@ let write sections =
   Buffer.add_string out "\x7fELF\x02\x01\x01\x00";   (* magic, 64-bit, little-endian, version 1, System V *)
   Buffer.add_string out (String.make 8 '\000');
   add_u16 out 1;          (* e_type: ET_REL *)
-  add_u16 out 62;         (* e_machine: EM_X86_64 *)
+  add_u16 out (match !Target.machine with Target.Amd64 -> 62 | Target.Riscv64 -> 243);
+                          (* e_machine: EM_X86_64 or EM_RISCV *)
   add_u32 out 1;          (* e_version *)
   add_u64 out 0L;         (* e_entry *)
   add_u64 out 0L;         (* e_phoff *)
   let shoff_pos = Buffer.length out in
   add_u64 out 0L;         (* e_shoff: patched below *)
-  add_u32 out 0;          (* e_flags *)
+  (* e_flags.  RISC-V records the floating-point ABI the file was built
+     for, and the linker refuses to mix two that disagree: 0x4 is the
+     double-precision one this compiler targets.  Bit 0 would say the
+     file contains compressed instructions, which none of ours do. *)
+  add_u32 out (match !Target.machine with Target.Amd64 -> 0 | Target.Riscv64 -> 0x4);
   add_u16 out 64;         (* e_ehsize *)
   add_u16 out 0; add_u16 out 0;   (* e_phentsize, e_phnum *)
   add_u16 out 64;         (* e_shentsize *)
