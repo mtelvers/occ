@@ -86,6 +86,7 @@ type state = {
   mutable counter : int;
   mutable line : int;
   mutable pic : bool;                   (* RISC-V ".option pic": what "la" means *)
+  mutable has_code : bool;              (* an instruction was assembled, so the file holds code *)
 }
 
 let error st fmt = Diag.error { Loc.file = st.file; line = st.line; col = 0 } fmt
@@ -328,22 +329,26 @@ let rec statement st (l : line) =
         if !Target.machine <> Target.Riscv64 then None
         else try Encode_riscv.address_pair ~pic:st.pic i with Fixup.Bad m -> error st "%s" m in
       (match pair with
-       | Some (hi, load) ->
+       | Some p ->
            let rd = List.nth i.operands 0 and sym = List.nth i.operands 1 in
            let target = match sym with
              | Imm e | Mem { disp = Some e; base = None; _ } -> e
              | _ -> error st "%s takes a symbol" i.mnemonic in
            let here = fresh_label st "occ.pcrel" in
            let one m ops = statement_instr st encode { i with mnemonic = m; operands = ops } in
-           one "auipc" [ rd; Imm (Encode_riscv.with_modifier hi target) ];
            let low = Sym (here, Some "pcrel_lo") in
-           if load then
-             one "ld" [ rd; Mem { seg = None; disp = Some low; base = (match rd with Reg r -> Some r | _ -> None);
-                                  index = None; scale = 1 } ]
-           else one "addi" [ rd; rd; Imm low ]
+           (match p with
+            | Encode_riscv.Add hi ->
+                one "auipc" [ rd; Imm (Encode_riscv.with_modifier hi target) ];
+                one "addi" [ rd; rd; Imm low ]
+            | Encode_riscv.Access (hi, m, value, scratch) ->
+                one "auipc" [ Reg scratch; Imm (Encode_riscv.with_modifier hi target) ];
+                one m [ value; Mem { seg = None; disp = Some low; base = Some scratch;
+                                     index = None; scale = 1 } ])
        | None -> statement_instr st encode i)
 
 and statement_instr st encode i =
+      st.has_code <- true;
       (match encode i with
        | Encode.Fixed (bytes, fixups) -> add_chunk st (Bytes (bytes, fixups, st.line))
        | Encode.Relaxable { short; long } ->
@@ -788,7 +793,7 @@ let run file text =
   let text_section = new_section ".text" (Elf.shf_alloc lor Elf.shf_execinstr) Elf.sht_progbits in
   let st = { file; sections = Hashtbl.create 8; section_order = [ text_section ]; symbols = Hashtbl.create 64;
              symbol_order = []; current = text_section; previous = None; files = []; file_symbol = None;
-             frame = None; counter = 0; line = 0; pic = false } in
+             frame = None; counter = 0; line = 0; pic = false; has_code = false } in
   Hashtbl.replace st.sections ".text" text_section;
   (* RISC-V marks each code section with the instruction set its
      contents belong to, so that a disassembler knows how to read them;
@@ -834,8 +839,14 @@ let run file text =
   end;
   (* the symbol table: file, sections, local symbols, then globals *)
   let defined_symbols = List.rev st.symbol_order in
+  (* The symbol marking which instruction set a code section holds is
+     for code: gas leaves it out of a file that is all data, and
+     runtime/prims.c, whose .text holds nothing but a table of function
+     pointers, is such a file. *)
+  let mapping_symbol sy = String.length sy.name > 0 && sy.name.[0] = '$' in
   let emitted = List.filter (fun (sy : symbol) ->
       (sy.needed || not (is_local_label sy.name)) &&
+      (st.has_code || not (mapping_symbol sy)) &&
       (match sy.def with
        | Undefined -> sy.referenced || sy.binding <> None
        | _ -> true)) defined_symbols in

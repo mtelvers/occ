@@ -691,18 +691,43 @@ let reloc_type ~(field : Fixup.field) ~modifier ~size ~pcrel =
    address is pc-relative arithmetic.  "lla" is always the second form,
    which is what a compiler uses for a symbol it knows is local; the two
    thread-local forms read their offset from the table. *)
+(* What the pair is: the modifier on the high half, then either an
+   "addi" that adds the low half to the same register, or a load or
+   store whose address is the low half of the register the auipc landed
+   in.  [scratch] is that register: the destination itself where it can
+   be, and the one the source named where it cannot -- a float cannot
+   hold an address, and a store's destination is memory. *)
+type pair =
+  | Add of string                                   (* hi modifier *)
+  | Access of string * string * operand * reg       (* hi modifier, mnemonic, the value, scratch *)
+
 let address_pair ~pic (i : instruction) =
+  let symbolic = function
+    | Imm (Sym _) | Imm (Bin (_, Sym _, _)) -> true
+    | _ -> false in
   match i.mnemonic, i.operands with
-  | ("la" | "lla" | "la.tls.ie" | "la.tls.gd"), [ Reg { rclass = Ireg; _ }; _ ] ->
-      let hi, load =
-        match i.mnemonic with
-        | "lla" -> "pcrel_hi", false
-        | "la" -> if pic then "got_pcrel_hi", true else "pcrel_hi", false
-        | "la.tls.ie" -> "tls_ie_pcrel_hi", true
-        | _ -> "tls_gd_pcrel_hi", false in
-      Some (hi, load)
+  | ("la" | "lla" | "la.tls.ie" | "la.tls.gd"), [ Reg ({ rclass = Ireg; _ } as rd); _ ] ->
+      (match i.mnemonic with
+       | "lla" -> Some (Add "pcrel_hi")
+       | "la" -> if pic then Some (Access ("got_pcrel_hi", "ld", Reg rd, rd)) else Some (Add "pcrel_hi")
+       | "la.tls.ie" -> Some (Access ("tls_ie_pcrel_hi", "ld", Reg rd, rd))
+       | _ -> Some (Add "tls_gd_pcrel_hi"))
   | ("la" | "lla" | "la.tls.ie" | "la.tls.gd"), _ ->
       bad "%s takes a register and a symbol" i.mnemonic
+  (* An integer load from a symbol: the destination holds the address
+     first, so it needs no scratch of its own. *)
+  | m, [ (Reg ({ rclass = Ireg; _ } as r) as rd); sym ]
+    when List.mem_assoc m load_f3 && symbolic sym ->
+      Some (Access ("pcrel_hi", m, rd, r))
+  (* A store, or a load into a floating-point register, which must be
+     told which register to build the address in. *)
+  | m, [ rd; sym; Reg ({ rclass = Ireg; _ } as tmp) ]
+    when (List.mem_assoc m load_f3 || List.mem_assoc m store_f3
+          || List.mem_assoc m fload_f3 || List.mem_assoc m fstore_f3) && symbolic sym ->
+      Some (Access ("pcrel_hi", m, rd, tmp))
+  | m, [ _; sym ] when (List.mem_assoc m fload_f3 || List.mem_assoc m store_f3
+                        || List.mem_assoc m fstore_f3) && symbolic sym ->
+      bad "%s from a symbol needs a register to build the address in" m
   | _ -> None
 
 (* the modifier attached to a symbol, wherever it sits in an expression *)
