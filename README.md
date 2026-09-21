@@ -10,7 +10,11 @@ before code generation sees it. There is one intermediate representation,
 a one-page linear-scan register allocator, a few peepholes, and no
 dependency outside the OCaml standard library. The occ-built OCaml
 bytecode interpreter runs about 2.5 times slower than gcc's `-O2` build,
-down from 6 times with everything in frame slots. x86-64 Linux, System V ABI.
+down from 6 times with everything in frame slots.
+
+Two machines: x86-64 Linux (System V ABI) and RISC-V RV64 Linux (the
+lp64d psABI). `--target=` chooses, and a compiler built on either
+defaults to the machine it runs on.
 
 Everything the build runs is now ours as well: the assembler (`occas`,
 byte-identical to GNU as on everything occ and ocamlopt produce), the
@@ -19,6 +23,14 @@ POSIX shell (`occsh`) and the utilities the build calls (`occutils`:
 sed, awk, grep, diff, sort, tr, cp, rm and twenty-odd more). With a
 PATH holding only those, `./configure && make world.opt` builds the
 OCaml compiler with no program written in C on it.
+
+The assembler and the linker know both machines. On RISC-V the
+comparison with GNU as is against `as -mno-relax`, since occas emits no
+R_RISCV_RELAX: relaxation is an invitation a linker need not accept, and
+neither of these accepts it. Everything in code, data, symbols and code
+relocations matches byte for byte; the frame and line tables hold values
+where gas leaves a relocation pair for a relaxing linker, and
+`tools/rvtabcheck.sh` compares what a reader makes of both.
 
 ## Layout
 
@@ -38,11 +50,16 @@ OCaml compiler with no program written in C on it.
       typed, elab        elaboration to a fully explicit typed AST
       ir, lower          three-address IR
       driver             gcc-compatible command line, stage selection
-      amd64/             asm AST, ABI classification, selection,
-                         register allocation, emission
-      assembler/         gas syntax (lexer, parser), x86-64 encoding,
-                         layout and relaxation, .eh_frame, .debug_line,
-                         ELF relocatable output
+      target             the one place the front end learns machine facts
+      abi                how each machine's calling convention carries
+                         an aggregate
+      dwarf              the debugging information tree, which is not
+                         machine knowledge
+      amd64/             asm AST, selection, register allocation, emission
+      riscv64/           the same for RV64
+      assembler/         gas syntax (lexer, parser), both machines'
+                         encodings, layout and relaxation, .eh_frame,
+                         .debug_line, ELF relocatable output
       archiver/          ar archives with a symbol index; ELF symbol reading
       linker/            ELF object reading; loading, symbol resolution,
                          placement, relocation, executable output
@@ -53,6 +70,11 @@ OCaml compiler with no program written in C on it.
     doc/phases.md        phase map, budgets, order of work
     doc/extensions.md    everything the runtime needs beyond C11
     doc/shell.md         what the OCaml build asks of a shell, measured
+    doc/riscv.md         the second machine: what was measured, what it cost
+    test/rv/             programs run on RISC-V and compared with gcc's build
+    test/rvas/           assembly compared with GNU as on that machine
+    tools/rvcheck.sh     build each test/rv program four ways, both toolchains
+    tools/rvtabcheck.sh  the frame and line tables occas writes, read back
 
 ## Building and testing
 
