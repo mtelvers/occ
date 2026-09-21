@@ -132,15 +132,9 @@ let parse_args argv =
      | "-dumpmachine" ->
          print_string (Target.name !Target.machine ^ "-unknown-linux-gnu\n"); exit 0
      | "--version" ->
-         (* what this compiler does for the machine it is aimed at, which
-            is not the same on both: the linker does not yet make a
-            shared object for RISC-V, and says so rather than letting a
-            reader assume it *)
-         Printf.printf "occ 0.1 (C11, %s Linux; native preprocess, compile, assemble and link; %s)\n"
-           (Target.name !Target.machine)
-           (match !Target.machine with
-            | Target.Amd64 -> "shared objects and dynamic executables too"
-            | Target.Riscv64 -> "gcc for shared objects and dynamic executables");
+         Printf.printf "occ 0.1 (C11, %s Linux; native preprocess, compile, assemble and link, \
+                        shared objects and dynamic executables too)\n"
+           (Target.name !Target.machine);
          exit 0
      | "-I" -> o.cpp <- { o.cpp with include_dirs = o.cpp.include_dirs @ [ next a ] }
      | "-isystem" -> o.cpp <- { o.cpp with system_dirs = o.cpp.system_dirs @ [ next a ] }
