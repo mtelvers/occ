@@ -389,7 +389,11 @@ let directive st name =
      relaxation on and off, and ".attribute" records which extensions the
      file was built for; neither changes a byte of what we assemble, since
      this assembler emits the fixed sequences and never relaxes. *)
-  | ".option" | ".attribute" | ".insn" ->
+  | ".option" ->
+      let what = match st.tok with IDENT w -> advance st; w | _ -> "" in
+      while st.tok <> NEWLINE && st.tok <> EOF do advance st done;
+      one (Riscv_option what)
+  | ".attribute" | ".insn" ->
       while st.tok <> NEWLINE && st.tok <> EOF do advance st done; one (Ignored name)
   | _ -> error st "unknown directive %s" name
 

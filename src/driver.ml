@@ -31,14 +31,13 @@ let native_stages =
 let mode stage =
   let key = match stage with
     | Preprocess -> "pp" | Compile -> "cc" | Assemble -> "as" | Link -> "ld" in
-  (* The assembler and the linker here are written for x86-64.  Until
-     they know RISC-V, a compilation for that machine hands those two
-     stages to the system's, which is what the staged plan in
-     doc/riscv.md says and what lets the code generator be judged on its
-     own. *)
+  (* The linker here is written for x86-64.  Until it knows RISC-V, a
+     compilation for that machine hands the link to the system's, which
+     is what the staged plan in doc/riscv.md says; the assembler knows
+     both machines. *)
   let ours_for_this_machine =
     match !Target.machine, stage with
-    | Target.Riscv64, (Assemble | Link) -> false
+    | Target.Riscv64, Link -> false
     | _ -> true in
   if List.mem key native_stages && ours_for_this_machine then Native else Delegate
 

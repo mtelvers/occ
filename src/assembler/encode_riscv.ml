@@ -666,3 +666,36 @@ let reloc_type ~(field : Fixup.field) ~modifier ~size ~pcrel =
        | n, _ -> bad "no relocation for %d bytes on this machine" n)
   | Fixup.Whole, Some m -> bad "unsupported relocation modifier %%%s" m
   | _, Some m -> bad "%%%s does not belong on that instruction" m
+
+(* ---- The address pseudo-instructions ---------------------------------- *)
+
+(* "la rd, sym" is two instructions, and the second names the first by a
+   label: the linker pairs a %pcrel_lo with the %pcrel_hi it belongs to
+   by that label's address.  So these cannot be encoded here -- an
+   encoder cannot define a label -- and [Assemble] expands them, asking
+   this only what the pair should be.
+
+   What "la" means depends on ".option": with position independence it
+   loads the address from the global offset table, and without it the
+   address is pc-relative arithmetic.  "lla" is always the second form,
+   which is what a compiler uses for a symbol it knows is local; the two
+   thread-local forms read their offset from the table. *)
+let address_pair ~pic (i : instruction) =
+  match i.mnemonic, i.operands with
+  | ("la" | "lla" | "la.tls.ie" | "la.tls.gd"), [ Reg { rclass = Ireg; _ }; _ ] ->
+      let hi, load =
+        match i.mnemonic with
+        | "lla" -> "pcrel_hi", false
+        | "la" -> if pic then "got_pcrel_hi", true else "pcrel_hi", false
+        | "la.tls.ie" -> "tls_ie_pcrel_hi", true
+        | _ -> "tls_gd_pcrel_hi", false in
+      Some (hi, load)
+  | ("la" | "lla" | "la.tls.ie" | "la.tls.gd"), _ ->
+      bad "%s takes a register and a symbol" i.mnemonic
+  | _ -> None
+
+(* the modifier attached to a symbol, wherever it sits in an expression *)
+let rec with_modifier m = function
+  | Sym (name, _) -> Sym (name, Some m)
+  | Bin (op, a, b) -> Bin (op, with_modifier m a, b)
+  | e -> e

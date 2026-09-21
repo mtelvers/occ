@@ -108,6 +108,10 @@ type directive =
   | Loc of int * int * int        (* .loc file line column *)
   | Cfi of cfi
   | Ident of string
+  (* RISC-V's ".option", which among other things chooses between the
+     two meanings of "la": a load from the global offset table, or a
+     pc-relative address *)
+  | Riscv_option of string
   | Ignored of string             (* directives accepted and dropped, listed in the parser *)
 
 type statement =

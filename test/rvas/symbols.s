@@ -48,3 +48,20 @@ uses:
 object:
 	.quad	object
 	.quad	elsewhere+4
+
+/* the address pseudo-instructions, which are a pair of instructions and
+   a label of their own; what "la" means depends on ".option" */
+	.text
+	.globl	addresses
+	.type	addresses, @function
+addresses:
+	lla	a0, object
+	la	a1, object
+	la.tls.ie a2, tls_object
+	la.tls.gd a3, tls_object
+	.option pic
+	la	a4, object
+	.option nopic
+	la	a5, object
+	ret
+	.size	addresses, .-addresses

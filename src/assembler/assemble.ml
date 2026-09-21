@@ -57,6 +57,11 @@ type def =
 
 type symbol = {
   name : string;
+  (* The name written into the object, which is the name above except
+     for a label the assembler made up for itself: gas calls every one of
+     those ".L0", several at once, and the name of a local label means
+     nothing to anyone but the relocation that points at it. *)
+  mutable out_name : string;
   mutable def : def;
   mutable binding : int option;         (* Elf.stb_*, None until .globl/.local/.weak *)
   mutable typ : int;                    (* Elf.stt_* *)
@@ -80,6 +85,7 @@ type state = {
   mutable frame : (string * bool * (string * cfi) list) option;   (* open .cfi_startproc: label, signal, ops reversed *)
   mutable counter : int;
   mutable line : int;
+  mutable pic : bool;                   (* RISC-V ".option pic": what "la" means *)
 }
 
 let error st fmt = Diag.error { Loc.file = st.file; line = st.line; col = 0 } fmt
@@ -152,8 +158,8 @@ let symbol st name =
   match Hashtbl.find_opt st.symbols name with
   | Some s -> s
   | None ->
-      let s = { name; def = Undefined; binding = None; typ = Elf.stt_notype; size = None; visibility = Elf.stv_default;
-                referenced = false; needed = false; symidx = 0 } in
+      let s = { name; out_name = name; def = Undefined; binding = None; typ = Elf.stt_notype; size = None;
+                visibility = Elf.stv_default; referenced = false; needed = false; symidx = 0 } in
       Hashtbl.replace st.symbols name s;
       st.symbol_order <- s :: st.symbol_order;
       s
@@ -291,9 +297,14 @@ let directive st = function
       let at = fresh_label st "loc" in
       st.current.locs <- { Debug_line.at; file; line; col } :: st.current.locs
   | Cfi c -> record_cfi st c
+  | Riscv_option ("pic" | "PIC") -> st.pic <- true
+  | Riscv_option ("nopic" | "NOPIC") -> st.pic <- false
+  (* the others -- rvc, relax, push, pop -- choose things this assembler
+     does not do either way *)
+  | Riscv_option _ -> ()
   | Ident _ | Ignored _ -> ()
 
-let statement st (l : line) =
+let rec statement st (l : line) =
   st.line <- l.lineno;
   match l.stmt with
   | Label name -> define_label st name
@@ -303,6 +314,30 @@ let statement st (l : line) =
       let encode = match !Target.machine with
         | Target.Amd64 -> Encode.instruction
         | Target.Riscv64 -> Encode_riscv.instruction in
+      (* An address pseudo-instruction is two instructions and a label of
+         its own, which only this level can make (see
+         [Encode_riscv.address_pair]). *)
+      let pair =
+        if !Target.machine <> Target.Riscv64 then None
+        else try Encode_riscv.address_pair ~pic:st.pic i with Fixup.Bad m -> error st "%s" m in
+      (match pair with
+       | Some (hi, load) ->
+           let rd = List.nth i.operands 0 and sym = List.nth i.operands 1 in
+           let target = match sym with
+             | Imm e | Mem { disp = Some e; base = None; _ } -> e
+             | _ -> error st "%s takes a symbol" i.mnemonic in
+           let here = fresh_label st "occ.pcrel" in
+           (symbol st here).out_name <- ".L0";
+           let one m ops = statement_instr st encode { i with mnemonic = m; operands = ops } in
+           one "auipc" [ rd; Imm (Encode_riscv.with_modifier hi target) ];
+           let low = Sym (here, Some "pcrel_lo") in
+           if load then
+             one "ld" [ rd; Mem { seg = None; disp = Some low; base = (match rd with Reg r -> Some r | _ -> None);
+                                  index = None; scale = 1 } ]
+           else one "addi" [ rd; rd; Imm low ]
+       | None -> statement_instr st encode i)
+
+and statement_instr st encode i =
       (match encode i with
        | Encode.Fixed (bytes, fixups) -> add_chunk st (Bytes (bytes, fixups, st.line))
        | Encode.Relaxable { short; long } ->
@@ -747,7 +782,7 @@ let run file text =
   let text_section = new_section ".text" (Elf.shf_alloc lor Elf.shf_execinstr) Elf.sht_progbits in
   let st = { file; sections = Hashtbl.create 8; section_order = [ text_section ]; symbols = Hashtbl.create 64;
              symbol_order = []; current = text_section; previous = None; files = []; file_symbol = None;
-             frame = None; counter = 0; line = 0 } in
+             frame = None; counter = 0; line = 0; pic = false } in
   Hashtbl.replace st.sections ".text" text_section;
   (* RISC-V marks each code section with the instruction set its
      contents belong to, so that a disassembler knows how to read them;
@@ -844,7 +879,7 @@ let run file text =
       | Common (_, align) -> Elf.shn_common, Int64.of_int align
       | Undefined -> Elf.shn_undef, 0L in
     let ssize = match sy.def with Common (s, _) -> s | _ -> size in
-    { Elf.sname = sy.name; bind; stype = sy.typ; other = sy.visibility; shndx; value; ssize } in
+    { Elf.sname = sy.out_name; bind; stype = sy.typ; other = sy.visibility; shndx; value; ssize } in
   List.iter (fun (sy : symbol) -> incr n_syms; sy.symidx <- !n_syms; add (symbol_entry sy Elf.stb_local)) locals;
   let n_locals = !n_syms + 1 in
   List.iter (fun (sy : symbol) ->
