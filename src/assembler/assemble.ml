@@ -176,6 +176,13 @@ let fresh_label st prefix =
   st.counter <- st.counter + 1;
   let name = Printf.sprintf ".L%s%d" prefix st.counter in
   define_label st name;
+  (* A label the assembler invented for itself is written into the object
+     under the name gas gives the same thing, ".L0", several at once: on
+     RISC-V such a label is named by a relocation and so reaches the
+     symbol table, and its name means nothing to anyone but that
+     relocation.  (On x86-64 they never reach it, since a relocation
+     against a local symbol there is reduced to its section.) *)
+  if !Target.machine = Target.Riscv64 then (symbol st name).out_name <- ".L0";
   name
 
 (* Replace symbols with a current constant value by that value, and "." by
@@ -327,7 +334,6 @@ let rec statement st (l : line) =
              | Imm e | Mem { disp = Some e; base = None; _ } -> e
              | _ -> error st "%s takes a symbol" i.mnemonic in
            let here = fresh_label st "occ.pcrel" in
-           (symbol st here).out_name <- ".L0";
            let one m ops = statement_instr st encode { i with mnemonic = m; operands = ops } in
            one "auipc" [ rd; Imm (Encode_riscv.with_modifier hi target) ];
            let low = Sym (here, Some "pcrel_lo") in

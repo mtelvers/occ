@@ -10,9 +10,32 @@ OCCAS="$HERE/_build/default/bin/occas.exe"
 # x86-64, and no relaxation on RISC-V, since occas emits the fixed
 # sequences and no R_RISCV_RELAX (see doc/riscv.md).
 case $(uname -m) in
-  riscv64) ASFLAGS=${ASFLAGS:--mno-relax};;
-  *) ASFLAGS=${ASFLAGS:---64};;
+  riscv64) ASFLAGS=${ASFLAGS:--mno-relax}; machine=riscv64;;
+  *) ASFLAGS=${ASFLAGS:---64}; machine=amd64;;
 esac
+
+# On RISC-V the frame and line tables are compared by what they mean
+# rather than byte for byte, by tools/rvtabcheck.sh: gas leaves every
+# difference of two labels in them to the linker as an ADD/SUB
+# relocation pair, because a relaxing linker may change it, and makes an
+# anonymous local symbol (".L0") for each end of each pair.  occas, which
+# never relaxes, works the difference out.  So this compares the code,
+# the data, the symbols and the relocations in the code -- where the two
+# assemblers agree byte for byte -- and leaves the tables to the other
+# harness.
+skip_section() {
+  [ "$machine" = riscv64 ] || return 1
+  case $1 in .eh_frame|.debug_*) return 0;; *) return 1;; esac
+}
+drop_table_relocs() {
+  if [ "$machine" = riscv64 ]
+  then grep -v "^\.rela\.\(eh_frame\|debug_\)"
+  else cat
+  fi
+}
+drop_anonymous() {
+  if [ "$machine" = riscv64 ]; then grep -v " \.L0$"; else cat; fi
+}
 tmp=$(mktemp -d)
 n=0; fail=0
 # named sections with file content (not NOBITS, not empty), except the tables
@@ -44,14 +67,20 @@ for d in "$@"; do
     synth=""; grep -q '^[[:space:]]*\.section[[:space:]]*\.debug_info' "$f" || synth="debug_info debug_abbrev debug_aranges debug_str"
     for s in $(sections "$tmp/ref.o"); do
       case " $synth " in *" ${s#.} "*) continue;; esac
+      skip_section "$s" && continue
       rm -f "$tmp/ref.bin"; objcopy --dump-section "$s=$tmp/ref.bin" "$tmp/ref.o" "$tmp/junk.o" 2>/dev/null
       rm -f "$tmp/occ.bin"; objcopy --dump-section "$s=$tmp/occ.bin" "$tmp/occ.o" "$tmp/junk.o" 2>/dev/null
       cmp -s "$tmp/ref.bin" "$tmp/occ.bin" || bad="$bad $s"
     done
-    symbols "$tmp/ref.o" > "$tmp/ref.sym"; symbols "$tmp/occ.o" > "$tmp/occ.sym"
+    symbols "$tmp/ref.o" | drop_anonymous > "$tmp/ref.sym"
+    symbols "$tmp/occ.o" | drop_anonymous > "$tmp/occ.sym"
     cmp -s "$tmp/ref.sym" "$tmp/occ.sym" || bad="$bad symbols"
-    relocs "$tmp/ref.o" | grep -v "^.rela.debug_\(info\|aranges\)" > "$tmp/ref.rel"; relocs "$tmp/occ.o" | grep -v "^.rela.debug_\(info\|aranges\)" > "$tmp/occ.rel"
-    if [ -z "$synth" ]; then relocs "$tmp/ref.o" > "$tmp/ref.rel"; relocs "$tmp/occ.o" > "$tmp/occ.rel"; fi
+    relocs "$tmp/ref.o" | grep -v "^.rela.debug_\(info\|aranges\)" | drop_table_relocs > "$tmp/ref.rel"
+    relocs "$tmp/occ.o" | grep -v "^.rela.debug_\(info\|aranges\)" | drop_table_relocs > "$tmp/occ.rel"
+    if [ -z "$synth" ]; then
+      relocs "$tmp/ref.o" | drop_table_relocs > "$tmp/ref.rel"
+      relocs "$tmp/occ.o" | drop_table_relocs > "$tmp/occ.rel"
+    fi
     cmp -s "$tmp/ref.rel" "$tmp/occ.rel" || bad="$bad relocs"
     if [ -n "$bad" ]; then fail=$((fail+1)); echo "DIFF $f:$bad"; fi
   done
