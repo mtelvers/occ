@@ -31,14 +31,11 @@ let native_stages =
 let mode stage =
   let key = match stage with
     | Preprocess -> "pp" | Compile -> "cc" | Assemble -> "as" | Link -> "ld" in
-  (* The linker here is written for x86-64.  Until it knows RISC-V, a
-     compilation for that machine hands the link to the system's, which
-     is what the staged plan in doc/riscv.md says; the assembler knows
-     both machines. *)
-  let ours_for_this_machine =
-    match !Target.machine, stage with
-    | Target.Riscv64, Link -> false
-    | _ -> true in
+  (* The assembler knows both machines.  The linker knows how to make a
+     RISC-V executable with nothing to load; a dynamic one still needs
+     the loader tables of that machine, so [link] hands those to the
+     system's linker for now (doc/riscv.md). *)
+  let ours_for_this_machine = true in
   if List.mem key native_stages && ours_for_this_machine then Native else Delegate
 
 let delegate_cc = Option.value (Sys.getenv_opt "OCC_CC") ~default:"gcc"
@@ -346,6 +343,10 @@ let link o objects output =
         if !Target.machine = Target.Riscv64 && not o.pic
            && not (List.mem "-shared" (linker_words o)) then [ "-no-pie" ] else [] in
       run o delegate_cc (pie @ o.passthrough @ objects @ o.link_args @ [ "-o"; output ])
+  | Native when !Target.machine = Target.Riscv64 && link_kind o <> Static_exe ->
+      (* not yet: a dynamic executable and a shared object need this
+         machine's loader tables *)
+      run o delegate_cc (o.passthrough @ objects @ o.link_args @ [ "-o"; output ])
   | Native ->
       let user_dirs = List.filter_map (fun a ->
           if String.length a > 2 && String.sub a 0 2 = "-L" then Some (String.sub a 2 (String.length a - 2)) else None) o.link_args in

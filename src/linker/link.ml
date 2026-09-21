@@ -468,7 +468,6 @@ let symbol_value st (inp : input) (sy : symbol) =
       | None -> error "%s: reference to a discarded section" inp.obj.file
   end else address_of st (gsym st sy.sname)
 
-let tp_offset st v = v - st.tls_end
 
 (* where the thread-local block begins, which is what the value of a
    thread-local symbol is measured from in a symbol table *)
@@ -477,6 +476,18 @@ let tls_block_start st =
   | Some o when o.osize > 0 -> o.addr
   | _ -> (osec st ".tbss").addr
 
+(* Where a thread-local sits, as the machine measures it from the thread
+   pointer.  The two ABIs put the pointer at opposite ends of the block:
+   x86-64 has it past the end, so a variable is at a negative offset,
+   while RISC-V has it at the start (the psABI's variant I), so the
+   offset is positive.  Getting this backwards linked and ran, and
+   faulted in glibc's __ctype_init, which is the first thing to read a
+   thread-local. *)
+let tp_offset st v =
+  match !Target.machine with
+  | Target.Amd64 -> v - st.tls_end
+  | Target.Riscv64 -> v - tls_block_start st
+
 (* ---- Step 3 continued: GOT, PLT and addresses --------------------------------------- *)
 
 let r_x86_64_64 = 1 and r_x86_64_pc32 = 2 and r_x86_64_plt32 = 4 and r_x86_64_gotpcrel = 9 and r_x86_64_32 = 10
@@ -484,6 +495,23 @@ and r_x86_64_32s = 11 and r_x86_64_16 = 12 and r_x86_64_pc16 = 13 and r_x86_64_8
 and r_x86_64_tlsgd = 19 and r_x86_64_tlsld = 20 and r_x86_64_dtpoff32 = 21 and r_x86_64_gottpoff = 22
 and r_x86_64_tpoff32 = 23 and r_x86_64_pc64 = 24 and r_x86_64_size32 = 32 and r_x86_64_size64 = 33
 and r_x86_64_irelative = 37 and r_x86_64_gotpcrelx = 41 and r_x86_64_rex_gotpcrelx = 42
+
+(* RISC-V's, from the psABI's relocation table.  The ones a static link
+   of this distribution's libc.a asks for, plus the fixed-addressing
+   pair that occ's own non-PIC output uses. *)
+let r_riscv_32 = 1 and r_riscv_64 = 2 and r_riscv_branch = 16 and r_riscv_jal = 17
+and r_riscv_call = 18 and r_riscv_call_plt = 19 and r_riscv_got_hi20 = 20
+and r_riscv_tls_got_hi20 = 21 and r_riscv_tls_gd_hi20 = 22 and r_riscv_pcrel_hi20 = 23
+and r_riscv_pcrel_lo12_i = 24 and r_riscv_pcrel_lo12_s = 25
+and r_riscv_hi20 = 26 and r_riscv_lo12_i = 27 and r_riscv_lo12_s = 28
+and r_riscv_tprel_hi20 = 29 and r_riscv_tprel_lo12_i = 30
+and r_riscv_tprel_lo12_s = 31 and r_riscv_tprel_add = 32
+and r_riscv_add8 = 33 and r_riscv_add16 = 34 and r_riscv_add32 = 35 and r_riscv_add64 = 36
+and r_riscv_sub8 = 37 and r_riscv_sub16 = 38 and r_riscv_sub32 = 39 and r_riscv_sub64 = 40
+and r_riscv_align = 43 and r_riscv_rvc_branch = 44 and r_riscv_rvc_jump = 45
+and r_riscv_relax = 51 and r_riscv_sub6 = 52 and r_riscv_set6 = 53
+and r_riscv_set8 = 54 and r_riscv_set16 = 55 and r_riscv_set32 = 56
+and r_riscv_32_pcrel = 57 and r_riscv_set_uleb128 = 60 and r_riscv_sub_uleb128 = 61
 
 (* the GOT slot for a relocation's symbol: [tls] for a thread-pointer offset slot *)
 let got_key (inp : input) (sy : symbol) tls =
@@ -567,7 +595,13 @@ let scan_relocs st =
                         st.copies <- (g, sy'.ssize) :: List.filter (fun (h, _) -> h != g) st.copies
                     | _ -> ()
                 end;
-                if r.rtype = r_x86_64_gotpcrel || r.rtype = r_x86_64_gotpcrelx || r.rtype = r_x86_64_rex_gotpcrelx then
+                if !Target.machine = Target.Riscv64 then begin
+                  (* the table forms, which need an entry each: one
+                     holding the address, one the thread-pointer offset *)
+                  if r.rtype = r_riscv_got_hi20 then ignore (got_slot st (got_key inp sy false));
+                  if r.rtype = r_riscv_tls_got_hi20 then ignore (got_slot st (got_key inp sy true))
+                end
+                else if r.rtype = r_x86_64_gotpcrel || r.rtype = r_x86_64_gotpcrelx || r.rtype = r_x86_64_rex_gotpcrelx then
                   (if not ifunc then ignore (got_slot st (got_key inp sy false)))
                 else if r.rtype = r_x86_64_gottpoff then ignore (got_slot st (got_key inp sy true))
                 else if dyn_need st inp target r <> No_need then
@@ -917,6 +951,150 @@ let patch (o : osec) off size v =
 let check_signed32 what v = if v < -0x80000000 || v > 0x7fffffff then error "relocation %s overflows 32 bits (%d)" what v
 let check_unsigned32 what v = if v < 0 || v > 0xffffffff then error "relocation %s overflows 32 bits (%d)" what v
 
+(* ---- RISC-V relocation ------------------------------------------------
+
+   The psABI's table, as far as a static link needs it, which the
+   distribution's own libc.a says is twenty-two of the types: the
+   branches and jumps, the twenty-high/twelve-low pairs in their fixed,
+   pc-relative, table and thread-local forms, the compressed branches,
+   and the set-and-subtract pairs that stand for a difference of two
+   labels in the frame and debug tables.
+
+   Two of the types are ignorable and it matters that they are.
+   R_RISCV_RELAX marks a place a linker *may* shorten; a linker need not,
+   and this one does not.  R_RISCV_ALIGN says "there are up to n bytes of
+   padding here, keep what follows aligned", which is already true if
+   nothing shrank.  Between them they are three quarters of the
+   relocations in libc.a.
+
+   A twelve-bit low half does not say which high half it belongs to: it
+   names a label at the instruction holding the high half, and the value
+   to write is the one that instruction computed.  So the high halves
+   record what they worked out, keyed by their address, and the low
+   halves look it up -- which is what every RISC-V linker does. *)
+
+let riscv_pcrel : (int, int) Hashtbl.t = Hashtbl.create 256
+
+(* the two-byte compressed forms *)
+let rv_half (o : osec) off =
+  Char.code (Bytes.get o.body off) lor (Char.code (Bytes.get o.body (off + 1)) lsl 8)
+
+let rv_set_half (o : osec) off v =
+  Bytes.set o.body off (Char.chr (v land 0xff));
+  Bytes.set o.body (off + 1) (Char.chr ((v lsr 8) land 0xff))
+
+let bit v n = (v lsr n) land 1
+let bits_of v hi lo = (v lsr lo) land ((1 lsl (hi - lo + 1)) - 1)
+
+(* read [size] bytes, for the relocations that add to or subtract from
+   what is already there *)
+let read_at (o : osec) off size =
+  let v = ref 0 in
+  for i = size - 1 downto 0 do v := (!v lsl 8) lor Char.code (Bytes.get o.body (off + i)) done;
+  !v
+
+(* a ULEB128 rewritten in the same number of bytes, which is what
+   R_RISCV_SET_ULEB128 asks for: the field was made wide enough by the
+   assembler and must not change width now *)
+let write_uleb_in_place (o : osec) off v =
+  let rec go i v =
+    let more = Char.code (Bytes.get o.body (off + i)) land 0x80 <> 0 in
+    Bytes.set o.body (off + i)
+      (Char.chr ((v land 0x7f) lor (if more then 0x80 else 0)));
+    if more then go (i + 1) (v lsr 7) in
+  go 0 v
+
+let read_uleb_in_place (o : osec) off =
+  let rec go i shift acc =
+    let b = Char.code (Bytes.get o.body (off + i)) in
+    let acc = acc lor ((b land 0x7f) lsl shift) in
+    if b land 0x80 <> 0 then go (i + 1) (shift + 7) acc else acc in
+  go 0 0 0
+
+(* One relocation of a RISC-V object.  [s] is the symbol's address, [a]
+   the addend, [p] where the relocation is, [where] its offset in the
+   output section. *)
+let riscv_reloc st (o : osec) ~sy ~slot ~tls_slot ~s ~p ~where ~a ~name ~t =
+  let open Assembler in
+  let field kind v = Encode_riscv.patch o.body where kind (Int64.of_int v) in
+  let hi20_at v = Hashtbl.replace riscv_pcrel p v; field Fixup.Rv_hi20 v in
+  (* the value a low half takes: the one the instruction its label names
+     worked out *)
+  let low_of_pair () =
+    match Hashtbl.find_opt riscv_pcrel (s ()) with
+    | Some v -> v
+    | None -> error "%s: the low half of a pair has no high half at 0x%x" name (s ()) in
+  let add_sub size f =
+    let v = f (read_at o where size) in
+    for i = 0 to size - 1 do Bytes.set o.body (where + i) (Char.chr ((v asr (8 * i)) land 0xff)) done in
+  ignore sy;
+  if t = r_riscv_relax || t = r_riscv_align then ()
+  else if t = r_riscv_64 then patch o where 8 (s () + a)
+  else if t = r_riscv_32 then (let v = s () + a in check_unsigned32 name v; patch o where 4 v)
+  else if t = r_riscv_32_pcrel then (let v = s () + a - p in check_signed32 name v; patch o where 4 v)
+  else if t = r_riscv_branch then field Fixup.Rv_branch (s () + a - p)
+  else if t = r_riscv_jal then field Fixup.Rv_jal (s () + a - p)
+  else if t = r_riscv_call || t = r_riscv_call_plt then field Fixup.Rv_call (s () + a - p)
+  else if t = r_riscv_hi20 then field Fixup.Rv_hi20 (s () + a)
+  else if t = r_riscv_lo12_i then field Fixup.Rv_lo12_i (s () + a)
+  else if t = r_riscv_lo12_s then field Fixup.Rv_lo12_s (s () + a)
+  else if t = r_riscv_pcrel_hi20 then hi20_at (s () + a - p)
+  else if t = r_riscv_pcrel_lo12_i then field Fixup.Rv_lo12_i (low_of_pair ())
+  else if t = r_riscv_pcrel_lo12_s then field Fixup.Rv_lo12_s (low_of_pair ())
+  else if t = r_riscv_got_hi20 then hi20_at (slot () + a - p)
+  else if t = r_riscv_tls_got_hi20 then hi20_at (tls_slot () + a - p)
+  else if t = r_riscv_tprel_hi20 then field Fixup.Rv_hi20 (tp_offset st (s ()) + a)
+  else if t = r_riscv_tprel_lo12_i then field Fixup.Rv_lo12_i (tp_offset st (s ()) + a)
+  else if t = r_riscv_tprel_lo12_s then field Fixup.Rv_lo12_s (tp_offset st (s ()) + a)
+  (* the marker on the "add" between a thread-local pair: nothing to do,
+     since this linker does not rewrite the sequence *)
+  else if t = r_riscv_tprel_add then ()
+  (* the compressed branches, which libc.a is full of *)
+  else if t = r_riscv_rvc_branch then begin
+    let v = s () + a - p in
+    if v < -256 || v > 254 || v land 1 <> 0 then error "%s: a compressed branch cannot reach it" name;
+    let w = rv_half o where land 0xe383 in
+    rv_set_half o where
+      (w lor (bit v 8 lsl 12) lor (bits_of v 4 3 lsl 10)
+         lor (bits_of v 7 6 lsl 5) lor (bits_of v 2 1 lsl 3) lor (bit v 5 lsl 2))
+  end
+  else if t = r_riscv_rvc_jump then begin
+    let v = s () + a - p in
+    if v < -2048 || v > 2046 || v land 1 <> 0 then error "%s: a compressed jump cannot reach it" name;
+    let w = rv_half o where land 0xe003 in
+    rv_set_half o where
+      (w lor (bit v 11 lsl 12) lor (bit v 4 lsl 11) lor (bits_of v 9 8 lsl 9)
+         lor (bit v 10 lsl 8) lor (bit v 6 lsl 7) lor (bit v 7 lsl 6)
+         lor (bits_of v 3 1 lsl 3) lor (bit v 5 lsl 2))
+  end
+  (* A difference of two labels, which on this machine the assembler
+     leaves to the linker: one relocation sets or adds the far end and
+     the next subtracts the near one. *)
+  else if t = r_riscv_add8 then add_sub 1 (fun old -> old + s () + a)
+  else if t = r_riscv_add16 then add_sub 2 (fun old -> old + s () + a)
+  else if t = r_riscv_add32 then add_sub 4 (fun old -> old + s () + a)
+  else if t = r_riscv_add64 then add_sub 8 (fun old -> old + s () + a)
+  else if t = r_riscv_sub8 then add_sub 1 (fun old -> old - (s () + a))
+  else if t = r_riscv_sub16 then add_sub 2 (fun old -> old - (s () + a))
+  else if t = r_riscv_sub32 then add_sub 4 (fun old -> old - (s () + a))
+  else if t = r_riscv_sub64 then add_sub 8 (fun old -> old - (s () + a))
+  else if t = r_riscv_set8 then add_sub 1 (fun _ -> s () + a)
+  else if t = r_riscv_set16 then add_sub 2 (fun _ -> s () + a)
+  else if t = r_riscv_set32 then add_sub 4 (fun _ -> s () + a)
+  (* six bits of a byte, which is how the frame tables hold a small
+     difference *)
+  else if t = r_riscv_set6 then
+    add_sub 1 (fun old -> (old land (lnot 0x3f)) lor ((s () + a) land 0x3f))
+  else if t = r_riscv_sub6 then
+    add_sub 1 (fun old -> (old land (lnot 0x3f)) lor ((old - (s () + a)) land 0x3f))
+  else if t = r_riscv_tls_gd_hi20 then
+    error "%s: %s is reached by the general dynamic thread-local sequence, which needs a \
+           dynamic loader; compile it with -ftls-model=initial-exec" o.oname name
+  else if t = r_riscv_set_uleb128 then write_uleb_in_place o where (s () + a)
+  else if t = r_riscv_sub_uleb128 then
+    write_uleb_in_place o where (read_uleb_in_place o where - (s () + a))
+  else error "relocation type %d (%s) is not implemented for this machine" t name
+
 let relocate st =
   let got = Hashtbl.find_opt st.sections ".got" in
   let got_addr k = match got with Some o -> o.addr + 8 * k | None -> assert false in
@@ -939,10 +1117,14 @@ let relocate st =
                     let a = r.addend in
                     let name = if global then sy.sname else inp.obj.sections.(sy.shndx).name in
                     let t = r.rtype in
+                    if !Target.machine = Target.Riscv64 then
+                      riscv_reloc st o ~sy ~s ~p ~where ~a ~name ~t
+                        ~slot:(fun () -> got_addr (Hashtbl.find st.got (got_key inp sy false)))
+                        ~tls_slot:(fun () -> got_addr (Hashtbl.find st.got (got_key inp sy true)))
                     (* [shared] a reference to something a shared
                        object provides: the call goes to its stub, and
                        an address is left for the loader to put in *)
-                    if st.dyn && (match g with Some g -> from_loader ~shared:st.shared g | None -> false) then begin
+                    else if st.dyn && (match g with Some g -> from_loader ~shared:st.shared g | None -> false) then begin
                       let g = Option.get g in
                       if t = r_x86_64_plt32 || t = r_x86_64_pc32 then begin
                         let stub = (osec st ".plt").addr + 16 * dplt_entry st g in
@@ -1269,6 +1451,13 @@ let define_synthetics st (segments : segment list) =
   List.iter (fun n -> define n data_end) [ "edata"; "_edata" ];
   List.iter (fun n -> define n (seg_end 6)) [ "end"; "_end" ];
   define "__bss_start" (start ".bss");
+  (* RISC-V sets gp once at startup and then reaches the small data
+     sections by twelve-bit offsets from it, which covers four kilobytes
+     either side; the linker script puts the register in the middle of
+     .sdata, and crt1.o reads this symbol to load it. *)
+  if !Target.machine = Target.Riscv64 then
+    define "__global_pointer$"
+      (fun () -> (match sec ".sdata" with Some o -> o.addr | None -> start ".data" ()) + 0x800);
   define "__executable_start" (fun () -> st.base);
   (* __start_X and __stop_X for every output section X named like a C identifier *)
   Hashtbl.iter (fun name (o : osec) ->
@@ -1392,11 +1581,16 @@ let link ?(shared = false) ?(soname = "") ?(export_all = false) ?(prefer_shared 
   Buffer.add_string out "\x7fELF\x02\x01\x01\x00"; Buffer.add_string out (String.make 8 '\000');
   u16 out (if st.shared then 3 else 2);                           (* ET_DYN or ET_EXEC *)
   u16 out (match !Target.machine with Target.Amd64 -> 62 | Target.Riscv64 -> 243);
-  u32 out 1;
+  u32 out 1;                                                 (* e_version *)
   u64 out (match entry with Some e -> address_of st (gsym st e) | None -> 0);
   u64 out 64;                                                (* e_phoff *)
   let shoff_pos = Buffer.length out in u64 out 0;
-  u32 out 0; u16 out 64; u16 out 56; u16 out phnum; u16 out 64;
+  (* e_flags: the union of what the inputs were built with, which is how
+     ld makes them.  On x86-64 there are none; on RISC-V they say which
+     floating-point ABI the code follows and whether any of it is
+     compressed, and a tool reading the file believes them. *)
+  u32 out (List.fold_left (fun acc (i : input) -> acc lor i.obj.eflags) 0 st.inputs);
+  u16 out 64; u16 out 56; u16 out phnum; u16 out 64;
   u16 out (List.length placed + 4); u16 out (List.length placed + 3);
   (* program headers *)
   let phdr typ flags off vaddr filesz memsz align =

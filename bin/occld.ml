@@ -11,6 +11,14 @@ let () =
      something to do: see src/linker/dynamic.ml *)
   let relocatable = ref false and shared = ref false and soname = ref "" in
   let export_all = ref false and rpath = ref "" and static = ref false in
+  (* the machine, from the host unless asked otherwise, as occas takes it *)
+  Occ.Target.machine := Occ.Host.machine;
+  let target name =
+    match name with
+    | "x86_64" | "amd64" | "x86-64" -> Occ.Target.machine := Occ.Target.Amd64
+    | "riscv64" | "riscv" | "rv64" -> Occ.Target.machine := Occ.Target.Riscv64
+    | _ -> Printf.eprintf "occld: unknown target %s\n" name; exit 2 in
+  (match Sys.getenv_opt "OCC_TARGET" with Some t -> target t | None -> ());
   let rec go = function
     | [] -> ()
     | "-o" :: f :: rest -> output := f; go rest
@@ -31,7 +39,11 @@ let () =
          | _ -> go rest)
     | a :: rest when String.length a > 2 && String.sub a 0 2 = "-L" -> search := !search @ [ String.sub a 2 (String.length a - 2) ]; go rest
     | a :: rest when String.length a > 2 && String.sub a 0 2 = "-l" -> items := Occ.Linker.Link.Library (String.sub a 2 (String.length a - 2)) :: !items; go rest
-    | "--version" :: _ -> print_string "occld (occ) 0.1\n"; exit 0
+    | "--target" :: t :: rest -> target t; go rest
+    | a :: rest when String.length a > 8 && String.sub a 0 9 = "--target=" ->
+        target (String.sub a 9 (String.length a - 9)); go rest
+    | "--version" :: _ ->
+        Printf.printf "occld (occ) 0.1 for %s\n" (Occ.Target.name !Occ.Target.machine); exit 0
     | a :: _ when String.length a > 0 && a.[0] = '-' -> Printf.eprintf "occld: unknown option %s\n%s" a usage; exit 2
     | a :: rest ->
         items :=

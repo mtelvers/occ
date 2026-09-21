@@ -44,6 +44,12 @@ type reloc = {
 
 type t = {
   file : string;           (* for messages: path, or archive(member) *)
+  (* The machine flags the object was built with, which on RISC-V say
+     which floating-point ABI its code follows and whether it holds
+     compressed instructions.  The output's are the union of its
+     inputs', as ld makes them: a file holding one compressed
+     instruction is a file that needs the bit set. *)
+  eflags : int;
   sections : section array;
   symbols : symbol array;
   relocs : (int * reloc array) list;   (* target section index, entries *)
@@ -212,4 +218,4 @@ let read file (s : string) : t =
             groups := (cstring strtab (u32 symtab.body e), members) :: !groups
           end
       | _ -> ()) sections;
-  { file; sections; symbols = !symbols; relocs = List.rev !relocs; groups = !groups }
+  { file; eflags = u32 s 0x30; sections; symbols = !symbols; relocs = List.rev !relocs; groups = !groups }

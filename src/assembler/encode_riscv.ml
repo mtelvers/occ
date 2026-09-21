@@ -584,10 +584,13 @@ and call ~rd target =
 
 (* ---- Patching a value the assembler worked out itself ----------------- *)
 
-(* A value the assembler knows goes into the instruction's fields rather
-   than into whole bytes, so patching means rebuilding those fields.
-   Anything left to the linker keeps its zero bits and a relocation
-   instead, which [reloc_type] names. *)
+(* A value goes into the instruction's fields rather than into whole
+   bytes, so patching means rebuilding those fields.  The field is
+   cleared first, so that this works for the linker too: it patches
+   fields the assembler already wrote a provisional value into.
+
+   Anything the assembler leaves to the linker keeps its provisional
+   value and a relocation, which [reloc_type] names. *)
 let patch (bytes : Bytes.t) at (f : Fixup.field) (v : int64) =
   let get k =
     let b i = Int32.of_int (Char.code (Bytes.get bytes (k + i))) in
@@ -595,6 +598,14 @@ let patch (bytes : Bytes.t) at (f : Fixup.field) (v : int64) =
       (Int32.logor (Int32.shift_left (b 1) 8)
          (Int32.logor (Int32.shift_left (b 2) 16) (Int32.shift_left (b 3) 24))) in
   let set k w = Bytes.blit_string (word w) 0 bytes k 4 in
+  (* what of the instruction is not the field *)
+  let keep k mask = Int32.logand (get k) (Int32.lognot mask) in
+  let i_mask = bits (-1l) 20 12 in
+  let s_mask = Int32.logor (bits (-1l) 7 5) (bits (-1l) 25 7) in
+  let u_mask = bits (-1l) 12 20 in
+  let b_mask = Int32.logor (bits (-1l) 7 5) (bits (-1l) 25 7) in
+  let j_mask = bits (-1l) 12 20 in
+  let get k mask = keep k mask in
   let reach bits what =
     if not (Fixup.fits_signed bits v) then bad "%s is %Ld bytes away, too far" what v in
   let v32 = Int64.to_int32 v in
@@ -604,27 +615,27 @@ let patch (bytes : Bytes.t) at (f : Fixup.field) (v : int64) =
   match f with
   | Fixup.Whole -> bad "a whole-byte field on this machine"
   | Fixup.Rv_none -> ()
-  | Fixup.Rv_hi20 -> set at (Int32.logor (get at) (bits (hi20 ()) 12 20))
-  | Fixup.Rv_lo12_i -> set at (Int32.logor (get at) (bits v32 20 12))
+  | Fixup.Rv_hi20 -> set at (Int32.logor (get at u_mask) (bits (hi20 ()) 12 20))
+  | Fixup.Rv_lo12_i -> set at (Int32.logor (get at i_mask) (bits v32 20 12))
   | Fixup.Rv_lo12_s ->
-      set at (Int32.logor (get at) (Int32.logor (bits v32 7 5) (field v32 25 7 5)))
+      set at (Int32.logor (get at s_mask) (Int32.logor (bits v32 7 5) (field v32 25 7 5)))
   | Fixup.Rv_branch ->
       reach 13 "the branch target";
-      set at (Int32.logor (get at)
+      set at (Int32.logor (get at b_mask)
                 (Int32.logor (field v32 8 4 1)
                    (Int32.logor (field v32 7 1 11)
                       (Int32.logor (field v32 25 6 5) (field v32 31 1 12)))))
   | Fixup.Rv_jal ->
       reach 21 "the jump target";
-      set at (Int32.logor (get at)
+      set at (Int32.logor (get at j_mask)
                 (Int32.logor (field v32 21 10 1)
                    (Int32.logor (field v32 20 1 11)
                       (Int32.logor (field v32 12 8 12) (field v32 31 1 20)))))
   | Fixup.Rv_call ->
       (* the pair: the auipc takes the high twenty bits and the jalr the
          low twelve, both measured from the auipc *)
-      set at (Int32.logor (get at) (bits (hi20 ()) 12 20));
-      set (at + 4) (Int32.logor (get (at + 4)) (bits v32 20 12))
+      set at (Int32.logor (get at u_mask) (bits (hi20 ()) 12 20));
+      set (at + 4) (Int32.logor (get (at + 4) i_mask) (bits v32 20 12))
 
 (* ---- Which relocation a field asks for -------------------------------- *)
 
