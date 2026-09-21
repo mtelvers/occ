@@ -54,6 +54,7 @@ type st = {
      frame, and the return address and frame pointer go below it. *)
   mutable va_bytes : int;             (* size of that area, 0 if not variadic *)
   mutable named_int : int;            (* integer registers the named parameters took *)
+  locals : (string, unit) Hashtbl.t;  (* symbols defined in this unit with internal linkage *)
   tls : (string, unit) Hashtbl.t;     (* thread-local symbols, defined or declared *)
   mutable consts : data list;         (* the read-only constants the functions needed *)
   mutable files : (string, int) Hashtbl.t;  (* source file -> its number in the .file table *)
@@ -143,6 +144,7 @@ let float_const st (ty : Ir.ty) (v : float) =
       st.const_count <- st.const_count + 1;
       let l = Printf.sprintf ".LC%s.%d" st.fname st.const_count in
       st.float_consts <- ((bits, narrow), l) :: st.float_consts;
+      Hashtbl.replace st.locals l ();     (* ours, so its address is arithmetic *)
       l
 
 (* The address of a symbol.  Without position independence that is the
@@ -170,7 +172,15 @@ let load_sym st sym (dst : reg) =
       op st "add" [ Reg dst; Reg dst; Reg TP; Sym ("%tprel_add(" ^ sym ^ ")", 0) ];
       op st "addi" [ Reg dst; Reg dst; Sym ("%tprel_lo(" ^ sym ^ ")", 0) ]
     end
-  else if st.pic then op st "la" [ Reg dst; Sym (sym, 0) ]
+  else if st.pic then
+    (* "la" reads the address from the global offset table, which is what
+       a symbol another object may define its own version of needs; a
+       symbol defined here and not visible outside cannot be replaced, so
+       its address is pc-relative arithmetic, which is what "lla" is.
+       gcc draws the same line, and a shared object that draws it wrongly
+       does not link: the loader cannot reach an interposable symbol by
+       arithmetic. *)
+    op st (if Hashtbl.mem st.locals sym then "lla" else "la") [ Reg dst; Sym (sym, 0) ]
   else begin
     op st "lui" [ Reg dst; Sym ("%hi(" ^ sym ^ ")", 0) ];
     op st "addi" [ Reg dst; Reg dst; Sym ("%lo(" ^ sym ^ ")", 0) ]
@@ -280,6 +290,7 @@ let wide_const st (v : float) =
       st.const_count <- st.const_count + 1;
       let l = Printf.sprintf ".LW%s.%d" st.fname st.const_count in
       st.wide_consts <- ((lo, hi), l) :: st.wide_consts;
+      Hashtbl.replace st.locals l ();
       l
 
 (* the two words of a long double, into a pair of integer registers *)
@@ -1423,9 +1434,12 @@ let data_of_global (g : Ir.global) : data option =
 (* ---- a program ------------------------------------------------------ *)
 
 let program ~pic ~debug (p : Ir.program) : program =
-  let tls = Hashtbl.create 16 in
-  List.iter (fun (g : Ir.global) -> if g.gtls then Hashtbl.replace tls g.gname ()) p.globals;
-  let st = { pic; debug; tls; code = []; regs = Hashtbl.create 64; slots = [||]; frame = 0;
+  let locals = Hashtbl.create 64 and tls = Hashtbl.create 16 in
+  List.iter (fun (g : Ir.global) ->
+      if g.gdefined && not g.gglobal then Hashtbl.replace locals g.gname ();
+      if g.gtls then Hashtbl.replace tls g.gname ()) p.globals;
+  List.iter (fun (f : Ir.func) -> if not f.global then Hashtbl.replace locals f.name ()) p.funcs;
+  let st = { pic; debug; locals; tls; code = []; regs = Hashtbl.create 64; slots = [||]; frame = 0;
              fname = ""; label_count = 0; float_consts = []; const_count = 0;
              hidden_ptr = 0; va_bytes = 0; named_int = 0;
              wide = Hashtbl.create 8; wide_consts = []; consts = [];
@@ -1433,6 +1447,6 @@ let program ~pic ~debug (p : Ir.program) : program =
   let funcs = List.map (fun f -> func st f) p.funcs in
   let data = List.filter_map data_of_global p.globals in
   let files = List.sort compare (Hashtbl.fold (fun name n acc -> (n, name) :: acc) st.files []) in
-  { funcs; data = data @ List.rev st.consts;
+  { pic; funcs; data = data @ List.rev st.consts;
     source = (if debug then Some p.source else None); files;
     asm_blocks = p.asm_blocks; init_array = p.init_array; fini_array = p.fini_array }

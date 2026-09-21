@@ -83,6 +83,7 @@ type func = {
 }
 
 type program = {
+  pic : bool; (* position-independent: what "la" means, said in ".option" *)
   funcs : func list;
   data : data list;
   source : string option; (* Some when emitting debug information *)

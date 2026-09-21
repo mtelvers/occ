@@ -140,6 +140,12 @@ let func ppf (f : func) =
   p "\t.size\t%s, .-%s@." f.name f.name
 
 let program ppf (prog : program) =
+  (* Which addressing model the file uses, which is the first thing gcc
+     writes here.  It is not decoration: it says whether "la" reads an
+     address from the global offset table or works it out with
+     arithmetic, and only the former can reach a symbol another object
+     may replace. *)
+  Format.fprintf ppf "\t.option\t%s@." (if prog.pic then "pic" else "nopic");
   (* the .file table comes first, before any .loc refers to it *)
   List.iter (fun (n, name) -> Format.fprintf ppf "\t.file\t%d \"%s\"@." n (escape name)) prog.files;
   List.iter (fun text -> Format.fprintf ppf "%s@." text) prog.asm_blocks;

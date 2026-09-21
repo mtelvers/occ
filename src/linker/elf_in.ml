@@ -169,7 +169,11 @@ let read_shared file (s : string) : shared =
 
 let read file (s : string) : t =
   if not (is_object s) then failwith (file ^ ": not an ELF64 relocatable object");
-  if u16 s 18 <> 62 then failwith (file ^ ": not an x86-64 object");
+  (* the machine, which must be the one being linked for: 62 is x86-64
+     and 243 RISC-V *)
+  let want = match !Target.machine with Target.Amd64 -> 62 | Target.Riscv64 -> 243 in
+  if u16 s 18 <> want then
+    failwith (Printf.sprintf "%s: not a %s object" file (Target.name !Target.machine));
   let shoff = u64 s 0x28 and shentsize = u16 s 0x3a and shnum = u16 s 0x3c and shstrndx = u16 s 0x3e in
   let hdr i = shoff + i * shentsize in
   let shstr = u64 s (hdr shstrndx + 0x18) in

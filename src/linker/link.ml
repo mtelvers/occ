@@ -1390,7 +1390,9 @@ let link ?(shared = false) ?(soname = "") ?(export_all = false) ?(prefer_shared 
   let shstr_names = List.map (fun o -> o.oname) placed @ [ ".symtab"; ".strtab"; ".shstrtab" ] in
   let shstrtab, shstr_offs = string_table shstr_names in
   Buffer.add_string out "\x7fELF\x02\x01\x01\x00"; Buffer.add_string out (String.make 8 '\000');
-  u16 out (if st.shared then 3 else 2); u16 out 62; u32 out 1;   (* ET_DYN or ET_EXEC, x86-64 *)
+  u16 out (if st.shared then 3 else 2);                           (* ET_DYN or ET_EXEC *)
+  u16 out (match !Target.machine with Target.Amd64 -> 62 | Target.Riscv64 -> 243);
+  u32 out 1;
   u64 out (match entry with Some e -> address_of st (gsym st e) | None -> 0);
   u64 out 64;                                                (* e_phoff *)
   let shoff_pos = Buffer.length out in u64 out 0;
