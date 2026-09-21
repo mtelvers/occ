@@ -29,12 +29,26 @@ skip_section() {
 }
 drop_table_relocs() {
   if [ "$machine" = riscv64 ]
-  then grep -v "^\.rela\.\(eh_frame\|debug_\)"
+  then
+    # and the two assemblers name a numeric local label differently --
+    # gas writes ".L1\0021" for the first definition of "1:", occas
+    # ".Lnum1.1" -- so a relocation against a local label is compared by
+    # everything except which label it is.  Which label is checked by the
+    # bytes: occas fills in the displacement of every branch it can
+    # measure, and those match gas byte for byte.
+    grep -v "^\.rela\.\(eh_frame\|debug_\)" | sed 's/ \.L[^ ]*/ .L/'
   else cat
   fi
 }
-drop_anonymous() {
-  if [ "$machine" = riscv64 ]; then grep -v " \.L0$"; else cat; fi
+# Which local labels reach the symbol table follows from how the tables
+# were written: gas's ADD/SUB pairs name the two ends of every
+# difference, so the labels survive, where occas works the difference out
+# and the labels are dropped as the local labels they are.  So on RISC-V
+# the local labels are left out of this comparison -- the relocations
+# that name a label are still compared, and so is everything with a real
+# name.
+drop_local_labels() {
+  if [ "$machine" = riscv64 ]; then grep -v " \.L[^ ]*$"; else cat; fi
 }
 tmp=$(mktemp -d)
 n=0; fail=0
@@ -72,8 +86,8 @@ for d in "$@"; do
       rm -f "$tmp/occ.bin"; objcopy --dump-section "$s=$tmp/occ.bin" "$tmp/occ.o" "$tmp/junk.o" 2>/dev/null
       cmp -s "$tmp/ref.bin" "$tmp/occ.bin" || bad="$bad $s"
     done
-    symbols "$tmp/ref.o" | drop_anonymous > "$tmp/ref.sym"
-    symbols "$tmp/occ.o" | drop_anonymous > "$tmp/occ.sym"
+    symbols "$tmp/ref.o" | drop_local_labels > "$tmp/ref.sym"
+    symbols "$tmp/occ.o" | drop_local_labels > "$tmp/occ.sym"
     cmp -s "$tmp/ref.sym" "$tmp/occ.sym" || bad="$bad symbols"
     relocs "$tmp/ref.o" | grep -v "^.rela.debug_\(info\|aranges\)" | drop_table_relocs > "$tmp/ref.rel"
     relocs "$tmp/occ.o" | grep -v "^.rela.debug_\(info\|aranges\)" | drop_table_relocs > "$tmp/occ.rel"
