@@ -12,8 +12,10 @@
 # Not compared, deliberately, because occld does not emit them and a
 # loader does not need them: .gnu.hash (DT_HASH serves), the version
 # tables on definitions (occld versions only its references, which is
-# what keeps glibc from binding to a compatibility symbol), and the
-# order and addresses of everything, which no two linkers agree on.
+# what keeps glibc from binding to a compatibility symbol), the order
+# and addresses of everything, which no two linkers agree on, and the
+# section symbols GNU ld puts in the dynamic table on RISC-V, which are
+# not names anything can look up and which no relocation there names.
 #
 # usage: tools/dyncheck.sh
 set -u
@@ -32,7 +34,7 @@ tables() {
   {
     readelf -dW "$1" | sed -n 's/.*(\(NEEDED\|SONAME\|RUNPATH\)).*\[\(.*\)\]/\1 \2/p' | sort
     echo "--- symbols offered"
-    readelf --dyn-syms -W "$1" | awk '$7 != "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u
+    readelf --dyn-syms -W "$1" | awk '$4 != "SECTION" && $7 != "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u
     echo "--- symbols wanted"
     readelf --dyn-syms -W "$1" | awk '$7 == "UND" && $8 != "" {print $8}' | sed 's/@.*//' | sort -u
     echo "--- relocations"
@@ -66,8 +68,10 @@ compare_run() {      # compare_run name command...
 # that what differs is the linking and not the compiling: occ and gcc
 # make different (equally valid) choices about which addressing to use,
 # and comparing their objects would compare those instead.
-gcclib=$(ls -d /usr/lib/gcc/x86_64-linux-gnu/* 2>/dev/null | tail -1)
-syslib=/usr/lib/x86_64-linux-gnu
+# the machine's own directories, so this runs on either host
+triple=$(gcc -dumpmachine)
+gcclib=$(ls -d "/usr/lib/gcc/$triple"/* 2>/dev/null | tail -1)
+syslib=/usr/lib/$triple
 # --as-needed, because that is what gcc's driver passes on this
 # platform and so what the output of `occ -shared' is compared against:
 # a library named and not used is not one the object needs.  Bare ld

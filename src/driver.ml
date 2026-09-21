@@ -132,8 +132,15 @@ let parse_args argv =
      | "-dumpmachine" ->
          print_string (Target.name !Target.machine ^ "-unknown-linux-gnu\n"); exit 0
      | "--version" ->
-         print_string "occ 0.1 (C11, x86-64 Linux; native preprocess, compile, assemble and link; \
-                       gcc for shared objects)\n";
+         (* what this compiler does for the machine it is aimed at, which
+            is not the same on both: the linker does not yet make a
+            shared object for RISC-V, and says so rather than letting a
+            reader assume it *)
+         Printf.printf "occ 0.1 (C11, %s Linux; native preprocess, compile, assemble and link; %s)\n"
+           (Target.name !Target.machine)
+           (match !Target.machine with
+            | Target.Amd64 -> "shared objects and dynamic executables too"
+            | Target.Riscv64 -> "gcc for shared objects and dynamic executables");
          exit 0
      | "-I" -> o.cpp <- { o.cpp with include_dirs = o.cpp.include_dirs @ [ next a ] }
      | "-isystem" -> o.cpp <- { o.cpp with system_dirs = o.cpp.system_dirs @ [ next a ] }
@@ -343,10 +350,6 @@ let link o objects output =
         if !Target.machine = Target.Riscv64 && not o.pic
            && not (List.mem "-shared" (linker_words o)) then [ "-no-pie" ] else [] in
       run o delegate_cc (pie @ o.passthrough @ objects @ o.link_args @ [ "-o"; output ])
-  | Native when !Target.machine = Target.Riscv64 && link_kind o <> Static_exe ->
-      (* not yet: a dynamic executable and a shared object need this
-         machine's loader tables *)
-      run o delegate_cc (o.passthrough @ objects @ o.link_args @ [ "-o"; output ])
   | Native ->
       let user_dirs = List.filter_map (fun a ->
           if String.length a > 2 && String.sub a 0 2 = "-L" then Some (String.sub a 2 (String.length a - 2)) else None) o.link_args in
@@ -355,6 +358,10 @@ let link o objects output =
           if String.length a > 2 && String.sub a 0 2 = "-l" then Some (Linker.Link.Library (String.sub a 2 (String.length a - 2)))
           else if Filename.check_suffix a ".a" then Some (Linker.Link.Archive a)
           else if Filename.check_suffix a ".o" then Some (Linker.Link.Object a)
+          (* a shared object named as a file rather than with -l, which
+             gcc accepts and a Makefile often writes *)
+          else if Filename.check_suffix a ".so" || String.length a > 4 && Filename.check_suffix (Filename.remove_extension a) ".so"
+          then Some (Linker.Link.Shared a)
           else None) (objects @ o.link_args) in
       let crt name = Linker.Link.Object (find_file search name) in
       let kind = link_kind o in

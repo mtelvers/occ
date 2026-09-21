@@ -125,13 +125,17 @@ let hash_size n = 8 + 4 * (max 1 (n / 4)) + 4 * n
    loader adds the load address to. *)
 type rel = { where : int; rtype : int; rsym : int; addend : int }
 
-let r_x86_64_64 = 1
-let r_x86_64_glob_dat = 6
-let r_x86_64_jump_slot = 7
-let r_x86_64_relative = 8
-let r_x86_64_dtpmod64 = 16
-let r_x86_64_dtpoff64 = 17
-let r_x86_64_tpoff64 = 18
+(* The loader's relocation types say the same things on the two machines
+   under different numbers, so they are asked for by what they mean.
+   RISC-V has no equivalent of GLOB_DAT: a table entry the loader must
+   fill takes the plain sixty-four-bit absolute kind, which is what its
+   own linkers emit. *)
+let r_absolute () = match !Target.machine with Target.Amd64 -> 1 | Target.Riscv64 -> 2
+let r_glob_dat () = match !Target.machine with Target.Amd64 -> 6 | Target.Riscv64 -> 2
+let r_jump_slot () = match !Target.machine with Target.Amd64 -> 7 | Target.Riscv64 -> 5
+let r_relative () = match !Target.machine with Target.Amd64 -> 8 | Target.Riscv64 -> 3
+let r_copy () = match !Target.machine with Target.Amd64 -> 5 | Target.Riscv64 -> 4
+let r_tpoff () = match !Target.machine with Target.Amd64 -> 18 | Target.Riscv64 -> 11
 
 let rela rels =
   let b = Buffer.create (24 * List.length rels) in
@@ -146,7 +150,7 @@ let rela rels =
    many, so that a loader can apply them without looking at each one.
    This is the order GNU ld uses as well. *)
 let sort_rels rels =
-  let relative, rest = List.partition (fun r -> r.rtype = r_x86_64_relative) rels in
+  let relative, rest = List.partition (fun r -> r.rtype = r_relative ()) rels in
   relative @ rest
 
 (* ---- the version tables ---- *)

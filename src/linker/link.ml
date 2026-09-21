@@ -47,7 +47,12 @@ let shn_undef = 0 and shn_abs = 0xfff1 and shn_common = 0xfff2
 let exec_base = 0x400000
 
 (* the loader an executable that needs one names (x86-64 ABI) *)
-let interpreter = "/lib64/ld-linux-x86-64.so.2"
+(* The loader a dynamic executable asks for, which is a different path
+   on each machine and is compiled into the binary. *)
+let interpreter () =
+  match !Target.machine with
+  | Target.Amd64 -> "/lib64/ld-linux-x86-64.so.2"
+  | Target.Riscv64 -> "/lib/ld-linux-riscv64-lp64d.so.1"
 let page = 0x1000
 
 (* ---- Inputs and symbols ------------------------------------------------------ *)
@@ -551,7 +556,10 @@ type dyn_need = No_need | Need_relative | Need_symbol of gsym
 
 let dyn_need st (inp : input) target (r : reloc) =
   if not st.dyn || inp.obj.sections.(target).flags land shf_alloc = 0 then No_need
-  else if r.rtype <> r_x86_64_64 then No_need
+  (* the eight-byte absolute kind, whose number differs: R_RISCV_32 is 1,
+     which is x86-64's own sixty-four-bit kind *)
+  else if r.rtype <> (match !Target.machine with Target.Amd64 -> r_x86_64_64 | Target.Riscv64 -> r_riscv_64)
+  then No_need
   else
     let sy = inp.obj.symbols.(r.sym) in
     let global = sy.bind <> stb_local && sy.stype <> stt_section && sy.sname <> "" in
@@ -584,9 +592,18 @@ let scan_relocs st =
                 (* and a variable in another object, referred to by its
                    address rather than through the table, needs a copy
                    of its own here for the loader to fill *)
-                if st.dyn && not st.shared && global
-                   && (r.rtype = r_x86_64_64 || r.rtype = r_x86_64_32 || r.rtype = r_x86_64_32s
-                       || r.rtype = r_x86_64_pc32)
+                let reaches_directly =
+                  match !Target.machine with
+                  | Target.Amd64 ->
+                      r.rtype = r_x86_64_64 || r.rtype = r_x86_64_32 || r.rtype = r_x86_64_32s
+                      || r.rtype = r_x86_64_pc32
+                  (* the ways RISC-V names an address without a table: the
+                     absolute pair, the pc-relative pair, and a whole
+                     word of data *)
+                  | Target.Riscv64 ->
+                      r.rtype = r_riscv_hi20 || r.rtype = r_riscv_lo12_i || r.rtype = r_riscv_lo12_s
+                      || r.rtype = r_riscv_pcrel_hi20 || r.rtype = r_riscv_64 || r.rtype = r_riscv_32 in
+                if st.dyn && not st.shared && global && reaches_directly
                 then begin
                   let g = gsym st sy.sname in
                   if is_imported g then
@@ -595,11 +612,24 @@ let scan_relocs st =
                         st.copies <- (g, sy'.ssize) :: List.filter (fun (h, _) -> h != g) st.copies
                     | _ -> ()
                 end;
+                (* RISC-V, whose table forms need an entry each -- one
+                   holding an address, one a thread-pointer offset -- and
+                   whose calls out need a stub to call instead.  This
+                   leaves the chain below to do the counting, which it
+                   must: reserving here and counting there are the two
+                   halves of one answer. *)
                 if !Target.machine = Target.Riscv64 then begin
-                  (* the table forms, which need an entry each: one
-                     holding the address, one the thread-pointer offset *)
                   if r.rtype = r_riscv_got_hi20 then ignore (got_slot st (got_key inp sy false));
-                  if r.rtype = r_riscv_tls_got_hi20 then ignore (got_slot st (got_key inp sy true))
+                  if r.rtype = r_riscv_tls_got_hi20 then ignore (got_slot st (got_key inp sy true));
+                  if st.dyn && global && (r.rtype = r_riscv_call_plt || r.rtype = r_riscv_call)
+                     && from_loader ~shared:st.shared (gsym st sy.sname)
+                  then ignore (dplt_entry st (gsym st sy.sname))
+                end;
+                if !Target.machine = Target.Riscv64 then begin
+                  if dyn_need st inp target r <> No_need then begin
+                    st.n_from_relocs <- st.n_from_relocs + 1;
+                    st.n_dynrel <- st.n_dynrel + 1
+                  end
                 end
                 else if r.rtype = r_x86_64_gotpcrel || r.rtype = r_x86_64_gotpcrelx || r.rtype = r_x86_64_rex_gotpcrelx then
                   (if not ifunc then ignore (got_slot st (got_key inp sy false)))
@@ -834,7 +864,7 @@ let synthesize st =
   if st.dyn && not st.shared then begin
     let o = osec st ".interp" in
     o.oflags <- shf_alloc; o.otype <- sht_progbits; o.oalign <- 1;
-    o.osize <- String.length interpreter + 1
+    o.osize <- String.length (interpreter ()) + 1
   end;
   if st.dyn then begin
     let strings = build_strtab st in
@@ -1014,7 +1044,7 @@ let read_uleb_in_place (o : osec) off =
 (* One relocation of a RISC-V object.  [s] is the symbol's address, [a]
    the addend, [p] where the relocation is, [where] its offset in the
    output section. *)
-let riscv_reloc st (o : osec) ~sy ~slot ~tls_slot ~s ~p ~where ~a ~name ~t =
+let riscv_reloc st (inp : input) target (o : osec) ~r ~sy ~g ~slot ~tls_slot ~s ~p ~where ~a ~name ~t =
   let open Assembler in
   let field kind v = Encode_riscv.patch o.body where kind (Int64.of_int v) in
   let hi20_at v = Hashtbl.replace riscv_pcrel p v; field Fixup.Rv_hi20 v in
@@ -1028,8 +1058,43 @@ let riscv_reloc st (o : osec) ~sy ~slot ~tls_slot ~s ~p ~where ~a ~name ~t =
     let v = f (read_at o where size) in
     for i = 0 to size - 1 do Bytes.set o.body (where + i) (Char.chr ((v asr (8 * i)) land 0xff)) done in
   ignore sy;
+  (* [shared] something a shared object provides: a call goes to the stub
+     that jumps through the slot the loader filled, and an address is
+     left for the loader to put in *)
+  let imported = st.dyn && (match g with Some g -> from_loader ~shared:st.shared g | None -> false) in
   if t = r_riscv_relax || t = r_riscv_align then ()
-  else if t = r_riscv_64 then patch o where 8 (s () + a)
+  else if imported && (t = r_riscv_call_plt || t = r_riscv_call) then begin
+    let stub = (osec st ".plt").addr + 16 * dplt_entry st (Option.get g) in
+    field Fixup.Rv_call (stub + a - p)
+  end
+  else if imported && t = r_riscv_64 then begin
+    patch o where 8 a;
+    match dyn_need st inp target r with
+    | Need_symbol g ->
+        st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_absolute ();
+                        rsym = g.dynidx; addend = a } :: st.dynrels
+    | Need_relative | No_need -> ()
+  end
+  (* The table forms need no special case for a symbol the loader
+     provides: the instruction addresses the slot either way, and the
+     slot itself is left to the loader where it has to be. *)
+  else if t = r_riscv_got_hi20 then hi20_at (slot () + a - p)
+  else if t = r_riscv_tls_got_hi20 then hi20_at (tls_slot () + a - p)
+  else if imported then
+    error "%s: %s is for the loader to find and relocation type %d cannot reach it"
+      inp.obj.file name t
+  else if t = r_riscv_64 then begin
+    let v = s () + a in
+    patch o where 8 v;
+    (* [shared] the loader adds where the object went to this address, so
+       what is left here is the addend it works from *)
+    match dyn_need st inp target r with
+    | Need_relative ->
+        st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_relative (); rsym = 0; addend = v } :: st.dynrels
+    | Need_symbol g ->
+        st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_absolute (); rsym = g.dynidx; addend = a } :: st.dynrels
+    | No_need -> ()
+  end
   else if t = r_riscv_32 then (let v = s () + a in check_unsigned32 name v; patch o where 4 v)
   else if t = r_riscv_32_pcrel then (let v = s () + a - p in check_signed32 name v; patch o where 4 v)
   else if t = r_riscv_branch then field Fixup.Rv_branch (s () + a - p)
@@ -1041,8 +1106,6 @@ let riscv_reloc st (o : osec) ~sy ~slot ~tls_slot ~s ~p ~where ~a ~name ~t =
   else if t = r_riscv_pcrel_hi20 then hi20_at (s () + a - p)
   else if t = r_riscv_pcrel_lo12_i then field Fixup.Rv_lo12_i (low_of_pair ())
   else if t = r_riscv_pcrel_lo12_s then field Fixup.Rv_lo12_s (low_of_pair ())
-  else if t = r_riscv_got_hi20 then hi20_at (slot () + a - p)
-  else if t = r_riscv_tls_got_hi20 then hi20_at (tls_slot () + a - p)
   else if t = r_riscv_tprel_hi20 then field Fixup.Rv_hi20 (tp_offset st (s ()) + a)
   else if t = r_riscv_tprel_lo12_i then field Fixup.Rv_lo12_i (tp_offset st (s ()) + a)
   else if t = r_riscv_tprel_lo12_s then field Fixup.Rv_lo12_s (tp_offset st (s ()) + a)
@@ -1118,7 +1181,7 @@ let relocate st =
                     let name = if global then sy.sname else inp.obj.sections.(sy.shndx).name in
                     let t = r.rtype in
                     if !Target.machine = Target.Riscv64 then
-                      riscv_reloc st o ~sy ~s ~p ~where ~a ~name ~t
+                      riscv_reloc st inp target o ~r ~sy ~g ~s ~p ~where ~a ~name ~t
                         ~slot:(fun () -> got_addr (Hashtbl.find st.got (got_key inp sy false)))
                         ~tls_slot:(fun () -> got_addr (Hashtbl.find st.got (got_key inp sy true)))
                     (* [shared] a reference to something a shared
@@ -1134,7 +1197,7 @@ let relocate st =
                         patch o where 8 a;
                         match dyn_need st inp target r with
                         | Need_symbol g ->
-                            st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_x86_64_64;
+                            st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_absolute ();
                                             rsym = g.dynidx; addend = a } :: st.dynrels
                         | Need_relative | No_need -> ()
                       end
@@ -1161,10 +1224,10 @@ let relocate st =
                          addend it works from *)
                       match dyn_need st inp target r with
                       | Need_relative ->
-                          st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_x86_64_relative;
+                          st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_relative ();
                                           rsym = 0; addend = v } :: st.dynrels
                       | Need_symbol g ->
-                          st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_x86_64_64;
+                          st.dynrels <- { Dynamic.where = p; rtype = Dynamic.r_absolute ();
                                           rsym = g.dynidx; addend = a } :: st.dynrels
                       | No_need -> ()
                     end
@@ -1233,6 +1296,32 @@ let assign_plt_slots st =
   st.n_dplt_slots <- !k
 
 (* GOT contents, PLT stubs and IRELATIVE entries *)
+(* One stub of the procedure linkage table: a jump through the table
+   slot the loader filled in.  Sixteen bytes on both machines, which is
+   why the arithmetic around this does not care which it is writing.
+
+   There is no lazy form and so no header stub: this linker asks the
+   loader to bind everything before the program starts (DF_BIND_NOW), so
+   a slot always holds the function itself and the stub need not pass an
+   index to a resolver. *)
+let plt_stub (plt : osec) entry slot =
+  match !Target.machine with
+  | Target.Amd64 ->
+      (* jmp *slot(%rip), padded out with nops *)
+      Bytes.blit_string "\xff\x25" 0 plt.body entry 2;
+      patch plt (entry + 2) 4 (slot - (plt.addr + entry + 6));
+      Bytes.blit_string "\x0f\x1f\x84\x00\x00\x00\x00\x00\x66\x90" 0 plt.body (entry + 6) 10
+  | Target.Riscv64 ->
+      (* auipc t3, %pcrel_hi(slot); ld t3, %pcrel_lo(slot)(t3); jr t3; nop *)
+      let here = plt.addr + entry in
+      let d = slot - here in
+      let hi = (d + 0x800) asr 12 and lo = d land 0xfff in
+      let word k w = patch plt (entry + k) 4 w in
+      word 0 (0x17 lor (28 lsl 7) lor ((hi land 0xfffff) lsl 12));      (* auipc t3 *)
+      word 4 (0x03 lor (28 lsl 7) lor (3 lsl 12) lor (28 lsl 15) lor (lo lsl 20));  (* ld t3,lo(t3) *)
+      word 8 (0x67 lor (28 lsl 15));                                    (* jr t3 *)
+      word 12 0x13                                                      (* nop *)
+
 let fill_tables st =
   (match Hashtbl.find_opt st.sections ".got" with
    | Some o ->
@@ -1271,7 +1360,7 @@ let fill_tables st =
                   thread-local nothing else can see needs. *)
                match named with
                | Some g when st.shared || from_loader ~shared:st.shared g ->
-                   st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_x86_64_tpoff64;
+                   st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_tpoff ();
                                    rsym = g.dynidx; addend = 0 } :: st.dynrels
                | _ ->
                  if st.shared then begin
@@ -1282,23 +1371,24 @@ let fill_tables st =
                                                other = 0; shndx; value; ssize = 0 }
                          - tls_block_start st
                      | Global (name, _) -> value_of st (gsym st name) - tls_block_start st in
-                   st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_x86_64_tpoff64;
+                   st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_tpoff ();
                                    rsym = 0; addend = within } :: st.dynrels
                  end
              end
              else
                match named with
                | Some g when st.shared || is_imported g ->
-                   st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_x86_64_glob_dat;
+                   st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_glob_dat ();
                                    rsym = g.dynidx; addend = 0 } :: st.dynrels
                | _ ->
                    if st.shared then
-                     st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_x86_64_relative;
+                     st.dynrels <- { Dynamic.where = at; rtype = Dynamic.r_relative ();
                                      rsym = 0; addend = v } :: st.dynrels
            end) st.got_slots
    | None -> ());
-  (* [shared] the stubs for calls out: jmp *slot(%rip), and a JUMP_SLOT
-     relocation asking the loader to put the function's address there *)
+  (* [shared] the stubs for calls out, and a JUMP_SLOT relocation asking
+     the loader to put the function's address in the slot each jumps
+     through *)
   (match Hashtbl.find_opt st.sections ".plt", Hashtbl.find_opt st.sections ".rela.plt" with
    | Some plt, rela when st.n_dplt > 0 ->
        let rela = match rela with Some r -> r | None -> plt in
@@ -1315,15 +1405,13 @@ let fill_tables st =
                  let slot = dplt_slot_addr st k in
                  (* the loader is asked for this function's address *)
                  patch rela (24 * k) 8 slot;
-                 patch rela (24 * k + 8) 8 (Dynamic.r_x86_64_jump_slot lor (g.dynidx lsl 32));
+                 patch rela (24 * k + 8) 8 (Dynamic.r_jump_slot () lor (g.dynidx lsl 32));
                  patch rela (24 * k + 16) 8 0;
                  slot
              | None ->
                  (* it is already in the table, with its own relocation *)
                  (osec st ".got").addr + 8 * Hashtbl.find st.got (Global (g.name, false)) in
-           Bytes.blit_string "\xff\x25" 0 plt.body entry 2;
-           patch plt (entry + 2) 4 (slot - (plt.addr + entry + 6));
-           Bytes.blit_string "\x0f\x1f\x84\x00\x00\x00\x00\x00\x66\x90" 0 plt.body (entry + 6) 10)
+           plt_stub plt entry slot)
          st.dplts
    | _ -> ());
   match Hashtbl.find_opt st.sections ".iplt", Hashtbl.find_opt st.sections ".got.plt", Hashtbl.find_opt st.sections ".rela.iplt" with
@@ -1331,11 +1419,8 @@ let fill_tables st =
       List.iter (fun g ->
           let k = Option.get g.plt in
           let slot = gotplt.addr + 8 * k in
-          (* jmp *slot(%rip), padded to 16 bytes *)
           let entry = 16 * k in
-          Bytes.blit_string "\xff\x25" 0 plt.body entry 2;
-          patch plt (entry + 2) 4 (slot - (plt.addr + entry + 6));
-          Bytes.blit_string "\x0f\x1f\x84\x00\x00\x00\x00\x00\x66\x90" 0 plt.body (entry + 6) 10;
+          plt_stub plt entry slot;
           (* the resolver runs at startup and its result goes in the slot *)
           patch rela (24 * k) 8 slot;
           patch rela (24 * k + 8) 8 r_x86_64_irelative;
@@ -1401,11 +1486,11 @@ let fill_dynamic st =
   (* the relocations the loader applies, the ones naming no symbol first *)
   let copies =
     List.map (fun ((g : gsym), _) ->
-        { Dynamic.where = value_of st g; rtype = 5 (* R_X86_64_COPY *);
+        { Dynamic.where = value_of st g; rtype = Dynamic.r_copy ();
           rsym = g.dynidx; addend = 0 })
       (List.rev st.copies) in
   let rels = Dynamic.sort_rels (List.rev st.dynrels @ copies) in
-  st.n_relative <- List.length (List.filter (fun (r : Dynamic.rel) -> r.rtype = Dynamic.r_x86_64_relative) rels);
+  st.n_relative <- List.length (List.filter (fun (r : Dynamic.rel) -> r.rtype = Dynamic.r_relative ()) rels);
   put ".rela.dyn" (Dynamic.rela rels);
   (* the version each name is to be looked up under: the imports carry
      what the shared object offered, and anything this object defines
@@ -1423,7 +1508,7 @@ let fill_dynamic st =
     put ".gnu.version" (Dynamic.versym indices);
     put ".gnu.version_r" (Dynamic.verneed needs)
   end;
-  put ".interp" (interpreter ^ "\000");
+  put ".interp" (interpreter () ^ "\000");
   put ".dynamic" (Dynamic.dynamic (dynamic_entries st strings))
 
 (* ---- Linker-defined symbols ------------------------------------------------------ *)

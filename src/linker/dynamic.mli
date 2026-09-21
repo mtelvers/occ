@@ -27,13 +27,17 @@ val hash_size : int -> int
 
 type rel = { where : int; rtype : int; rsym : int; addend : int }
 
-val r_x86_64_64 : int
-val r_x86_64_glob_dat : int
-val r_x86_64_jump_slot : int
-val r_x86_64_relative : int
-val r_x86_64_dtpmod64 : int
-val r_x86_64_dtpoff64 : int
-val r_x86_64_tpoff64 : int
+(** The loader's relocation types, by what they mean rather than by
+    their numbers, which differ between the machines: put an address
+    here, bind a symbol's address into the table, add the load address
+    to what is here, copy a variable in, put a thread-local's offset
+    here. *)
+val r_absolute : unit -> int
+val r_glob_dat : unit -> int
+val r_jump_slot : unit -> int
+val r_relative : unit -> int
+val r_copy : unit -> int
+val r_tpoff : unit -> int
 
 val rela : rel list -> string
 val sort_rels : rel list -> rel list
