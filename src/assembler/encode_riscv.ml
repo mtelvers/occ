@@ -272,6 +272,11 @@ let fp_ops = [
   "fsgnj", 0x10; "fmin", 0x14;
 ]
 
+(* The fused multiply-adds, the one family with four register operands:
+   the third source sits in the top five bits where a funct7 would be,
+   and two bits below it say which precision.  ocamlopt emits them. *)
+let fma_ops = [ "fmadd", 0x43; "fmsub", 0x47; "fnmsub", 0x4b; "fnmadd", 0x4f ]
+
 (* comparisons: funct7 and funct3 *)
 let fcmp_ops = [ "feq", 2; "flt", 1; "fle", 0 ]
 
@@ -468,6 +473,19 @@ let rec instruction (i : instruction) : encoded =
            let exact = into = "d" in
            plain (r_type ~op:op_fp ~f3:(rm ~default:(if exact then 0 else 7) 2) ~f7
                     ~rd:(frd_of ops 0) ~rs1:(frd_of ops 1) ~rs2))
+  | _ when (match suffixes m with [ base; ("s" | "d") ] -> List.mem_assoc base fma_ops | _ -> false) ->
+      want_rm 4;
+      let base, prec = match suffixes m with [ b; p ] -> b, p | _ -> assert false in
+      let fmt = if prec = "d" then 1 else 0 in
+      let w =
+        Int32.logor (Int32.of_int (List.assoc base fma_ops))
+          (Int32.logor (bits (Int32.of_int (frd_of ops 0)) 7 5)
+             (Int32.logor (bits (Int32.of_int (rm 4)) 12 3)
+                (Int32.logor (bits (Int32.of_int (frd_of ops 1)) 15 5)
+                   (Int32.logor (bits (Int32.of_int (frd_of ops 2)) 20 5)
+                      (Int32.logor (bits (Int32.of_int fmt) 25 2)
+                         (bits (Int32.of_int (frd_of ops 3)) 27 5)))))) in
+      plain w
   (* moving bits between the banks, which is not a conversion *)
   | "fmv.x.w" -> want 2; plain (r_type ~op:op_fp ~f3:0 ~f7:0x70 ~rd:(rd_of ops 0) ~rs1:(frd_of ops 1) ~rs2:0)
   | "fmv.w.x" -> want 2; plain (r_type ~op:op_fp ~f3:0 ~f7:0x78 ~rd:(frd_of ops 0) ~rs1:(rd_of ops 1) ~rs2:0)
