@@ -9,7 +9,7 @@ type st = {
   tls : (string, unit) Hashtbl.t; (* thread-local symbols, defined or declared *)
   mutable code : instr list; (* reversed *)
   mutable regs : (int, int) Hashtbl.t; (* spilled Ir reg -> rbp offset *)
-  mutable alloc : Regalloc.assignment; (* where each Ir register lives *)
+  mutable alloc : Asm.reg Regalloc.assignment; (* where each Ir register lives *)
   mutable saved : (reg * int) list; (* callee-saved registers and their save slots *)
   mutable slots : int array; (* Ir slot -> rbp offset *)
   mutable frame : int; (* bytes below rbp allocated so far *)
@@ -194,6 +194,32 @@ let set_flag st cc (r : int) =
   emit st (Setcc (cc, Reg RAX));
   emit st (Movzx (B, L, Reg RAX, Reg RAX));
   store_int st Ir.I32 r RAX
+
+(* ---- What the allocator needs to know about this machine ------------- *)
+
+(* The algorithm is in [Regalloc] and is the same on both machines; what
+   is x86-64's is which registers may be allocated, and which registers
+   the code below writes for itself.  rax, rcx, rdx, r10 and r11 are
+   never allocated: whatever [Select] is doing at the time uses them. *)
+
+let callee_saved = [ RBX; R12; R13; R14; R15 ]
+let caller_saved = [ R8; R9; RSI; RDI ]
+
+let clobbers (i : Ir.instr) : Asm.reg list =
+  match i with
+  | Ir.Call _ | Ir.Inline_asm _ -> caller_saved
+  | Ir.Memcpy _ | Ir.Memzero _ -> [ RDI; RSI ]
+  | Ir.Atomic_rmw _ | Ir.Atomic_cmpxchg _ | Ir.Va_arg _ -> [ RSI ]
+  | Ir.Va_arg_aggregate _ -> [ RSI; RDI; R8 ]
+  | Ir.Ret (Some (Ir.Rv_aggregate _)) -> [ RDI; RSI ]
+  | _ -> []
+
+let reg_name = function
+  | RBX -> "rbx" | R12 -> "r12" | R13 -> "r13" | R14 -> "r14" | R15 -> "r15"
+  | R8 -> "r8" | R9 -> "r9" | RSI -> "rsi" | RDI -> "rdi" | _ -> "?"
+
+let allocate (f : Ir.func) =
+  Regalloc.allocate ~callee_saved ~caller_saved ~clobbers ~name:reg_name f
 
 (* The .file index of a source file, emitting the directive on first use. *)
 let file_index st name =
@@ -950,7 +976,7 @@ let func st (f : Ir.func) : func =
   st.code <- []; st.regs <- Hashtbl.create 64; st.f80 <- Hashtbl.create 8; st.scratch <- 0; st.frame <- 0; st.fname <- f.name; st.label_count <- 0;
   (* frame: IR slots; spill slots are allocated as they are first used *)
   st.slots <- Array.map (fun (s : Ir.slot) -> alloc st s.size (max s.align 1)) f.slots;
-  st.alloc <- Regalloc.allocate f;
+  st.alloc <- allocate f;
   st.saved <- List.map (fun p -> p, alloc st 8 8) st.alloc.used;
   (* parameters arrive per the same assignment a caller makes *)
   let hidden = match f.returns_aggregate with Some (_, passing) -> in_memory passing | None -> false in

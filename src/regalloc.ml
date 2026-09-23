@@ -1,24 +1,21 @@
-open Asm
+(* Linear-scan register allocation over the IR (Poletto and Sarkar's
+   algorithm, in one page).
 
-type location = Register of Asm.reg | Spill of int
+   None of this is machine knowledge and it is the same job on both
+   machines, so the machines supply only four things: which registers may
+   be allocated and which of those a call destroys, which registers an
+   instruction's selected code writes for itself, and how to name one in
+   a dump.  Everything else -- what an instruction defines and uses,
+   which values are floating-point, where each value's live interval
+   begins and ends, and which value wins a register when two want one --
+   is read off the IR.
 
-type assignment = { where : (int, location) Hashtbl.t; spill_slots : int; used : Asm.reg list }
+   Floating-point values are not allocated: they live in frame slots, on
+   both machines, which is where the second pass puts them. *)
 
-let callee_saved = [ RBX; R12; R13; R14; R15 ]
-let caller_saved = [ R8; R9; RSI; RDI ]
-let allocatable = callee_saved @ caller_saved
+type 'r location = Register of 'r | Spill of int
 
-(* The caller-saved registers an instruction's selected code may write,
-   besides the scratch registers rax, rcx, rdx, r10 and r11 that are never
-   allocated.  Mirrors [Select]. *)
-let clobbers (i : Ir.instr) : Asm.reg list =
-  match i with
-  | Ir.Call _ | Ir.Inline_asm _ -> caller_saved
-  | Ir.Memcpy _ | Ir.Memzero _ -> [ RDI; RSI ]
-  | Ir.Atomic_rmw _ | Ir.Atomic_cmpxchg _ | Ir.Va_arg _ -> [ RSI ]
-  | Ir.Va_arg_aggregate _ -> [ RSI; RDI; R8 ]
-  | Ir.Ret (Some (Ir.Rv_aggregate _)) -> [ RDI; RSI ]
-  | _ -> []
+type 'r assignment = { where : (int, 'r location) Hashtbl.t; spill_slots : int; used : 'r list }
 
 (* Registers defined and used by an instruction. *)
 let regs_of_instr (i : Ir.instr) : int list * int list =
@@ -104,7 +101,8 @@ let intervals (f : Ir.func) =
             end) !loops) f.variables;
   List.sort compare (Hashtbl.fold (fun r s acc -> (s, Hashtbl.find last r, r) :: acc) first [])
 
-let allocate (f : Ir.func) : assignment =
+let allocate ~callee_saved ~caller_saved ~clobbers ~name (f : Ir.func) =
+  let allocatable = callee_saved @ caller_saved in
   let where = Hashtbl.create 64 in
   let floats = float_regs f in
   (* for each caller-saved register, the positions that clobber it *)
@@ -190,6 +188,6 @@ let allocate (f : Ir.func) : assignment =
   if Sys.getenv_opt "OCC_DUMP_ALLOC" = Some f.name then
     List.iter (fun (start, stop, r) ->
         Printf.eprintf "%%%d [%d,%d] -> %s\n" r start stop
-          (match Hashtbl.find where r with Register p -> (match p with RBX -> "rbx" | R12 -> "r12" | R13 -> "r13" | R14 -> "r14" | R15 -> "r15" | _ -> "?") | Spill k -> "slot" ^ string_of_int k))
+          (match Hashtbl.find where r with Register p -> name p | Spill k -> "slot" ^ string_of_int k))
       (intervals f);
   { where; spill_slots = !slots; used = List.sort compare (List.filter (fun p -> List.mem p callee_saved) !used) }
