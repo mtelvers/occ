@@ -201,6 +201,11 @@ let rv_addressing_ahead st =
     yes
   end
 
+(* A mnemonic is written in whichever case the author liked -- OCaml's
+   testsuite/tools/asmgen_riscv.S writes "ADDI" -- and gas reads them all
+   the same way. *)
+let lower = String.lowercase_ascii
+
 let rec rv_operand st =
   match st.tok with
   | IDENT name when register_by_name name <> None -> advance st; Reg (register st name)
@@ -433,13 +438,13 @@ let statement st =
             | IDENT mnemonic ->
                 advance st;
                 let ops = operands st in
-                [ Instruction { prefixes = st.pending_prefixes @ [ name ]; mnemonic; operands = ops } ]
+                [ Instruction { prefixes = st.pending_prefixes @ [ name ]; mnemonic = lower mnemonic; operands = ops } ]
             | _ -> st.pending_prefixes <- st.pending_prefixes @ [ name ]; [])
        | _ ->
            let ops = operands st in
            let p = st.pending_prefixes in
            st.pending_prefixes <- [];
-           [ Instruction { prefixes = p; mnemonic = name; operands = ops } ])
+           [ Instruction { prefixes = p; mnemonic = lower name; operands = ops } ])
   | _ -> error st "expected a statement"
 
 let parse file text =
