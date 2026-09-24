@@ -57,6 +57,7 @@ type data_item =
   | Quad_sym of string * int64 (* a symbol plus an addend, eight bytes *)
   | Quad of int64
   | Long of int32
+  | Long_diff of string * string (* four bytes holding a - b: a jump table's entry *)
 
 type data = {
   dname : string;

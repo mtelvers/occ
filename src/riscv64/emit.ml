@@ -123,7 +123,8 @@ let data ppf (d : data) =
            | Quad_sym (s, 0L) -> p "\t.quad\t%s@." s
            | Quad_sym (s, o) -> p "\t.quad\t%s%+Ld@." s o
            | Quad v -> p "\t.quad\t%Ld@." v
-           | Long v -> p "\t.long\t%ld@." v) d.items)
+           | Long v -> p "\t.long\t%ld@." v
+           | Long_diff (a, b) -> p "\t.long\t%s - %s@." a b) d.items)
 
 let func ppf (f : func) =
   let p fmt = Format.fprintf ppf fmt in

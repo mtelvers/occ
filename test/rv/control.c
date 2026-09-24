@@ -35,6 +35,48 @@ static int wide_magic(unsigned long m) {
   }
 }
 
+/* A switch over a run of nearby values, which becomes a jump table: the
+   shape of an interpreter's dispatch, and the reason the table is worth
+   having.  The holes and the ends are what a table gets wrong if the
+   bounds check or the index is off by one. */
+static int dispatch(int op, int a, int b) {
+  switch (op) {
+  case 0: return a + b;
+  case 1: return a - b;
+  case 2: return a * b;
+  case 3: return a & b;
+  case 4: return a | b;
+  case 5: return a ^ b;
+  case 6: return a << (b & 7);
+  case 8: return a >> (b & 7);          /* 7 is a hole */
+  case 9: return -a;
+  case 10: return ~b;
+  case 11: return a < b;
+  case 12: return a == b;
+  default: return 12345;
+  }
+}
+
+/* one whose cases do not start at zero, so the index is the value less
+   the smallest case */
+static int shifted(int op) {
+  switch (op) {
+  case 100: return 1; case 101: return 2; case 102: return 3;
+  case 103: return 4; case 104: return 5; case 106: return 7;
+  default: return -1;
+  }
+}
+
+/* and one on a narrower type, where the index has to be taken
+   zero-extended */
+static int narrow_switch(unsigned char c) {
+  switch (c) {
+  case 250: return 1; case 251: return 2; case 252: return 3;
+  case 253: return 4; case 255: return 6;
+  default: return 0;
+  }
+}
+
 int main(void) {
   yes("for", loops(5) == 10);
   yes("while", whileloop(4) == 10);
@@ -50,6 +92,20 @@ int main(void) {
   yes("switch on a value with its top bit set",
       magic(0x8495A6BEu) == 1 && magic(0x8495A6BFu) == 2 && magic(0x8495A6BDu) == 3
       && magic(0x7fffffffu) == 4 && magic(0) == -1);
+  yes("a jump table", dispatch(0, 7, 3) == 10 && dispatch(1, 7, 3) == 4
+      && dispatch(2, 7, 3) == 21 && dispatch(5, 7, 3) == 4
+      && dispatch(6, 1, 3) == 8 && dispatch(8, 64, 3) == 8
+      && dispatch(9, 5, 0) == -5 && dispatch(10, 0, 0) == -1
+      && dispatch(11, 1, 2) == 1 && dispatch(12, 2, 2) == 1);
+  yes("its holes and its edges",
+      dispatch(7, 1, 1) == 12345 && dispatch(13, 1, 1) == 12345
+      && dispatch(-1, 1, 1) == 12345 && dispatch(1000000, 1, 1) == 12345);
+  yes("a table that does not start at zero",
+      shifted(100) == 1 && shifted(104) == 5 && shifted(106) == 7
+      && shifted(105) == -1 && shifted(99) == -1 && shifted(107) == -1);
+  yes("a table on a narrower type",
+      narrow_switch(250) == 1 && narrow_switch(253) == 4 && narrow_switch(255) == 6
+      && narrow_switch(254) == 0 && narrow_switch(0) == 0 && narrow_switch(100) == 0);
   yes("switch at the register's own width",
       wide_magic(0xffffffffffffffffUL) == 1 && wide_magic(0x8000000000000000UL) == 2
       && wide_magic(1) == -1);

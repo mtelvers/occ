@@ -59,6 +59,7 @@ type st = {
   locals : (string, unit) Hashtbl.t;  (* symbols defined in this unit with internal linkage *)
   tls : (string, unit) Hashtbl.t;     (* thread-local symbols, defined or declared *)
   mutable consts : data list;         (* the read-only constants the functions needed *)
+  mutable tables : data list;         (* the jump tables the switches needed *)
   mutable files : (string, int) Hashtbl.t;  (* source file -> its number in the .file table *)
   mutable next_file : int;
 }
@@ -654,6 +655,29 @@ let conv st (c : Ir.conv) (r : int) (o : Ir.operand) =
       end
   | Ir.Fconv (_, _) -> failwith "Riscv64.Select: a conversion between two long doubles"
 
+(* Is a switch's set of cases worth a table?  Near enough together that
+   the holes cost less than the comparisons would -- and enough of them,
+   which on this machine means many more than on the other.
+
+   A table ends in an indirect jump, and this core pays for one: measured
+   on it, a dispatch over n cases takes
+
+       cases:      8     16     32     64    128
+       chain:   0.14   0.20   0.31   0.43   0.61
+       table:   0.30   0.30   0.30   0.30   0.30
+
+   so the chain -- whose every branch is predicted well -- wins until
+   about thirty-two cases, where the two meet.  x86-64 predicts an
+   indirect jump and takes a table from four.  OCaml's bytecode
+   interpreter dispatches over a hundred and fifty opcodes, which is the
+   case this is for. *)
+let dense (cases : (int64 * string) list) =
+  List.length cases >= 32 &&
+  let lo = List.fold_left (fun m (c, _) -> min m c) Int64.max_int cases in
+  let hi = List.fold_left (fun m (c, _) -> max m c) Int64.min_int cases in
+  let span = Int64.sub hi lo in
+  Int64.compare span 0L >= 0 && Int64.compare span (Int64.of_int (2 * List.length cases + 8)) <= 0
+
 (* ---- block moves ---------------------------------------------------- *)
 
 (* A copy, and a clear, between addresses already in registers.  A small
@@ -1105,8 +1129,48 @@ let instr st (i : Ir.instr) =
       load_int st Ir.I32 o (T 0);
       op st "bnez" [ Reg (T 0); Sym (t, 0) ];
       op st "j" [ Sym (e, 0) ]
+  (* A switch over a run of nearby values becomes a jump table: the
+     chain of comparisons below is two instructions a case, which the
+     interpreter's dispatch in OCaml's runtime cannot afford.  The index
+     is the value less the smallest case, checked unsigned so that one
+     comparison also rejects everything below the range, and each entry
+     holds its target's distance from the table, so the code needs no
+     relocation at run time and works wherever it is loaded. *)
+  | Ir.Switch (ty, o, cases, default) when dense cases ->
+      let lo = List.fold_left (fun m (c, _) -> min m c) Int64.max_int cases in
+      let hi = List.fold_left (fun m (c, _) -> max m c) Int64.min_int cases in
+      load_int st ty o (T 0);
+      if not (Int64.equal lo 0L) then begin
+        op st "li" [ Reg (T 1); Imm (narrow ty lo) ];
+        op st (if ty = Ir.I32 then "subw" else "sub") [ Reg (T 0); Reg (T 0); Reg (T 1) ]
+      end;
+      (* the index is compared as an unsigned value, so it is taken
+         zero-extended from whatever width it had *)
+      if width ty < 8 then begin
+        op st "slli" [ Reg (T 0); Reg (T 0); Imm (Int64.of_int (64 - 8 * width ty)) ];
+        op st "srli" [ Reg (T 0); Reg (T 0); Imm (Int64.of_int (64 - 8 * width ty)) ]
+      end;
+      op st "li" [ Reg (T 1); Imm (Int64.sub hi lo) ];
+      op st "bltu" [ Reg (T 1); Reg (T 0); Sym (default, 0) ];
+      st.const_count <- st.const_count + 1;
+      let table = Printf.sprintf ".LJT%s.%d" st.fname st.const_count in
+      Hashtbl.replace st.locals table ();
+      let entries = Array.make (Int64.to_int (Int64.sub hi lo) + 1) default in
+      List.iter (fun (c, l) -> entries.(Int64.to_int (Int64.sub c lo)) <- l) cases;
+      st.tables <-
+        { dname = table; dglobal = false; dweak = false; dhidden = false; dalias = None;
+          dfunc = false; ddecl = false; dtls = false; dalign = 4; section = Rodata;
+          size = 4 * Array.length entries;
+          items = Array.to_list (Array.map (fun l -> Long_diff (l, table)) entries) }
+        :: st.tables;
+      load_sym st table (T 2);
+      op st "slli" [ Reg (T 3); Reg (T 0); Imm 2L ];
+      op st "add" [ Reg (T 3); Reg (T 2); Reg (T 3) ];
+      op st "lw" [ Reg (T 3); Mem (T 3, 0) ];
+      op st "add" [ Reg (T 3); Reg (T 2); Reg (T 3) ];
+      op st "jr" [ Reg (T 3) ]
   | Ir.Switch (ty, o, cases, default) ->
-      (* a chain of comparisons: a jump table can come later *)
+      (* few cases, or scattered ones: a chain of comparisons *)
       load_int st ty o (T 0);
       (* each label's value in the form the machine keeps one of that
          type in, as the switched value is: a case of 0x8495a6be in a
@@ -1527,6 +1591,7 @@ let program ~pic ~debug (p : Ir.program) : program =
   List.iter (fun (f : Ir.func) -> if not f.global then Hashtbl.replace locals f.name ()) p.funcs;
   let st = { pic; debug; locals; tls; code = []; regs = Hashtbl.create 64; slots = [||]; frame = 0;
              alloc = { Regalloc.where = Hashtbl.create 1; spill_slots = 0; used = [] }; saved = [];
+             tables = [];
              fname = ""; label_count = 0; float_consts = []; const_count = 0;
              hidden_ptr = 0; va_bytes = 0; named_int = 0;
              wide = Hashtbl.create 8; wide_consts = []; consts = [];
@@ -1534,6 +1599,6 @@ let program ~pic ~debug (p : Ir.program) : program =
   let funcs = List.map (fun f -> func st f) p.funcs in
   let data = List.filter_map data_of_global p.globals in
   let files = List.sort compare (Hashtbl.fold (fun name n acc -> (n, name) :: acc) st.files []) in
-  { pic; funcs; data = data @ List.rev st.consts;
+  { pic; funcs; data = data @ List.rev st.consts @ List.rev st.tables;
     source = (if debug then Some p.source else None); files;
     asm_blocks = p.asm_blocks; init_array = p.init_array; fini_array = p.fini_array }
