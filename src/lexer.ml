@@ -333,17 +333,24 @@ let punctuator c =
 
 (* ---- Phase 6: string literal concatenation (6.4.5p5) ---------------------- *)
 
-let rec concatenate = function
-  | ({ tok = String_lit a; loc } as t1) :: { tok = String_lit b; loc = loc2 } :: rest ->
-      let enc =
-        match a.enc, b.enc with
-        | e, Plain | Plain, e -> e
-        | e1, e2 when e1 = e2 -> e1
-        | _ -> Diag.error loc2 "concatenation of string literals with different encoding prefixes" in
-      ignore t1;
-      concatenate ({ tok = String_lit { bytes = a.bytes ^ b.bytes; enc }; loc } :: rest)
-  | t :: rest -> t :: concatenate rest
-  | [] -> []
+(* Written around an accumulator rather than as the plain recursion the
+   rule reads like, because the list being walked is every token in the
+   translation unit: the C file ocamlc writes for -output-complete-obj
+   embeds a whole bytecode image as an array literal, some hundreds of
+   thousands of tokens, and a stack frame apiece is more stack than a
+   process is given. *)
+let concatenate tokens =
+  let rec walk done_ = function
+    | { tok = String_lit a; loc } :: { tok = String_lit b; loc = loc2 } :: rest ->
+        let enc =
+          match a.enc, b.enc with
+          | e, Plain | Plain, e -> e
+          | e1, e2 when e1 = e2 -> e1
+          | _ -> Diag.error loc2 "concatenation of string literals with different encoding prefixes" in
+        walk done_ ({ tok = String_lit { bytes = a.bytes ^ b.bytes; enc }; loc } :: rest)
+    | t :: rest -> walk (t :: done_) rest
+    | [] -> List.rev done_ in
+  walk [] tokens
 
 (* ---- Main loop --------------------------------------------------------------- *)
 
