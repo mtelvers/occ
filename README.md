@@ -14,7 +14,11 @@ down from 6 times with everything in frame slots.
 
 Two machines: x86-64 Linux (System V ABI) and RISC-V RV64 Linux (the
 lp64d psABI). `--target=` chooses, and a compiler built on either
-defaults to the machine it runs on.
+defaults to the machine it runs on. Where the two disagree the machine
+is asked rather than the other back end: RISC-V takes a jump table from
+thirty-two cases where x86-64 takes one from four, because an indirect
+jump costs more there than a well-predicted chain of comparisons, and
+that crossover was measured on the board.
 
 Everything the build runs is now ours as well: the assembler (`occas`,
 byte-identical to GNU as on everything occ and ocamlopt produce), the
