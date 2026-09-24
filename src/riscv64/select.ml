@@ -540,7 +540,12 @@ let binop st (b : Ir.binop) (ty : Ir.ty) (r : int) a c =
       let x = source st ty a (T 0) and y = source st ty c (T 1) in
       let d = dest st r (T 0) in
       op st (int_mnemonic b ty) [ Reg d; Reg x; Reg y ];
-      store st ty r d
+      (* The `w' forms leave a 32-bit result sign-extended, which is the
+         form it has to be kept in, and the bitwise operations on values
+         already in that form leave them in it.  Only the narrower types,
+         whose arithmetic is done at the register's width, have to be cut
+         back down. *)
+      store ~normal:(width ty >= 4) st ty r d
 
 (* A comparison leaves 0 or 1 in a register, which is what the IR asks
    for; the machine has set-less-than and nothing else, so the other
@@ -1127,12 +1132,12 @@ let instr st (i : Ir.instr) =
       let x = source st ty o (T 0) in
       let d = dest st r (T 0) in
       op st (if ty = Ir.I32 then "negw" else "neg") [ Reg d; Reg x ];
-      store st ty r d
+      store ~normal:(width ty >= 4) st ty r d
   | Ir.Not (ty, r, o) ->
       let x = source st ty o (T 0) in
       let d = dest st r (T 0) in
       op st "not" [ Reg d; Reg x ];
-      store st ty r d
+      store ~normal:(width ty >= 4) st ty r d
   | Ir.Cmp (c, ty, r, a, b) when is_float ty ->
       compare_float st c ty a b (T 0);
       store st Ir.I32 r (T 0)
