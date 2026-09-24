@@ -54,6 +54,8 @@ type st = {
      frame, and the return address and frame pointer go below it. *)
   mutable va_bytes : int;             (* size of that area, 0 if not variadic *)
   mutable named_int : int;            (* integer registers the named parameters took *)
+  mutable alloc : Asm.reg Regalloc.assignment;  (* where each IR register lives *)
+  mutable saved : (reg * int) list;   (* callee-saved registers the allocation used, and their slots *)
   locals : (string, unit) Hashtbl.t;  (* symbols defined in this unit with internal linkage *)
   tls : (string, unit) Hashtbl.t;     (* thread-local symbols, defined or declared *)
   mutable consts : data list;         (* the read-only constants the functions needed *)
@@ -94,10 +96,47 @@ let alloc st size align =
   st.frame <- round_up (st.frame + size) align;
   - st.frame
 
+(* ---- what the allocator needs to know about this machine ------------- *)
+
+(* s1..s11, and nothing else.  s0 is the frame pointer; t0..t6 are what
+   every instruction selected here uses for its own working, and a0..a7
+   carry arguments, so a value could not survive in one of those.  With
+   only callee-saved registers offered, nothing this back end emits can
+   destroy an allocated value -- a call preserves them by definition, and
+   inline assembly that names one saves and restores it -- so there is no
+   list of clobbers to keep in step with the code below. *)
+let callee_saved = List.init 11 (fun i -> S (i + 1))
+
+let allocate (f : Ir.func) =
+  Regalloc.allocate ~callee_saved ~caller_saved:[] ~clobbers:(fun _ -> []) ~name:Emit.reg f
+
+(* The DWARF number of a register is the hardware's: s0 is x8, s1 is x9,
+   and s2..s11 are x18..x27. *)
+let dwarf_number = function
+  | S 0 -> 8 | S 1 -> 9 | S n -> 16 + n
+  | RA -> 1 | SP -> 2
+  | r -> failwith ("Riscv64.Select: no DWARF number for " ^ Emit.reg r)
+
+(* Where an IR register lives: a callee-saved register chosen by
+   [Regalloc], or a frame slot.  Slots are eight bytes, shared over time
+   between spilled registers whose live ranges do not overlap. *)
+let location st r =
+  match Hashtbl.find_opt st.alloc.Regalloc.where r with
+  | Some (Regalloc.Register p) -> `Reg p
+  | Some (Regalloc.Spill k) ->
+      (match Hashtbl.find_opt st.regs k with
+       | Some off -> `Mem off
+       | None -> let off = alloc st 8 8 in Hashtbl.replace st.regs k off; `Mem off)
+  | None ->
+      (* never mentioned by the allocator: a register only written *)
+      (match Hashtbl.find_opt st.regs (-1 - r) with
+       | Some off -> `Mem off
+       | None -> let off = alloc st 8 8 in Hashtbl.replace st.regs (-1 - r) off; `Mem off)
+
 let reg_slot st r =
-  match Hashtbl.find_opt st.regs r with
-  | Some off -> off
-  | None -> let off = alloc st 8 8 in Hashtbl.replace st.regs r off; off
+  match location st r with
+  | `Mem off -> off
+  | `Reg _ -> failwith "Riscv64.Select: that register is not in a frame slot"
 
 (* A twelve-bit signed offset reaches most of a frame; beyond that the
    address has to be built.  Every load and store goes through this, so
@@ -222,7 +261,10 @@ let sp_adjust st n =
 let rec load_int st (ty : Ir.ty) (o : Ir.operand) (dst : reg) =
   match o with
   | Ir.Imm v -> op st "li" [ Reg dst; Imm (narrow ty v) ]
-  | Ir.Reg r -> op st (load_mnemonic ty true) [ Reg dst; addr st (S 0) (reg_slot st r) dst ]
+  | Ir.Reg r ->
+      (match location st r with
+       | `Reg p -> if p <> dst then op st "mv" [ Reg dst; Reg p ]
+       | `Mem off -> op st (load_mnemonic ty true) [ Reg dst; addr st (S 0) off dst ])
   | Ir.Slot k -> frame_addr st st.slots.(k) dst
   | Ir.Sym s -> load_sym st s dst
   | Ir.Fimm f -> load_int st ty (Ir.Imm (Int64.bits_of_float f)) dst
@@ -243,8 +285,26 @@ let load_float st (ty : Ir.ty) (o : Ir.operand) (dst : reg) =
 
 let load st ty o dst_i dst_f = if is_float ty then load_float st ty o dst_f else load_int st ty o dst_i
 
+(* A value kept in a register has to be kept in the form the machine
+   keeps values of its type in -- sign-extended to the register's width,
+   which is what every load here produces.  A slot did that on its own:
+   storing eight bits and loading them back with lb is a sign extension.
+   Nothing does it for a value that never leaves a register, so it is
+   done here, and only for the narrow types, which are rare in C after
+   promotion. *)
+let normalise st (ty : Ir.ty) (p : reg) =
+  match ty with
+  | Ir.I8 | Ir.I16 ->
+      let bits = 64 - 8 * width ty in
+      op st "slli" [ Reg p; Reg p; Imm (Int64.of_int bits) ];
+      op st "srai" [ Reg p; Reg p; Imm (Int64.of_int bits) ]
+  | Ir.I32 -> op st "sext.w" [ Reg p; Reg p ]
+  | _ -> ()
+
 let store st (ty : Ir.ty) (r : int) (src : reg) =
-  op st (store_mnemonic ty) [ Reg src; addr st (S 0) (reg_slot st r) (T 2) ]
+  match location st r with
+  | `Reg p -> if p <> src then op st "mv" [ Reg p; Reg src ]; normalise st ty p
+  | `Mem off -> op st (store_mnemonic ty) [ Reg src; addr st (S 0) off (T 2) ]
 
 (* ---- long double ---------------------------------------------------- *)
 
@@ -520,12 +580,11 @@ let conv st (c : Ir.conv) (r : int) (o : Ir.operand) =
   match c with
   | Ir.Sext (from, _) -> load_int st from o (T 0); store st Ir.I64 r (T 0)
   | Ir.Zext (from, _) ->
-      (* the load sign-extends, so the high bits are cleared by hand *)
+      (* every value arrives sign-extended, so the high bits are cleared
+         by hand: one instruction for a byte, two for the rest *)
+      load_int st from o (T 0);
       (match from with
-       | Ir.I8 -> op st (load_mnemonic Ir.I8 false) [ Reg (T 0); addr st (S 0) (reg_slot st (match o with Ir.Reg x -> x | _ -> 0)) (T 2) ]
-       | _ -> load_int st from o (T 0));
-      (match from with
-       | Ir.I8 -> ()
+       | Ir.I8 -> op st "andi" [ Reg (T 0); Reg (T 0); Imm 255L ]
        | Ir.I16 -> op st "slli" [ Reg (T 0); Reg (T 0); Imm 48L ]; op st "srli" [ Reg (T 0); Reg (T 0); Imm 48L ]
        | Ir.I32 -> op st "slli" [ Reg (T 0); Reg (T 0); Imm 32L ]; op st "srli" [ Reg (T 0); Reg (T 0); Imm 32L ]
        | _ -> ());
@@ -1256,6 +1315,8 @@ let func st (f : Ir.func) : func =
   st.code <- []; st.regs <- Hashtbl.create 64; st.wide <- Hashtbl.create 8;
   st.frame <- saved_bytes;
   st.fname <- f.name; st.label_count <- 0; st.hidden_ptr <- 0;
+  st.alloc <- allocate f;
+  st.saved <- [];
   let hidden = match f.returns_aggregate with Some (_, p) -> p = Ir.In_memory | None -> false in
   (* the parameters arrive where a caller would have put them *)
   let as_args = List.map (function
@@ -1273,6 +1334,9 @@ let func st (f : Ir.func) : func =
   (* the slots come after the save area, whose size is now known *)
   st.slots <- Array.map (fun (s : Ir.slot) -> alloc st s.size (max s.align 1)) f.slots;
   if hidden then st.hidden_ptr <- alloc st 8 8;
+  (* the callee-saved registers the allocation used, which the prologue
+     puts away and the epilogue brings back *)
+  st.saved <- List.map (fun p -> p, alloc st 8 8) st.alloc.Regalloc.used;
   let saved = st.code in
   st.code <- [];
   if f.variadic then
@@ -1290,8 +1354,11 @@ let func st (f : Ir.func) : func =
       (* a floating-point value that arrived in an integer register is
          its bits, so they are put away with an integer store *)
       | Ir.P_scalar (ty, r), [ In_int i ] when is_float ty ->
-          op st (store_mnemonic (if ty = Ir.F32 then Ir.I32 else Ir.I64))
-            [ Reg (A i); addr st (S 0) (reg_slot st r) (T 2) ]
+          (match location st r with
+           | `Mem off ->
+               op st (store_mnemonic (if ty = Ir.F32 then Ir.I32 else Ir.I64))
+                 [ Reg (A i); addr st (S 0) off (T 2) ]
+           | `Reg p -> op st "mv" [ Reg p; Reg (A i) ])
       | Ir.P_scalar (ty, r), [ In_int i ] -> store st ty r (A i)
       | Ir.P_scalar (ty, r), [ In_float i ] -> store st ty r (FA i)
       | Ir.P_scalar (ty, r), [ On_stack off ] ->
@@ -1333,7 +1400,10 @@ let func st (f : Ir.func) : func =
     else begin
       let where = function
         | Ir.P_scalar (Ir.F80, r) -> Dwarf.At_cfa_offset (slot16 st r)
-        | Ir.P_scalar (_, r) -> Dwarf.At_cfa_offset (reg_slot st r)
+        | Ir.P_scalar (_, r) ->
+            (match location st r with
+             | `Reg p -> Dwarf.In_register (dwarf_number p)
+             | `Mem off -> Dwarf.At_cfa_offset off)
         | Ir.P_aggregate (k, _, _) -> Dwarf.At_cfa_offset st.slots.(k) in
       let dparams =
         List.map2 (fun p (pname, ty) -> { Dwarf.pname; ptype = Dwarf.of_ctype ty; ploc = where p })
@@ -1364,6 +1434,15 @@ let func st (f : Ir.func) : func =
      variable length array moved sp in between.  While the old frame
      pointer is being reloaded the canonical frame address lives only in
      t0, which DWARF can say -- t0 is register 5. *)
+  (* A save or a restore of one of those registers, which is written as a
+     list rather than through [addr] because the prologue is built
+     directly: past twelve bits the offset has to be made in a register,
+     and t0 is free at both ends of a function. *)
+  let at_frame mnemonic p off =
+    if fits12 off then [ Op (mnemonic, [ Reg p; Mem (S 0, off) ]) ]
+    else [ Op ("li", [ Reg (T 0); Imm (Int64.of_int off) ]);
+           Op ("add", [ Reg (T 0); Reg (S 0); Reg (T 0) ]);
+           Op (mnemonic, [ Reg p; Mem (T 0, 0) ]) ] in
   let prologue =
     (if st.debug then [ Loc (file_index st f.loc.Loc.file, f.loc.Loc.line) ] else [])
     @ [ Cfi "startproc";
@@ -1376,10 +1455,17 @@ let func st (f : Ir.func) : func =
         Cfi (Printf.sprintf "offset 1, %d" (ra_offset st));
         Cfi (Printf.sprintf "offset 8, %d" (fp_offset st));
         Op ("mv", [ Reg (S 0); Reg (T 0) ]);
-        Cfi "def_cfa 8, 0" ] in
+        Cfi "def_cfa 8, 0" ]
+    (* and the registers the allocation borrowed, which are the callee's
+       to give back *)
+    @ List.concat_map (fun (p, off) ->
+        at_frame "sd" p off @ [ Cfi (Printf.sprintf "offset %d, %d" (dwarf_number p) off) ])
+        st.saved in
   let epilogue =
-    [ Label (".Lreturn." ^ f.name);
-      Op ("mv", [ Reg (T 0); Reg (S 0) ]);
+    [ Label (".Lreturn." ^ f.name) ]
+    @ List.concat_map (fun (p, off) -> at_frame "ld" p off) st.saved
+    @ List.map (fun (p, _) -> Cfi (Printf.sprintf "restore %d" (dwarf_number p))) st.saved
+    @ [ Op ("mv", [ Reg (T 0); Reg (S 0) ]);
       Cfi "def_cfa 5, 0";
       Op ("ld", [ Reg RA; Mem (T 0, ra_offset st) ]);
       Op ("ld", [ Reg (S 0); Mem (T 0, fp_offset st) ]);
@@ -1440,6 +1526,7 @@ let program ~pic ~debug (p : Ir.program) : program =
       if g.gtls then Hashtbl.replace tls g.gname ()) p.globals;
   List.iter (fun (f : Ir.func) -> if not f.global then Hashtbl.replace locals f.name ()) p.funcs;
   let st = { pic; debug; locals; tls; code = []; regs = Hashtbl.create 64; slots = [||]; frame = 0;
+             alloc = { Regalloc.where = Hashtbl.create 1; spill_slots = 0; used = [] }; saved = [];
              fname = ""; label_count = 0; float_consts = []; const_count = 0;
              hidden_ptr = 0; va_bytes = 0; named_int = 0;
              wide = Hashtbl.create 8; wide_consts = []; consts = [];
