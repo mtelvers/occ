@@ -1,8 +1,10 @@
 #!/bin/sh
 # Run one native phase over every corpus unit and summarise the failures
 # by message, most common first, with one example location each.
-# usage: tools/corpus-check.sh tokens|ast|typed|ir|asm|obj  [max-messages-shown]
-# "obj" compiles and assembles natively, so the assembler checks the output.
+# usage: tools/corpus-check.sh tokens|ast|typed|ir|asm|obj|rvobj [max-messages-shown]
+# "obj" compiles and assembles natively, so the assembler checks the
+# output; "rvobj" does the same for the other machine, which works on
+# either host since both back ends and both encoders are always built.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 OCC="$HERE/_build/default/bin/main.exe"
@@ -13,6 +15,8 @@ for f in $(find "$HERE/corpus" -name '*.i' | sort); do
   n=$((n+1))
   if [ "$stage" = obj ]; then
     ok=true; err=$("$OCC" -c -g "$f" -o /dev/null 2>&1) || ok=false
+  elif [ "$stage" = rvobj ]; then
+    ok=true; err=$("$OCC" --target=riscv64 -c -g "$f" -o /dev/null 2>&1) || ok=false
   else
     ok=true; err=$(OCC_NATIVE=cc "$OCC" "--dump=$stage" "$f" 2>&1 >/dev/null) || ok=false
   fi

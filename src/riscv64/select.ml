@@ -302,9 +302,34 @@ let normalise st (ty : Ir.ty) (p : reg) =
   | Ir.I32 -> op st "sext.w" [ Reg p; Reg p ]
   | _ -> ()
 
-let store st (ty : Ir.ty) (r : int) (src : reg) =
+(* Where a value already is, rather than where to put it: the register
+   the allocator gave it, or the scratch it has to be loaded into.  Using
+   this instead of [load_int] is what makes an allocated value worth
+   allocating -- the instruction reads it where it lives, and no move is
+   emitted at all. *)
+let source st (ty : Ir.ty) (o : Ir.operand) (scratch : reg) =
+  match o with
+  | Ir.Reg r ->
+      (match location st r with
+       | `Reg p -> p
+       | `Mem off ->
+           op st (load_mnemonic ty true) [ Reg scratch; addr st (S 0) off scratch ];
+           scratch)
+  | _ -> load_int st ty o scratch; scratch
+
+(* and where to compute a result: the register it is to live in, or a
+   scratch to be stored from *)
+let dest st (r : int) (scratch : reg) =
+  match location st r with `Reg p -> p | `Mem _ -> scratch
+
+(* [normal] says the value is already in the form the machine keeps one
+   of its type in, so that a value that came from a sign-extending load
+   or from a constant is not narrowed again for nothing. *)
+let store ?(normal = false) st (ty : Ir.ty) (r : int) (src : reg) =
   match location st r with
-  | `Reg p -> if p <> src then op st "mv" [ Reg p; Reg src ]; normalise st ty p
+  | `Reg p ->
+      if p <> src then op st "mv" [ Reg p; Reg src ];
+      if not normal then normalise st ty p
   | `Mem off -> op st (store_mnemonic ty) [ Reg src; addr st (S 0) off (T 2) ]
 
 (* ---- long double ---------------------------------------------------- *)
@@ -512,29 +537,28 @@ let binop st (b : Ir.binop) (ty : Ir.ty) (r : int) a c =
       op st (float_mnemonic b ty) [ Reg (FT 0); Reg (FT 0); Reg (FT 1) ];
       store st ty r (FT 0)
   | _ ->
-      load_int st ty a (T 0);
-      load_int st ty c (T 1);
-      op st (int_mnemonic b ty) [ Reg (T 0); Reg (T 0); Reg (T 1) ];
-      store st ty r (T 0)
+      let x = source st ty a (T 0) and y = source st ty c (T 1) in
+      let d = dest st r (T 0) in
+      op st (int_mnemonic b ty) [ Reg d; Reg x; Reg y ];
+      store st ty r d
 
 (* A comparison leaves 0 or 1 in a register, which is what the IR asks
    for; the machine has set-less-than and nothing else, so the other
    nine conditions are built from it and from equality against zero. *)
 let compare_int st (c : Ir.cond) ty a b (dst : reg) =
-  load_int st ty a (T 0);
-  load_int st ty b (T 1);
+  let t0 = source st ty a (T 0) and t1 = source st ty b (T 1) in
   let slt = "slt" and sltu = "sltu" in
   match c with
-  | Ir.Eq -> op st "sub" [ Reg dst; Reg (T 0); Reg (T 1) ]; op st "seqz" [ Reg dst; Reg dst ]
-  | Ir.Ne -> op st "sub" [ Reg dst; Reg (T 0); Reg (T 1) ]; op st "snez" [ Reg dst; Reg dst ]
-  | Ir.Slt -> op st slt [ Reg dst; Reg (T 0); Reg (T 1) ]
-  | Ir.Sgt -> op st slt [ Reg dst; Reg (T 1); Reg (T 0) ]
-  | Ir.Sle -> op st slt [ Reg dst; Reg (T 1); Reg (T 0) ]; op st "xori" [ Reg dst; Reg dst; Imm 1L ]
-  | Ir.Sge -> op st slt [ Reg dst; Reg (T 0); Reg (T 1) ]; op st "xori" [ Reg dst; Reg dst; Imm 1L ]
-  | Ir.Ult -> op st sltu [ Reg dst; Reg (T 0); Reg (T 1) ]
-  | Ir.Ugt -> op st sltu [ Reg dst; Reg (T 1); Reg (T 0) ]
-  | Ir.Ule -> op st sltu [ Reg dst; Reg (T 1); Reg (T 0) ]; op st "xori" [ Reg dst; Reg dst; Imm 1L ]
-  | Ir.Uge -> op st sltu [ Reg dst; Reg (T 0); Reg (T 1) ]; op st "xori" [ Reg dst; Reg dst; Imm 1L ]
+  | Ir.Eq -> op st "sub" [ Reg dst; Reg t0; Reg t1 ]; op st "seqz" [ Reg dst; Reg dst ]
+  | Ir.Ne -> op st "sub" [ Reg dst; Reg t0; Reg t1 ]; op st "snez" [ Reg dst; Reg dst ]
+  | Ir.Slt -> op st slt [ Reg dst; Reg t0; Reg t1 ]
+  | Ir.Sgt -> op st slt [ Reg dst; Reg t1; Reg t0 ]
+  | Ir.Sle -> op st slt [ Reg dst; Reg t1; Reg t0 ]; op st "xori" [ Reg dst; Reg dst; Imm 1L ]
+  | Ir.Sge -> op st slt [ Reg dst; Reg t0; Reg t1 ]; op st "xori" [ Reg dst; Reg dst; Imm 1L ]
+  | Ir.Ult -> op st sltu [ Reg dst; Reg t0; Reg t1 ]
+  | Ir.Ugt -> op st sltu [ Reg dst; Reg t1; Reg t0 ]
+  | Ir.Ule -> op st sltu [ Reg dst; Reg t1; Reg t0 ]; op st "xori" [ Reg dst; Reg dst; Imm 1L ]
+  | Ir.Uge -> op st sltu [ Reg dst; Reg t0; Reg t1 ]; op st "xori" [ Reg dst; Reg dst; Imm 1L ]
   | Ir.Feq | Ir.Fne | Ir.Flt | Ir.Fle | Ir.Fgt | Ir.Fge ->
       failwith "Riscv64.Select: a floating-point comparison came to the integer path"
 
@@ -1075,6 +1099,15 @@ let not_yet what = failwith ("Riscv64.Select: " ^ what ^ " is not implemented ye
 let instr st (i : Ir.instr) =
   match i with
   | Ir.Mov (Ir.F80, r, o) -> load_wide st o (T 0) (T 1); store_wide st r (T 0) (T 1)
+  | Ir.Mov (ty, r, o) when not (is_float ty) ->
+      (* a constant, an address or another register, put where the value
+         is to live without going through a scratch *)
+      (match location st r with
+       | `Reg p ->
+           (match o with
+            | Ir.Reg _ -> let x = source st ty o (T 0) in if x <> p then op st "mv" [ Reg p; Reg x ]
+            | _ -> load_int st ty o p)
+       | `Mem _ -> let x = source st ty o (T 0) in store ~normal:true st ty r x)
   | Ir.Mov (ty, r, o) ->
       load st ty o (T 0) (FT 0);
       store st ty r (if is_float ty then FT 0 else T 0)
@@ -1091,16 +1124,25 @@ let instr st (i : Ir.instr) =
       op st (if ty = Ir.F32 then "fneg.s" else "fneg.d") [ Reg (FT 0); Reg (FT 0) ];
       store st ty r (FT 0)
   | Ir.Neg (ty, r, o) ->
-      load_int st ty o (T 0);
-      op st (if ty = Ir.I32 then "negw" else "neg") [ Reg (T 0); Reg (T 0) ];
-      store st ty r (T 0)
+      let x = source st ty o (T 0) in
+      let d = dest st r (T 0) in
+      op st (if ty = Ir.I32 then "negw" else "neg") [ Reg d; Reg x ];
+      store st ty r d
   | Ir.Not (ty, r, o) ->
-      load_int st ty o (T 0);
-      op st "not" [ Reg (T 0); Reg (T 0) ];
-      store st ty r (T 0)
-  | Ir.Cmp (c, ty, r, a, b) ->
-      if is_float ty then compare_float st c ty a b (T 0) else compare_int st c ty a b (T 0);
+      let x = source st ty o (T 0) in
+      let d = dest st r (T 0) in
+      op st "not" [ Reg d; Reg x ];
+      store st ty r d
+  | Ir.Cmp (c, ty, r, a, b) when is_float ty ->
+      compare_float st c ty a b (T 0);
       store st Ir.I32 r (T 0)
+  | Ir.Cmp (c, ty, r, a, b) ->
+      (* the answer is nought or one, so it needs no narrowing after *)
+      let d = dest st r (T 0) in
+      compare_int st c ty a b d;
+      (match location st r with
+       | `Reg p -> if p <> d then op st "mv" [ Reg p; Reg d ]
+       | `Mem _ -> store st Ir.I32 r d)
   | Ir.Conv (c, r, o) -> conv st c r o
   | Ir.Load (Ir.F80, r, o) ->
       load_addr st o (T 2);
@@ -1112,22 +1154,32 @@ let instr st (i : Ir.instr) =
       load_addr st a (T 2);
       op st "sd" [ Reg (T 0); Mem (T 2, 0) ];
       op st "sd" [ Reg (T 1); Mem (T 2, 8) ]
+  | Ir.Load (ty, r, o) when not (is_float ty) ->
+      let base = source st Ir.I64 o (T 2) in
+      let d = dest st r (T 0) in
+      op st (load_mnemonic ty true) [ Reg d; Mem (base, 0) ];
+      (* the load sign-extended it already *)
+      store ~normal:true st ty r d
   | Ir.Load (ty, r, o) ->
       load_addr st o (T 2);
-      op st (load_mnemonic ty true) [ Reg (if is_float ty then FT 0 else T 0); Mem (T 2, 0) ];
-      store st ty r (if is_float ty then FT 0 else T 0)
+      op st (load_mnemonic ty true) [ Reg (FT 0); Mem (T 2, 0) ];
+      store st ty r (FT 0)
+  | Ir.Store (ty, a, v) when not (is_float ty) ->
+      let x = source st ty v (T 0) in
+      let base = source st Ir.I64 a (T 2) in
+      op st (store_mnemonic ty) [ Reg x; Mem (base, 0) ]
   | Ir.Store (ty, a, v) ->
       load st ty v (T 0) (FT 0);
       load_addr st a (T 2);
-      op st (store_mnemonic ty) [ Reg (if is_float ty then FT 0 else T 0); Mem (T 2, 0) ]
+      op st (store_mnemonic ty) [ Reg (FT 0); Mem (T 2, 0) ]
   | Ir.Memcpy (dst, src, n) -> memcopy st dst src n
   | Ir.Memzero (dst, n) -> memzero st dst n
   | Ir.Call (res, callee, args, named) -> call st res callee args named
   | Ir.Label l -> emit st (Label l)
   | Ir.Jump l -> op st "j" [ Sym (l, 0) ]
   | Ir.Branch (o, t, e) ->
-      load_int st Ir.I32 o (T 0);
-      op st "bnez" [ Reg (T 0); Sym (t, 0) ];
+      let x = source st Ir.I32 o (T 0) in
+      op st "bnez" [ Reg x; Sym (t, 0) ];
       op st "j" [ Sym (e, 0) ]
   (* A switch over a run of nearby values becomes a jump table: the
      chain of comparisons below is two instructions a case, which the
