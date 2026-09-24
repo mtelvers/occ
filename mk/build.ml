@@ -295,7 +295,17 @@ let run_recipe b ~target ~lines ~locs =
           else begin
             let shell = Value.get b.db "SHELL" in
             let shell = if shell = "" then "/bin/sh" else shell in
-            let code = Sys.command (Printf.sprintf "%s -c %s" (Filename.quote shell) (Filename.quote cmd)) in
+            (* The shell is run directly, as make does, and not through
+               Sys.command: that would hand the line to /bin/sh first and
+               let *it* run the shell we were asked for, which is both a
+               process per recipe line that need not exist and, for a
+               build whose point is that no program in it is written in
+               C, the one C program left in the chain. *)
+            let code =
+              let pid = Unix.create_process shell [| shell; "-c"; cmd |] Unix.stdin Unix.stdout Unix.stderr in
+              match snd (Unix.waitpid [] pid) with
+              | Unix.WEXITED n -> n
+              | Unix.WSIGNALED n | Unix.WSTOPPED n -> 128 + n in
             if code = 0 then go rest
             else if !ignore_err then begin
               (* a recipe line written with `-' does not stop the build,

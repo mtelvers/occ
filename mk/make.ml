@@ -7,11 +7,16 @@ let default_variables db =
   d "MAKE" (Filename.quote Sys.executable_name);
   d "SHELL" "/bin/sh";
   d ".RECIPEPREFIX" "";
-  (* import the environment (origin Environment, so makefiles override) *)
+  (* Import the environment (origin Environment, so makefiles override).
+     SHELL is the exception: it is never taken from the environment (6.10,
+     "Variables from the Environment"), because there it names the user's
+     login shell and says nothing about what recipes should run under.
+     A makefile or the command line may still set it. *)
   Array.iter (fun kv ->
       match String.index_opt kv '=' with
-      | Some i -> Value.set db ~origin:Value.Environment (String.sub kv 0 i) (String.sub kv (i + 1) (String.length kv - i - 1))
-      | None -> ()) (Unix.environment ())
+      | Some i when String.sub kv 0 i <> "SHELL" ->
+          Value.set db ~origin:Value.Environment (String.sub kv 0 i) (String.sub kv (i + 1) (String.length kv - i - 1))
+      | _ -> ()) (Unix.environment ())
 
 type options = {
   mutable makefile : string option;
