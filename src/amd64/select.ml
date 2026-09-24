@@ -255,11 +255,11 @@ let assign_args ~(hidden : bool) (args : Ir.arg list) : place list * int * int *
   let ni = ref (if hidden then 1 else 0) and nf = ref 0 and stack = ref 0 in
   let places = List.map (fun a ->
       match a with
-      | Ir.Scalar (Ir.F80, _) ->
+      | Ir.Scalar (Ir.F80, _, _) ->
           (* class X87: in memory, 16-byte aligned *)
           stack := round_up !stack 16;
           let o = !stack in stack := !stack + 16; On_stack o
-      | Ir.Scalar (ty, _) when is_float ty ->
+      | Ir.Scalar (ty, _, _) when is_float ty ->
           if !nf < 8 then (let r = XMM !nf in incr nf; In_regs [ r ])
           else (let o = !stack in stack := !stack + 8; On_stack o)
       | Ir.Scalar _ ->
@@ -318,8 +318,8 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
   (* stack arguments first, while the argument registers are still free *)
   List.iter2 (fun a place ->
       match a, place with
-      | Ir.Scalar (Ir.F80, op), On_stack off -> fpush st op; x87 st "fstpt" (Some (Mem (RSP, off)))
-      | Ir.Scalar (ty, op), On_stack off ->
+      | Ir.Scalar (Ir.F80, _, op), On_stack off -> fpush st op; x87 st "fstpt" (Some (Mem (RSP, off)))
+      | Ir.Scalar (ty, _, op), On_stack off ->
           if is_float ty then (load_float st ty op (XMM 0); emit st (Sse ("mov" ^ sse_suffix ty, Reg (XMM 0), Mem (RSP, off))))
           else (load_int st ty op RAX; emit st (Mov (Q, Reg RAX, Mem (RSP, off))))
       | Ir.Aggregate ag, On_stack off ->
@@ -339,7 +339,7 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
      r11, and loading an operand only touches the destination *)
   List.iter2 (fun a place ->
       match a, place with
-      | Ir.Scalar (ty, op), In_regs [ r ] -> load st ty op r
+      | Ir.Scalar (ty, _, op), In_regs [ r ] -> load st ty op r
       | _ -> ()) args places;
   (match res with
    | Some (Ir.Ret_aggregate a) when hidden -> load_addr st a.addr RDI
@@ -812,8 +812,8 @@ let instr st (i : Ir.instr) =
   | Ir.Ret v ->
       (match v with
        | None -> ()
-       | Some (Ir.Rv_scalar (Ir.F80, op)) -> fpush st op
-       | Some (Ir.Rv_scalar (ty, op)) -> load st ty op (if is_float ty then XMM 0 else RAX)
+       | Some (Ir.Rv_scalar (Ir.F80, _, op)) -> fpush st op
+       | Some (Ir.Rv_scalar (ty, _, op)) -> load st ty op (if is_float ty then XMM 0 else RAX)
        | Some (Ir.Rv_aggregate a) ->
            if in_memory a.passing then begin
              emit st (Mov (Q, Mem (RBP, st.hidden_ptr), Reg RDI));
@@ -981,7 +981,9 @@ let func st (f : Ir.func) : func =
   (* parameters arrive per the same assignment a caller makes *)
   let hidden = match f.returns_aggregate with Some (_, passing) -> in_memory passing | None -> false in
   let as_args = List.map (function
-      | Ir.P_scalar (ty, r) -> Ir.Scalar (ty, Ir.Reg r)
+      (* the signedness does not matter here: this machine passes a narrow
+         value in the low bits of a register and widens nothing *)
+      | Ir.P_scalar (ty, r) -> Ir.Scalar (ty, true, Ir.Reg r)
       | Ir.P_aggregate (slot, size, passing) -> Ir.Aggregate { Ir.addr = Ir.Slot slot; size; passing }) f.params in
   let places, ni, nf, stack_bytes = assign_args ~hidden as_args in
   st.va_gp <- ni; st.va_fp <- nf; st.va_stack <- stack_bytes;

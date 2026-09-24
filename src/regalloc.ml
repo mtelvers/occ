@@ -20,7 +20,7 @@ type 'r assignment = { where : (int, 'r location) Hashtbl.t; spill_slots : int; 
 (* Registers defined and used by an instruction. *)
 let regs_of_instr (i : Ir.instr) : int list * int list =
   let u = function Ir.Reg r -> [ r ] | _ -> [] in
-  let arg = function Ir.Scalar (_, o) -> u o | Ir.Aggregate a -> u a.addr in
+  let arg = function Ir.Scalar (_, _, o) -> u o | Ir.Aggregate a -> u a.addr in
   match i with
   | Ir.Mov (_, r, o) | Ir.Neg (_, r, o) | Ir.Not (_, r, o) | Ir.Conv (_, r, o) | Ir.Load (_, r, o)
   | Ir.Va_arg (_, r, o) | Ir.Atomic_load (_, r, o, _) | Ir.Intrinsic (_, _, r, o) | Ir.Alloca (r, o) -> [ r ], u o
@@ -39,7 +39,7 @@ let regs_of_instr (i : Ir.instr) : int list * int list =
   | Ir.Call (res, f, args, _) ->
       (match res with Some (Ir.Ret_scalar (_, r)) -> [ r ] | _ -> []),
       u f @ List.concat_map arg args @ (match res with Some (Ir.Ret_aggregate a) -> u a.addr | _ -> [])
-  | Ir.Ret (Some (Ir.Rv_scalar (_, o))) -> [], u o
+  | Ir.Ret (Some (Ir.Rv_scalar (_, _, o))) -> [], u o
   | Ir.Ret (Some (Ir.Rv_aggregate a)) -> [], u a.addr
   | Ir.Return_address r -> [ r ], []
   | Ir.Ret None | Ir.Label _ | Ir.Jump _ | Ir.Fence _ | Ir.Trap | Ir.Line _ -> [], []

@@ -325,6 +325,21 @@ let dest st (r : int) (scratch : reg) =
 (* [normal] says the value is already in the form the machine keeps one
    of its type in, so that a value that came from a sign-extending load
    or from a constant is not narrowed again for nothing. *)
+(* The psABI's rule for a value narrower than a register crossing the
+   boundary: widened to thirty-two bits by the sign of its type, then
+   sign-extended to the register's width.  So an unsigned char is passed
+   zero-extended where this back end's own convention would leave it
+   sign-extended, and the difference is visible: glibc's htons shifts the
+   whole register, and a uint16_t handed to it sign-extended comes back
+   wrong. *)
+let widen st (ty : Ir.ty) signed (p : reg) =
+  match ty with
+  | Ir.I8 | Ir.I16 when not signed ->
+      let bits = 64 - 8 * width ty in
+      op st "slli" [ Reg p; Reg p; Imm (Int64.of_int bits) ];
+      op st "srli" [ Reg p; Reg p; Imm (Int64.of_int bits) ]
+  | _ -> ()          (* wider values are already in the form it asks for *)
+
 let store ?(normal = false) st (ty : Ir.ty) (r : int) (src : reg) =
   match location st r with
   | `Reg p ->
@@ -782,7 +797,7 @@ let assign_args ?(named = None) ~hidden (args : Ir.arg list) =
         (* long double is sixteen bytes and travels as two words, in
            integer registers or on the stack, never in a floating-point
            register: the machine has none that wide *)
-        | Ir.Scalar (Ir.F80, _) ->
+        | Ir.Scalar (Ir.F80, _, _) ->
             (* An argument whose alignment is two words starts at an
                even-numbered register, the psABI's rule for a register
                pair; long double is the one scalar that asks for it, and
@@ -796,17 +811,17 @@ let assign_args ?(named = None) ~hidden (args : Ir.arg list) =
               let p = [ On_stack !stack; On_stack (!stack + 8) ] in
               stack := !stack + 16; p
             end
-        | Ir.Scalar (ty, _) when is_float ty && ellipsis ->
+        | Ir.Scalar (ty, _, _) when is_float ty && ellipsis ->
             if !ni < 8 then (let p = In_int !ni in incr ni; [ p ])
             else (let p = On_stack !stack in stack := !stack + 8; [ p ])
-        | Ir.Scalar (ty, _) when is_float ty && !nf < 8 -> let p = In_float !nf in incr nf; [ p ]
+        | Ir.Scalar (ty, _, _) when is_float ty && !nf < 8 -> let p = In_float !nf in incr nf; [ p ]
         (* With the floating-point registers used up, a floating-point
            value takes an integer register next -- its bits, not its
            value -- and only when those are gone does it go on the stack.
            The psABI says so, and gcc puts the ninth of sixteen doubles
            in a0; a test in OCaml's own suite is what found this. *)
-        | Ir.Scalar (ty, _) when is_float ty && !ni < 8 -> let p = In_int !ni in incr ni; [ p ]
-        | Ir.Scalar (ty, _) when not (is_float ty) && !ni < 8 -> let p = In_int !ni in incr ni; [ p ]
+        | Ir.Scalar (ty, _, _) when is_float ty && !ni < 8 -> let p = In_int !ni in incr ni; [ p ]
+        | Ir.Scalar (ty, _, _) when not (is_float ty) && !ni < 8 -> let p = In_int !ni in incr ni; [ p ]
         | Ir.Scalar _ -> let p = On_stack !stack in stack := !stack + 8; [ p ]
         | Ir.Aggregate a ->
             (match a.passing with
@@ -840,18 +855,20 @@ let call st (res : Ir.result option) (callee : Ir.operand) (args : Ir.arg list) 
   (* the arguments, into their registers or onto the stack *)
   List.iter2 (fun (a : Ir.arg) ps ->
       match a, ps with
-      | Ir.Scalar (Ir.F80, o), [ In_int i; In_int j ] -> load_wide st o (A i) (A j)
-      | Ir.Scalar (Ir.F80, o), [ On_stack a; On_stack b ] ->
+      | Ir.Scalar (Ir.F80, _, o), [ In_int i; In_int j ] -> load_wide st o (A i) (A j)
+      | Ir.Scalar (Ir.F80, _, o), [ On_stack a; On_stack b ] ->
           load_wide st o (T 0) (T 1);
           op st "sd" [ Reg (T 0); Mem (SP, a) ];
           op st "sd" [ Reg (T 1); Mem (SP, b) ]
-      | Ir.Scalar (ty, o), [ In_int i ] when is_float ty ->
+      | Ir.Scalar (ty, _, o), [ In_int i ] when is_float ty ->
           (* a floating-point value in an integer register: its bits *)
           load_float st ty o (FT 0);
           op st (if ty = Ir.F32 then "fmv.x.w" else "fmv.x.d") [ Reg (A i); Reg (FT 0) ]
-      | Ir.Scalar (ty, o), [ In_int i ] -> load_int st ty o (A i)
-      | Ir.Scalar (ty, o), [ In_float i ] -> load_float st ty o (FA i)
-      | Ir.Scalar (ty, o), [ On_stack off ] ->
+      | Ir.Scalar (ty, signed, o), [ In_int i ] ->
+          load_int st ty o (A i);
+          widen st ty signed (A i)
+      | Ir.Scalar (ty, _, o), [ In_float i ] -> load_float st ty o (FA i)
+      | Ir.Scalar (ty, _, o), [ On_stack off ] ->
           load st ty o (T 0) (FT 0);
           op st (store_mnemonic ty) [ Reg (if is_float ty then FT 0 else T 0); Mem (SP, off) ]
       (* An object too big for two registers is passed by reference, and
@@ -1237,11 +1254,12 @@ let instr st (i : Ir.instr) =
           op st "beq" [ Reg (T 0); Reg (T 1); Sym (l, 0) ]) cases;
       op st "j" [ Sym (default, 0) ]
   | Ir.Ret None -> op st "j" [ Sym (".Lreturn." ^ st.fname, 0) ]
-  | Ir.Ret (Some (Ir.Rv_scalar (Ir.F80, o))) ->
+  | Ir.Ret (Some (Ir.Rv_scalar (Ir.F80, _, o))) ->
       load_wide st o (A 0) (A 1);
       op st "j" [ Sym (".Lreturn." ^ st.fname, 0) ]
-  | Ir.Ret (Some (Ir.Rv_scalar (ty, o))) ->
+  | Ir.Ret (Some (Ir.Rv_scalar (ty, signed, o))) ->
       load st ty o (A 0) (FA 0);
+      if not (is_float ty) then widen st ty signed (A 0);
       op st "j" [ Sym (".Lreturn." ^ st.fname, 0) ]
   | Ir.Ret (Some (Ir.Rv_aggregate a)) ->
       (match a.passing with
@@ -1441,7 +1459,7 @@ let func st (f : Ir.func) : func =
   let hidden = match f.returns_aggregate with Some (_, p) -> p = Ir.In_memory | None -> false in
   (* the parameters arrive where a caller would have put them *)
   let as_args = List.map (function
-      | Ir.P_scalar (ty, r) -> Ir.Scalar (ty, Ir.Reg r)
+      | Ir.P_scalar (ty, r) -> Ir.Scalar (ty, true, Ir.Reg r)
       | Ir.P_aggregate (slot, size, passing) -> Ir.Aggregate { Ir.addr = Ir.Slot slot; size; passing })
       f.params in
   let places, named_int, _, _ = assign_args ~hidden as_args in

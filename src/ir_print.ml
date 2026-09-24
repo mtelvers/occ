@@ -41,7 +41,7 @@ let passing = function
 let agg (a : agg) = Printf.sprintf "agg[%d:%s] %s" a.size (passing a.passing) (operand a.addr)
 
 let arg = function
-  | Scalar (t, o) -> Printf.sprintf "%s %s" (ty t) (operand o)
+  | Scalar (t, signed, o) -> Printf.sprintf "%s%s %s" (ty t) (if signed then "" else "u") (operand o)
   | Aggregate a -> agg a
 
 let instr ppf i =
@@ -72,7 +72,7 @@ let instr ppf i =
       p "  switch.%s %s [%s] default %s" (ty t) (operand v)
         (String.concat "; " (List.map (fun (v, l) -> Printf.sprintf "%Ld: %s" v l) cases)) d
   | Ret None -> p "  ret"
-  | Ret (Some (Rv_scalar (t, o))) -> p "  ret.%s %s" (ty t) (operand o)
+  | Ret (Some (Rv_scalar (t, signed, o))) -> p "  ret.%s%s %s" (ty t) (if signed then "" else "u") (operand o)
   | Ret (Some (Rv_aggregate a)) -> p "  ret.%s" (agg a)
   | Atomic_load (t, r, a, o) -> p "  %%%d = atomic_load.%s.%s [%s]" r (ty t) (order o) (operand a)
   | Atomic_store (t, a, v, o) -> p "  atomic_store.%s.%s [%s], %s" (ty t) (order o) (operand a) (operand v)

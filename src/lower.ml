@@ -579,7 +579,7 @@ and call_general fn tu ~dst (ret_ty : C.t) (f : T.expr) (args : T.expr list) : I
   let agg (a : T.expr) addr = { Ir.addr; size = size_of env a.ty; passing = Abi.classify env a.ty } in
   let args = List.map (fun (a : T.expr) ->
       if is_aggregate a.ty then Ir.Aggregate (agg a (address fn tu a))
-      else Ir.Scalar (ir_type env a.ty, value fn tu a)) args in
+      else Ir.Scalar (ir_type env a.ty, is_signed env a.ty, value fn tu a)) args in
   (* how many arguments the callee named, for the back end that needs it *)
   let named =
     if fty.variadic then Some (match fty.params with Some ps -> List.length ps | None -> 0)
@@ -633,7 +633,7 @@ and builtin fn tu loc name (args : T.expr list) : Ir.operand =
       emit fn (Ir.Memcpy (va_addr fn tu d, va_addr fn tu s, Target.va_list_size ())); Ir.Imm 0L
   | ("__builtin_setjmp" | "__builtin_longjmp"), _ ->
       let name = if name = "__builtin_setjmp" then "_setjmp" else "longjmp" in
-      let args = List.map (fun (a : T.expr) -> Ir.Scalar (ir_type env a.ty, value fn tu a)) args in
+      let args = List.map (fun (a : T.expr) -> Ir.Scalar (ir_type env a.ty, is_signed env a.ty, value fn tu a)) args in
       let r = fresh fn in
       emit fn (Ir.Call (Some (Ir.Ret_scalar (Ir.I32, r)), Ir.Sym name, args, None)); Ir.Reg r
   | _ -> Diag.error loc "internal: unknown builtin %s" name
@@ -792,7 +792,7 @@ let rec stmt fn tu (s : T.stmt) =
   | T.Return (Some e) ->
       if is_aggregate e.ty then
         emit fn (Ir.Ret (Some (Ir.Rv_aggregate { Ir.addr = address fn tu e; size = size_of fn.env e.ty; passing = Abi.classify fn.env e.ty })))
-      else emit fn (Ir.Ret (Some (Ir.Rv_scalar (ir_type fn.env e.ty, value fn tu e))))
+      else emit fn (Ir.Ret (Some (Ir.Rv_scalar (ir_type fn.env e.ty, is_signed fn.env e.ty, value fn tu e))))
   | T.Asm a -> inline_asm fn tu a
 
 and loop fn tu ~brk ~cont body =
@@ -923,7 +923,7 @@ let func tu (f : T.func) : Ir.func =
   (match fn.code with
    | Ir.Ret _ :: _ -> ()
    | _ ->
-       if f.fsym.name = "main" then emit fn (Ir.Ret (Some (Ir.Rv_scalar (Ir.I32, Ir.Imm 0L))))
+       if f.fsym.name = "main" then emit fn (Ir.Ret (Some (Ir.Rv_scalar (Ir.I32, true, Ir.Imm 0L))))
        else emit fn (Ir.Ret None));
   { Ir.flink = link_of f.fsym; name = fn.fname; params; variadic = fty.variadic;
     returns_aggregate = (if is_aggregate fty.ret then Some (size_of env fty.ret, Abi.classify env fty.ret) else None);
@@ -936,7 +936,7 @@ let func tu (f : T.func) : Ir.func =
 (* Symbols an instruction refers to. *)
 let syms_of_instr (i : Ir.instr) : string list =
   let op = function Ir.Sym s -> [ s ] | _ -> [] in
-  let arg = function Ir.Scalar (_, o) -> op o | Ir.Aggregate a -> op a.addr in
+  let arg = function Ir.Scalar (_, _, o) -> op o | Ir.Aggregate a -> op a.addr in
   match i with
   | Ir.Mov (_, _, o) | Ir.Neg (_, _, o) | Ir.Not (_, _, o) | Ir.Conv (_, _, o) | Ir.Load (_, _, o)
   | Ir.Va_start o | Ir.Va_arg (_, _, o) | Ir.Branch (o, _, _) | Ir.Switch (_, o, _, _)
@@ -949,7 +949,7 @@ let syms_of_instr (i : Ir.instr) : string list =
   | Ir.Va_arg_aggregate (d, _, _, ap) -> op d @ op ap
   | Ir.Call (res, f, args, _) ->
       op f @ List.concat_map arg args @ (match res with Some (Ir.Ret_aggregate a) -> op a.addr | _ -> [])
-  | Ir.Ret (Some (Ir.Rv_scalar (_, o))) -> op o
+  | Ir.Ret (Some (Ir.Rv_scalar (_, _, o))) -> op o
   | Ir.Ret (Some (Ir.Rv_aggregate a)) -> op a.addr
   | Ir.Intrinsic (_, _, _, o) -> op o
   | Ir.Inline_asm a ->

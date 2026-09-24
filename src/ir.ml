@@ -61,11 +61,23 @@ type passing =
    value, aggregates by address with their size and how they travel. *)
 type agg = { addr : operand; size : int; passing : passing }
 
-type arg = Scalar of ty * operand | Aggregate of agg
+(* A scalar that crosses the boundary -- an argument, or a returned value
+   -- carries the signedness of its C type as well as its machine type,
+   because an ABI may ask for a value narrower than a register to be
+   widened by it.  RISC-V's does: an unsigned char is passed
+   zero-extended and a signed one sign-extended, and a function compiled
+   by another compiler relies on it.  (glibc's htons shifts the whole
+   register, so a uint16_t handed to it sign-extended comes back wrong.)
+
+   Nothing else in the IR needs signedness -- it is a property of
+   operations, not of values -- and what a callee receives, or a caller
+   gets back, is re-narrowed to whatever the back end's own convention
+   is. *)
+type arg = Scalar of ty * bool (* signed *) * operand | Aggregate of agg
 
 type result = Ret_scalar of ty * reg | Ret_aggregate of agg (* into this address *)
 
-type ret_value = Rv_scalar of ty * operand | Rv_aggregate of agg
+type ret_value = Rv_scalar of ty * bool (* signed *) * operand | Rv_aggregate of agg
 
 type instr =
   | Mov of ty * reg * operand
