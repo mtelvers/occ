@@ -22,11 +22,24 @@ let multiarch () =
   | Target.Amd64 -> "x86_64-linux-gnu"
   | Target.Riscv64 -> "riscv64-linux-gnu"
 
+let all_stages = [ "pp"; "cc"; "as"; "ld" ]
+
 let native_stages =
   match Sys.getenv_opt "OCC_NATIVE" with
-  | None | Some "" -> [ "pp"; "cc"; "as"; "ld" ]
+  | None | Some "" -> all_stages
   | Some "none" -> []
-  | Some s -> String.split_on_char ',' s
+  | Some s ->
+      let named = String.split_on_char ',' s in
+      (* A name that is not a stage used to select nothing, which quietly
+         turned the whole compiler into a wrapper around the delegate.
+         Say so instead: a misspelling here is not a request to delegate. *)
+      List.iter (fun name ->
+          if not (List.mem name all_stages) then begin
+            Printf.eprintf "occ: OCC_NATIVE: %s is not a stage; use %s, or \"none\"\n"
+              name (String.concat "," all_stages);
+            exit 1
+          end) named;
+      named
 
 let mode stage =
   let key = match stage with
@@ -163,7 +176,37 @@ let parse_args argv =
 
 (* ---- Running things ----------------------------------------------------- *)
 
+(* The delegate is looked up on PATH, and on a PATH holding only this
+   toolchain the name "gcc" is a link to this very program: delegating
+   would run occ again, which would delegate again, without end.  Two
+   files that are the same length and open with the same kilobyte are the
+   same program under another name; catching it here costs one read and
+   stops the loop at the first step rather than the thousandth process. *)
+let same_program a b =
+  let head f =
+    let c = open_in_bin f in
+    let n = in_channel_length c in
+    let head = really_input_string c (min n 1024) in
+    close_in c; (n, head) in
+  match head a, head b with
+  | x, y -> x = y            (* same length and same first kilobyte *)
+  | exception Sys_error _ -> false
+
+let on_path prog =
+  if String.contains prog '/' then Some prog
+  else
+    let dirs = String.split_on_char ':' (Option.value (Sys.getenv_opt "PATH") ~default:"") in
+    List.find_map (fun dir ->
+        let f = Filename.concat (if dir = "" then "." else dir) prog in
+        if Sys.file_exists f then Some f else None) dirs
+
 let run o prog args =
+  (match on_path prog with
+   | Some found when same_program found Sys.executable_name ->
+       Printf.eprintf
+         "occ: %s on PATH is this compiler (%s); delegating to it would not terminate\n" prog found;
+       exit 1
+   | _ -> ());
   if o.verbose then prerr_endline (String.concat " " (prog :: args));
   match Sys.command (Filename.quote_command prog args) with
   | 0 -> ()
