@@ -764,6 +764,11 @@ let instr st (i : Ir.instr) =
   | Ir.Inline_asm a -> inline_asm st a
   | Ir.Label l -> emit st (Label l)
   | Ir.Jump l -> emit st (Jmp l)
+  (* extension: a label's address, and a jump to one.  The address is
+     taken pc-relative, as the jump table above takes its own, so the
+     code is position independent either way (doc/extensions.md). *)
+  | Ir.Label_addr (r, l) -> emit st (Lea (Rip (l, 0), RAX)); store st Ir.I64 r RAX
+  | Ir.Jump_indirect o -> load_int st Ir.I64 o RAX; emit st (Jmp_indirect (Reg RAX))
   | Ir.Branch (c, t, f) ->
       (match c with
        | Ir.Reg r when (match location st r with `Reg _ -> true | `Mem _ -> false) ->

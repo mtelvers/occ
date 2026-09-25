@@ -8,6 +8,7 @@ type value =
   | Int of int64
   | Float of float
   | Addr of Typed.symbol * int64 (* &symbol + offset *)
+  | Label of string (* extension: &&label, an address constant too *)
   | Str of string * Ctype.t * int64 (* string literal, its array type, offset *)
 
 val eval : Env.t -> Typed.expr -> value option

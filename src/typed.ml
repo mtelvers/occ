@@ -56,6 +56,7 @@ and expr_desc =
   | Member of expr * Ctype.field (* [expr] is an lvalue of struct/union type *)
   | Compound_literal of symbol * init (* a fresh object initialised in place *)
   | Va_arg of expr * Ctype.t
+  | Label_addr of string (* extension: "&&done", the address of a label *)
   | Builtin of string * expr list (* doc/extensions.md *)
   | Atomic_op of atomic_op * Ir.memory_order list * expr list
 
@@ -84,6 +85,7 @@ type stmt =
   | For of stmt option * expr option * expr option * stmt
   | Label of string * stmt
   | Goto of string
+  | Goto_computed of expr
   | Continue
   | Break
   | Return of expr option

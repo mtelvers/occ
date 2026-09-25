@@ -101,6 +101,12 @@ type instr =
   | Call of result option * operand * arg list * int option
   | Label of string
   | Jump of string
+  (* extension: the address of a label in a register, and a jump to such
+     an address.  A label whose address is taken may be entered from any
+     [Jump_indirect] in the function, which is what makes the two
+     inseparable here (doc/extensions.md). *)
+  | Label_addr of reg * string
+  | Jump_indirect of operand
   | Branch of operand * string * string (* if nonzero then else *)
   | Switch of ty * operand * (int64 * string) list * string
   | Ret of ret_value option

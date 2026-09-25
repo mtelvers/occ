@@ -27,7 +27,8 @@ let rec expr ppf (e : expr) =
                         (match f.bits with Some (b, w) -> Printf.sprintf " bits %d+%d" b w | None -> "")
    | Compound_literal (s, _) -> p ppf "(compound-literal %a)" sym s
    | Va_arg (ap, ty) -> p ppf "(va_arg %a %a)" expr ap Ctype.pp ty
-   | Builtin (name, args) -> p ppf "(%s%a)" name (fun ppf -> List.iter (fun a -> p ppf " %a" expr a)) args
+   | Label_addr l -> p ppf "(&&%s)" l
+  | Builtin (name, args) -> p ppf "(%s%a)" name (fun ppf -> List.iter (fun a -> p ppf " %a" expr a)) args
    | Atomic_op (op, _, args) ->
        let name = match op with
          | Load -> "atomic-load" | Store -> "atomic-store" | Exchange -> "atomic-exchange"
@@ -63,6 +64,7 @@ let rec stmt indent ppf (s : stmt) =
         (fun ppf -> function Some e -> expr ppf e | None -> ()) st sub body
   | Label (l, body) -> p ppf "%s%s:@.%a" ind l sub body
   | Goto l -> p ppf "%sgoto %s@." ind l
+  | Goto_computed e -> p ppf "%sgoto *%a@." ind expr e
   | Continue -> p ppf "%scontinue@." ind
   | Break -> p ppf "%sbreak@." ind
   | Return None -> p ppf "%sreturn@." ind

@@ -1199,6 +1199,16 @@ let instr st (i : Ir.instr) =
   | Ir.Call (res, callee, args, named) -> call st res callee args named
   | Ir.Label l -> emit st (Label l)
   | Ir.Jump l -> op st "j" [ Sym (l, 0) ]
+  (* extension: a label's address, and a jump to one.  A label is defined
+     in this object and nothing outside can replace it, so its address is
+     pc-relative arithmetic -- "lla" -- whatever the addressing mode
+     (doc/extensions.md). *)
+  | Ir.Label_addr (r, l) ->
+      op st "lla" [ Reg (T 0); Sym (l, 0) ];
+      store st Ir.I64 r (T 0)
+  | Ir.Jump_indirect o ->
+      let x = source st Ir.I64 o (T 0) in
+      op st "jr" [ Reg x ]
   | Ir.Branch (o, t, e) ->
       let x = source st Ir.I32 o (T 0) in
       op st "bnez" [ Reg x; Sym (t, 0) ];

@@ -427,6 +427,12 @@ and string_literal loc (bytes : string) (enc : Token.encoding) : T.expr =
         (match enc with Token.Wide -> C.wchar | Token.Char16 -> C.char16 | _ -> C.char32), !n in
   mk ~lvalue:true loc (C.array elem (Some (len + 1))) (T.String bytes)
 
+(* A label's name in the assembly.  Labels share a namespace with
+   nothing, so one function's "done" must not be another's; the name is
+   settled here rather than in [Lower] so that the label, the gotos that
+   reach it and the "&&done" that takes its address cannot disagree. *)
+and mangle_label ctx name = Printf.sprintf ".L%s.%s" ctx.func_name name
+
 (* ---- Expressions (6.5) --------------------------------------------------------- *)
 
 and expr ctx (e : S.expr) : T.expr =
@@ -562,6 +568,12 @@ and expr ctx (e : S.expr) : T.expr =
        | [ (_, e) ], _ | [], Some (_, e) -> expr ctx e
        | [], None -> error loc "'_Generic' selector of type '%a' is not compatible with any association" C.pp cty
        | _ -> error loc "'_Generic' selector matches more than one association")
+  (* extension: the address of a label.  Its type is void *, and the
+     label itself is checked at the end of the function like a goto's,
+     since it may be defined further down (doc/extensions.md). *)
+  | S.Label_addr name ->
+      ctx.gotos <- (name, loc) :: ctx.gotos;
+      mk loc (C.pointer C.void) (T.Label_addr (mangle_label ctx name))
   | S.Va_arg (ap, tn) ->
       let ap = rvalue (expr ctx ap) in
       let ty = type_name ctx tn in
@@ -1151,7 +1163,7 @@ and statement ctx (s : S.stmt) : T.stmt =
   | S.Label (name, body) ->
       if Hashtbl.mem ctx.labels name then error loc "duplicate label '%s'" name;
       Hashtbl.replace ctx.labels name ();
-      T.Label (name, statement ctx body)
+      T.Label (mangle_label ctx name, statement ctx body)
   | S.Case (e, body) ->
       (match ctx.switch_types with
        | [] -> error loc "case label not within a switch statement"
@@ -1206,7 +1218,13 @@ and statement ctx (s : S.stmt) : T.stmt =
       let body = loop_body ctx body in
       Env.pop ctx.env;
       T.For (init, c, step, body)
-  | S.Goto name -> ctx.gotos <- (name, loc) :: ctx.gotos; T.Goto name
+  | S.Goto name -> ctx.gotos <- (name, loc) :: ctx.gotos; T.Goto (mangle_label ctx name)
+  (* extension: "goto *p", whose operand is a pointer (6.5.2.3 has
+     nothing to say about it; gcc requires a pointer type) *)
+  | S.Goto_computed e ->
+      let e = rvalue (expr ctx e) in
+      if not (C.is_pointer e.T.ty) then error loc "the operand of a computed goto must be a pointer";
+      T.Goto_computed e
   | S.Continue ->
       if ctx.loops = 0 || ctx.loops = List.length ctx.switch_types && not (in_loop ctx) then
         error loc "continue statement not within a loop";

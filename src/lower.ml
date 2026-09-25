@@ -166,6 +166,9 @@ let rec fill_image tu (img : image) (base : int) (ty : C.t) (init : T.init) =
            let v = if size = 4 then Int64.of_int32 (Int32.bits_of_float f) else Int64.bits_of_float f in
            Bytes.blit_string (le_bytes (min size 8) v) 0 img.bytes base (min size 8)
        | Some (Const_eval.Addr (s, off)) -> img.relocs <- (base, asm_name s, off) :: img.relocs
+       (* extension: a static array of label addresses, which is how a
+          threaded-code interpreter dispatches (doc/extensions.md) *)
+       | Some (Const_eval.Label l) -> img.relocs <- (base, l, 0L) :: img.relocs
        | Some (Const_eval.Str (bytes, sty, off)) ->
            let name = intern_string tu { e with e = T.String bytes; ty = sty } in
            img.relocs <- (base, name, off) :: img.relocs
@@ -541,6 +544,9 @@ and value fn tu (e : T.expr) : Ir.operand =
   | T.Va_arg (ap, ty) ->
       let r = fresh fn in
       emit fn (Ir.Va_arg (ir_type env ty, r, va_addr fn tu ap)); Ir.Reg r
+  | T.Label_addr name ->
+      let r = fresh fn in
+      emit fn (Ir.Label_addr (r, name)); Ir.Reg r
   | T.Builtin (name, args) -> builtin fn tu e.loc name args
   | T.Atomic_op (op, orders, args) -> atomic fn tu e.ty op orders args
 
@@ -784,8 +790,10 @@ let rec stmt fn tu (s : T.stmt) =
        | (cs, _) :: rest -> fn.cases <- (cs, Some l) :: rest
        | [] -> assert false);
       emit fn (Ir.Label l); stmt fn tu body
-  | T.Label (name, body) -> emit fn (Ir.Label (Printf.sprintf ".L%s.%s" fn.fname name)); stmt fn tu body
-  | T.Goto name -> emit fn (Ir.Jump (Printf.sprintf ".L%s.%s" fn.fname name))
+  (* the name was settled in [Elab.mangle_label] *)
+  | T.Label (name, body) -> emit fn (Ir.Label name); stmt fn tu body
+  | T.Goto name -> emit fn (Ir.Jump name)
+  | T.Goto_computed e -> emit fn (Ir.Jump_indirect (value fn tu e))
   | T.Continue -> emit fn (Ir.Jump (List.hd fn.continues))
   | T.Break -> emit fn (Ir.Jump (List.hd fn.breaks))
   | T.Return None -> emit fn (Ir.Ret None)
@@ -857,6 +865,7 @@ and inline_asm fn tu (a : T.asm) =
 let rec find_addressed fn (s : T.stmt) =
   let rec expr (e : T.expr) =
     match e.e with
+    | T.Label_addr _ -> ()
     | T.Addr { e = T.Var s; _ } -> Hashtbl.replace fn.addressed s.id ()
     | T.Addr x -> expr x
     | T.Var _ | T.Int _ | T.Float _ | T.String _ -> ()
@@ -885,6 +894,7 @@ let rec find_addressed fn (s : T.stmt) =
   | T.Expr e -> expr e
   | T.Decl (_, Some i) -> init i
   | T.Decl (_, None) | T.Goto _ | T.Continue | T.Break | T.Return None -> ()
+  | T.Goto_computed _ -> ()
   | T.Asm a ->
       (* a memory operand needs its variable in memory *)
       List.iter (fun (_, c, (e : T.expr)) ->
@@ -956,6 +966,9 @@ let syms_of_instr (i : Ir.instr) : string list =
       List.concat_map (function
           | Ir.Asm_in (_, _, o) | Ir.Asm_mem (_, o) | Ir.Asm_inout (_, _, _, o) -> op o
           | Ir.Asm_out _ | Ir.Asm_imm _ -> []) (Array.to_list a.operands)
+  | Ir.Jump_indirect o -> op o
+  (* a label is not a symbol, so its address refers to nothing here *)
+  | Ir.Label_addr _
   | Ir.Ret None | Ir.Label _ | Ir.Jump _ | Ir.Fence _ | Ir.Trap | Ir.Return_address _ | Ir.Line _ -> []
 
 (* Drop inline definitions nothing refers to, transitively. *)

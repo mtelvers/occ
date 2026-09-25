@@ -42,6 +42,8 @@ let regs_of_instr (i : Ir.instr) : int list * int list =
   | Ir.Ret (Some (Ir.Rv_scalar (_, _, o))) -> [], u o
   | Ir.Ret (Some (Ir.Rv_aggregate a)) -> [], u a.addr
   | Ir.Return_address r -> [ r ], []
+  | Ir.Label_addr (r, _) -> [ r ], []
+  | Ir.Jump_indirect o -> [], u o
   | Ir.Ret None | Ir.Label _ | Ir.Jump _ | Ir.Fence _ | Ir.Trap | Ir.Line _ -> [], []
 
 (* Which registers hold floating-point values: those defined with an F type. *)
@@ -84,6 +86,21 @@ let intervals (f : Ir.func) =
       List.iter (fun l -> match Hashtbl.find_opt labels l with
           | Some j when j <= i -> loops := (j, i) :: !loops
           | _ -> ()) targets) f.body;
+  (* An indirect jump may go to any label whose address was taken, and
+     one of those may be reached from any such jump: control flows
+     between the two in both directions, so each pair spans a region
+     that a value touched inside must survive, exactly as a loop does.
+     Taking the pairs rather than one region from the first label to the
+     last jump keeps the extension to what the jumps can actually
+     reach. *)
+  let addressed = ref [] and indirect = ref [] in
+  List.iteri (fun i ins ->
+      match ins with
+      | Ir.Label_addr (_, l) -> (match Hashtbl.find_opt labels l with Some j -> addressed := j :: !addressed | None -> ())
+      | Ir.Jump_indirect _ -> indirect := i :: !indirect
+      | _ -> ()) f.body;
+  List.iter (fun j ->
+      List.iter (fun i -> loops := (min i j, max i j) :: !loops) !indirect) !addressed;
   (* Only variables need this: a temporary is defined once and used after
      its definition within the same iteration, so its linear interval is
      already right, and extending it would keep it alive over the whole

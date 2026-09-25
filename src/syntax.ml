@@ -37,6 +37,9 @@ and expr_desc =
      be ordinary calls.  Other __builtin_* names are plain [Call]s. *)
   | Va_arg of expr * type_name
   | Offsetof of type_name * designator list
+  (* extension: the address of a label, "&&done", whose type is void *
+     (doc/extensions.md).  It goes with [Goto_computed]. *)
+  | Label_addr of string
 
 and initialiser = { i : init_desc; iloc : loc }
 
@@ -125,6 +128,8 @@ and stmt_desc =
   | Do of stmt * expr
   | For of for_init * expr option * expr option * stmt
   | Goto of string
+  (* extension: "goto *p", whose operand is the address of a label *)
+  | Goto_computed of expr
   | Continue
   | Break
   | Return of expr option

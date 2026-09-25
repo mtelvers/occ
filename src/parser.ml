@@ -186,6 +186,9 @@ and unary st : expr =
   | Punct PlusPlus -> advance st; node (Unop (Preinc, unary st))
   | Punct MinusMinus -> advance st; node (Unop (Predec, unary st))
   | Punct Amp -> advance st; node (Unop (Addr, cast st))
+  (* extension: "&&done" is the address of a label, and the lexer has
+     already made one token of the two ampersands (doc/extensions.md) *)
+  | Punct AmpAmp -> advance st; node (Label_addr (expect_ident st))
   | Punct Star -> advance st; node (Unop (Deref, cast st))
   | Punct Plus -> advance st; cast st
   | Punct Minus -> advance st; node (Unop (Neg, cast st))
@@ -735,7 +738,16 @@ and statement st : stmt =
       let body = statement st in
       pop_scope st;
       node (For (init, cond, step, body))
-  | Keyword Goto -> advance st; let name = expect_ident st in expect_punct st Semi; node (Goto name)
+  | Keyword Goto ->
+      advance st;
+      (* extension: "goto *p" jumps to a label whose address was taken *)
+      if peek st = Punct Star then begin
+        advance st;
+        let e = expression st in
+        expect_punct st Semi; node (Goto_computed e)
+      end else begin
+        let name = expect_ident st in expect_punct st Semi; node (Goto name)
+      end
   | Keyword Continue -> advance st; expect_punct st Semi; node Continue
   | Keyword Break -> advance st; expect_punct st Semi; node Break
   | Keyword Return ->

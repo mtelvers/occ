@@ -2,6 +2,7 @@ type value =
   | Int of int64
   | Float of float
   | Addr of Typed.symbol * int64
+  | Label of string
   | Str of string * Ctype.t * int64
 
 let normalise (t : Ctype.t) v =
@@ -35,6 +36,7 @@ let rec eval env (e : Typed.expr) : value option =
   | Int v -> Some (Int v)
   | Float f -> Some (Float f)
   | String s -> Some (Str (s, e.ty, 0L))
+  | Label_addr l -> Some (Label l)
   | Var { storage = Static _; _ } when Ctype.is_array e.ty || Ctype.is_function e.ty ->
       (* an array or function designator is already an address *)
       (match e.e with Var s -> Some (Addr (s, 0L)) | _ -> None)
@@ -60,8 +62,8 @@ let rec eval env (e : Typed.expr) : value option =
        | Float f, (Integer _ | Enum _) -> Some (Int (normalise e.ty (Int64.of_float f)))
        | Float f, Floating Float -> Some (Float (Int32.float_of_bits (Int32.bits_of_float f)))
        | Float f, Floating _ -> Some (Float f)
-       | (Addr _ | Str _), Pointer _ -> Some v
-       | (Addr _ | Str _), Integer (Long | ULong | LLong | ULLong) -> Some v
+       | (Addr _ | Str _ | Label _), Pointer _ -> Some v
+       | (Addr _ | Str _ | Label _), Integer (Long | ULong | LLong | ULLong) -> Some v
        | _ -> None)
   | Unop (op, x) ->
       let* v = eval env x in
@@ -71,7 +73,7 @@ let rec eval env (e : Typed.expr) : value option =
        | Not, Int i -> Some (Int (normalise e.ty (Int64.lognot i)))
        | Lnot, Int i -> Some (Int (if i = 0L then 1L else 0L))
        | Lnot, Float f -> Some (Int (if f = 0.0 then 1L else 0L))
-       | Lnot, (Addr _ | Str _) -> Some (Int 0L)
+       | Lnot, (Addr _ | Str _ | Label _) -> Some (Int 0L)
        | _ -> None)
   | Binop (op, a, b) ->
       let* va = eval env a in
@@ -79,7 +81,7 @@ let rec eval env (e : Typed.expr) : value option =
       binop env e.ty a.ty op va vb
   | Cond (c, a, b) ->
       let* vc = eval env c in
-      let truth = match vc with Int i -> i <> 0L | Float f -> f <> 0.0 | Addr _ | Str _ -> true in
+      let truth = match vc with Int i -> i <> 0L | Float f -> f <> 0.0 | Addr _ | Str _ | Label _ -> true in
       eval env (if truth then a else b)
   | _ -> None
 

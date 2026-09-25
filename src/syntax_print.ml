@@ -82,6 +82,7 @@ and expr ppf (e : expr) =
              | None -> p ppf " [default: %a]" expr e)) assocs
   | Va_arg (ap, t) -> p ppf "(va_arg %a %a)" expr ap type_name t
   | Offsetof (t, _) -> p ppf "(offsetof %a ...)" type_name t
+  | Label_addr l -> p ppf "(&&%s)" l
 
 and initialiser ppf (i : initialiser) =
   match i.i with
@@ -120,6 +121,7 @@ let rec stmt indent ppf (s : stmt) =
   | Break -> p ppf "%sbreak@." ind
   | Return None -> p ppf "%sreturn@." ind
   | Return (Some e) -> p ppf "%sreturn %a@." ind expr e
+  | Goto_computed e -> p ppf "%sgoto *%a@." ind expr e
   | Asm a -> p ppf "%sasm %S@." ind a.template
 
 and block_item indent ppf = function

@@ -67,6 +67,8 @@ let instr ppf i =
         (operand f) (String.concat ", " (List.map arg args))
   | Label l -> p "%s:" l
   | Jump l -> p "  jump %s" l
+  | Label_addr (r, l) -> p "  r%d = &%s" r l
+  | Jump_indirect o -> p "  jump *%s" (operand o)
   | Branch (c, a, b) -> p "  branch %s ? %s : %s" (operand c) a b
   | Switch (t, v, cases, d) ->
       p "  switch.%s %s [%s] default %s" (ty t) (operand v)
