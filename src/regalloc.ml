@@ -95,13 +95,20 @@ let intervals (f : Ir.func) =
   (* the label each name stands for *)
   let labels = Hashtbl.create 32 in
   Array.iteri (fun i ins -> match ins with Ir.Label l -> Hashtbl.replace labels l i | _ -> ()) body;
-  (* Every label whose address is taken is a possible target of every
-     indirect jump: that is the whole of what a computed goto does to the
-     flow graph. *)
-  let addressed = ref [] in
-  Array.iter (function
-      | Ir.Label_addr (_, l) -> (match Hashtbl.find_opt labels l with Some j -> addressed := j :: !addressed | None -> ())
-      | _ -> ()) body;
+  (* An indirect jump may go to any label whose address escaped, and an
+     address escapes through static data as readily as through an
+     instruction: a threaded-code interpreter takes the address of each
+     of its opcode labels in an initialised array, which is data this
+     function's instructions never mention.  Nothing here can see that,
+     so every label of the body is taken to be a possible target.  The
+     alternative -- believing only the [Label_addr] instructions -- makes
+     the dispatch loop of such an interpreter look like straight-line
+     code and every value in it look dead between one opcode and the
+     next. *)
+  let addressed =
+    if Array.exists (function Ir.Jump_indirect _ -> true | _ -> false) body
+    then Hashtbl.fold (fun _ j acc -> j :: acc) labels []
+    else [] in
   let target l = Hashtbl.find_opt labels l in
   (* Successors of position [i]: where control may go next.  A return
      goes nowhere; a trap ends the function too. *)
@@ -111,7 +118,7 @@ let intervals (f : Ir.func) =
     | Ir.Jump l -> (match target l with Some j -> [ j ] | None -> [])
     | Ir.Branch (_, a, b) -> List.filter_map target [ a; b ]
     | Ir.Switch (_, _, cases, d) -> List.filter_map target (d :: List.map snd cases)
-    | Ir.Jump_indirect _ -> !addressed
+    | Ir.Jump_indirect _ -> addressed
     | Ir.Ret _ -> []
     | _ -> fallthrough in
   (* Live-in sets, as one bitset per position over the registers in use.
@@ -152,7 +159,36 @@ let intervals (f : Ir.func) =
     List.iter (fun r -> note r i) uses;
     for r = 0 to nregs - 1 do if get live.(i) r then note r i done
   done;
+  (* the invariant the scan below rests on: a value's interval covers
+     every position where the value is live *)
+  if Sys.getenv_opt "OCC_CHECK_INTERVALS" <> None then
+    for i = 0 to n - 1 do
+      for r = 0 to nregs - 1 do
+        if get live.(i) r then
+          match Hashtbl.find_opt first r, Hashtbl.find_opt last r with
+          | Some a, Some b when a <= i && i <= b -> ()
+          | Some a, Some b -> Printf.eprintf "occ: %s: r%d live at %d but interval is [%d,%d]\n" f.name r i a b
+          | _ -> Printf.eprintf "occ: %s: r%d live at %d but has no interval\n" f.name r i
+      done
+    done;
   List.sort compare (Hashtbl.fold (fun r s acc -> (s, Hashtbl.find last r, r) :: acc) first [])
+
+(* A call that may return twice (7.13.2.1p3 for setjmp; the others are
+   the same shape).  On the second return the callee-saved registers
+   hold the values they had at the call, while memory holds whatever was
+   written since: a value kept in such a register across the call and
+   written after it would be read back stale.  So a value live across
+   one of these lives in memory instead.
+
+   They are recognised by name, as the machine's own compiler recognises
+   them: the declarations in <setjmp.h> carry no attribute saying so.  A
+   value first defined after the call is unaffected -- the second return
+   re-enters at the call and runs the definition again -- which is what
+   leaves the interpreter's pc, sp and accumulator in registers. *)
+let returns_twice = function
+  | "setjmp" | "_setjmp" | "__setjmp" | "sigsetjmp" | "__sigsetjmp"
+  | "savectx" | "qsetjmp" | "vfork" | "getcontext" -> true
+  | _ -> false
 
 let allocate ~callee_saved ~caller_saved ~clobbers ~name (f : Ir.func) =
   let allocatable = callee_saved @ caller_saved in
@@ -178,6 +214,14 @@ let allocate ~callee_saved ~caller_saved ~clobbers ~name (f : Ir.func) =
     Hashtbl.replace where r (Spill slot);
     spilled := (stop, slot) :: !spilled in
   let all = intervals f in
+  (* the positions of calls that may return twice, and whether an
+     interval is live across one *)
+  let twice = ref [] in
+  List.iteri (fun i ins ->
+      match ins with
+      | Ir.Call (_, Ir.Sym s, _, _) when returns_twice s -> twice := i :: !twice
+      | _ -> ()) f.body;
+  let spans_twice start stop = List.exists (fun p -> start < p && p < stop) !twice in
   let uses = Hashtbl.create 64 in
   List.iter (fun i -> let ds, us = regs_of_instr i in
               List.iter (fun r -> Hashtbl.replace uses r (1 + Option.value (Hashtbl.find_opt uses r) ~default:0)) (ds @ us)) f.body;
@@ -189,7 +233,7 @@ let allocate ~callee_saved ~caller_saved ~clobbers ~name (f : Ir.func) =
       let expired, still = List.partition (fun (e, _, _) -> e < start) !active in
       active := still;
       List.iter (fun (_, _, p) -> free := p :: !free) expired;
-      if Hashtbl.mem floats r then ()
+      if Hashtbl.mem floats r || spans_twice start stop then ()
       else
         match List.find_opt (fun p -> safe start stop p && not (start < 0 && List.mem p caller_saved)) !free with
         | Some p ->
@@ -229,7 +273,7 @@ let allocate ~callee_saved ~caller_saved ~clobbers ~name (f : Ir.func) =
       match Hashtbl.find_opt where r with
       | Some (Register _) -> () (* a variable placed in pass 1 *)
       | _ ->
-          if Hashtbl.mem floats r || Hashtbl.mem is_var r then spill (stop, r)
+          if Hashtbl.mem floats r || Hashtbl.mem is_var r || spans_twice start stop then spill (stop, r)
           else
             match List.find_opt (fun p -> safe start stop p && not (busy start stop p) && not (start < 0 && List.mem p caller_saved)) allocatable with
             | Some p ->
