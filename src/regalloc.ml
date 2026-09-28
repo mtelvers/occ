@@ -64,58 +64,94 @@ let float_regs (f : Ir.func) =
       | _ -> ()) f.body;
   fl
 
-(* Live intervals: (start, stop, register), sorted by start. *)
+(* Live intervals: (start, stop, register), sorted by start.
+
+   A value's interval has to cover every position where the value is
+   live, and liveness is a property of the control flow, not of the order
+   the instructions happen to be written in: a value defined at the
+   bottom of a loop and read at the top is live across the back edge,
+   and a value whose every use is inside one arm of a switch is not live
+   in the others.  So the flow graph is built and live-variable analysis
+   run over it (the backward dataflow of the dragon book, chapter 9),
+   rather than approximated.
+
+   The approximation this replaces -- a value touched anywhere inside a
+   loop is live over the whole loop -- is safe but ruinous where the
+   whole function is one loop with many arms, which is what a bytecode
+   interpreter is: each of its hundred-odd opcode handlers has locals of
+   its own, and treating them all as live at once leaves a hundred
+   values competing for twelve registers.  Under the analysis each
+   handler's locals live only in that handler, and only what the loop
+   really carries -- the interpreter's pc, sp and accumulator -- stays
+   live throughout.
+
+   Intervals remain one range apiece rather than a set of ranges with
+   holes: that is still conservative, and it keeps the scan below in the
+   one page it takes. *)
 let intervals (f : Ir.func) =
+  let body = Array.of_list f.body in
+  let n = Array.length body in
+  let def_use = Array.map regs_of_instr body in
+  (* the label each name stands for *)
+  let labels = Hashtbl.create 32 in
+  Array.iteri (fun i ins -> match ins with Ir.Label l -> Hashtbl.replace labels l i | _ -> ()) body;
+  (* Every label whose address is taken is a possible target of every
+     indirect jump: that is the whole of what a computed goto does to the
+     flow graph. *)
+  let addressed = ref [] in
+  Array.iter (function
+      | Ir.Label_addr (_, l) -> (match Hashtbl.find_opt labels l with Some j -> addressed := j :: !addressed | None -> ())
+      | _ -> ()) body;
+  let target l = Hashtbl.find_opt labels l in
+  (* Successors of position [i]: where control may go next.  A return
+     goes nowhere; a trap ends the function too. *)
+  let succs i =
+    let fallthrough = if i + 1 < n then [ i + 1 ] else [] in
+    match body.(i) with
+    | Ir.Jump l -> (match target l with Some j -> [ j ] | None -> [])
+    | Ir.Branch (_, a, b) -> List.filter_map target [ a; b ]
+    | Ir.Switch (_, _, cases, d) -> List.filter_map target (d :: List.map snd cases)
+    | Ir.Jump_indirect _ -> !addressed
+    | Ir.Ret _ -> []
+    | _ -> fallthrough in
+  (* Live-in sets, as one bitset per position over the registers in use.
+     The fixpoint is reached by sweeping backwards until nothing changes,
+     which for a body written in source order is a handful of sweeps. *)
+  let nregs = 1 + Array.fold_left (fun m (ds, us) -> List.fold_left max m (ds @ us)) 0 def_use in
+  let words = (nregs + 7) / 8 in
+  let live = Array.init (n + 1) (fun _ -> Bytes.make words '\000') in
+  let get b r = Char.code (Bytes.get b (r / 8)) land (1 lsl (r land 7)) <> 0 in
+  let set b r = Bytes.set b (r / 8) (Char.chr (Char.code (Bytes.get b (r / 8)) lor (1 lsl (r land 7)))) in
+  let clear b r = Bytes.set b (r / 8) (Char.chr (Char.code (Bytes.get b (r / 8)) land lnot (1 lsl (r land 7)) land 0xff)) in
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    for i = n - 1 downto 0 do
+      (* live-out is the union of the successors' live-in *)
+      let out = Bytes.make words '\000' in
+      List.iter (fun s ->
+          let ls = live.(s) in
+          for k = 0 to words - 1 do
+            Bytes.set out k (Char.chr (Char.code (Bytes.get out k) lor Char.code (Bytes.get ls k)))
+          done) (succs i);
+      let defs, uses = def_use.(i) in
+      List.iter (fun r -> clear out r) defs;
+      List.iter (fun r -> set out r) uses;
+      if Bytes.compare out live.(i) <> 0 then begin live.(i) <- out; changed := true end
+    done
+  done;
+  (* The interval of a value runs from where it is first defined or live
+     to where it is last live or used. *)
   let first = Hashtbl.create 64 and last = Hashtbl.create 64 in
   let note r i = if not (Hashtbl.mem first r) then Hashtbl.replace first r i; Hashtbl.replace last r i in
+  (* a parameter is live from before the first instruction *)
   List.iter (function Ir.P_scalar (_, r) -> note r (-1) | Ir.P_aggregate _ -> ()) f.params;
-  List.iteri (fun i ins ->
-      let defs, uses = regs_of_instr ins in
-      List.iter (fun r -> note r i) defs;
-      List.iter (fun r -> note r i) uses) f.body;
-  (* A backward jump closes a loop: every register touched inside it must
-     stay live over the whole loop, since the next iteration may read it
-     before this one's definition in program order. *)
-  let labels = Hashtbl.create 32 in
-  List.iteri (fun i ins -> match ins with Ir.Label l -> Hashtbl.replace labels l i | _ -> ()) f.body;
-  let loops = ref [] in
-  List.iteri (fun i ins ->
-      let targets = match ins with
-        | Ir.Jump l -> [ l ] | Ir.Branch (_, a, b) -> [ a; b ]
-        | Ir.Switch (_, _, cases, d) -> d :: List.map snd cases | _ -> [] in
-      List.iter (fun l -> match Hashtbl.find_opt labels l with
-          | Some j when j <= i -> loops := (j, i) :: !loops
-          | _ -> ()) targets) f.body;
-  (* An indirect jump may go to any label whose address was taken, and
-     one of those may be reached from any such jump: control flows
-     between the two in both directions, so each pair spans a region
-     that a value touched inside must survive, exactly as a loop does.
-     Taking the pairs rather than one region from the first label to the
-     last jump keeps the extension to what the jumps can actually
-     reach. *)
-  let addressed = ref [] and indirect = ref [] in
-  List.iteri (fun i ins ->
-      match ins with
-      | Ir.Label_addr (_, l) -> (match Hashtbl.find_opt labels l with Some j -> addressed := j :: !addressed | None -> ())
-      | Ir.Jump_indirect _ -> indirect := i :: !indirect
-      | _ -> ()) f.body;
-  List.iter (fun j ->
-      List.iter (fun i -> loops := (min i j, max i j) :: !loops) !indirect) !addressed;
-  (* Only variables need this: a temporary is defined once and used after
-     its definition within the same iteration, so its linear interval is
-     already right, and extending it would keep it alive over the whole
-     loop for nothing. *)
-  let touched = Hashtbl.create 64 in (* register -> positions *)
-  List.iteri (fun i ins ->
-      let defs, uses = regs_of_instr ins in
-      List.iter (fun r -> Hashtbl.add touched r i) (defs @ uses)) f.body;
-  List.iter (fun r ->
-      if Hashtbl.mem first r then
-        List.iter (fun (lo, hi) ->
-            if List.exists (fun pos -> pos >= lo && pos <= hi) (Hashtbl.find_all touched r) then begin
-              if Hashtbl.find first r > lo then Hashtbl.replace first r lo;
-              if Hashtbl.find last r < hi then Hashtbl.replace last r hi
-            end) !loops) f.variables;
+  for i = 0 to n - 1 do
+    let defs, uses = def_use.(i) in
+    List.iter (fun r -> note r i) defs;
+    List.iter (fun r -> note r i) uses;
+    for r = 0 to nregs - 1 do if get live.(i) r then note r i done
+  done;
   List.sort compare (Hashtbl.fold (fun r s acc -> (s, Hashtbl.find last r, r) :: acc) first [])
 
 let allocate ~callee_saved ~caller_saved ~clobbers ~name (f : Ir.func) =
