@@ -565,7 +565,8 @@ let last s = s.[String.length s - 1]
 let sized_mnemonics = [
   "mov"; "add"; "or"; "adc"; "sbb"; "and"; "sub"; "xor"; "cmp"; "test"; "lea"; "push"; "pop";
   "inc"; "dec"; "neg"; "not"; "mul"; "imul"; "div"; "idiv"; "shl"; "sal"; "shr"; "sar"; "rol"; "ror";
-  "xchg"; "cmpxchg"; "xadd"; "bswap"; "movabs"; "call"; "jmp"; "bsf"; "bsr"; "popcnt"; "lzcnt"; "tzcnt" ]
+  "xchg"; "cmpxchg"; "xadd"; "bswap"; "movabs"; "call"; "jmp"; "bsf"; "bsr"; "popcnt"; "lzcnt"; "tzcnt";
+  "bt"; "bts"; "btr"; "btc" ]
 
 let rec encode mnemonic operands =
   let cc_of s = List.assoc_opt s condition_codes in
@@ -735,6 +736,22 @@ and sized base suffix operands =
       let prefix = if base = "bsf" || base = "bsr" then [] else [ 0xF3 ] in
       let op = match base with "bsf" | "tzcnt" -> 0xBC | "bsr" | "lzcnt" -> 0xBD | _ -> 0xB8 in
       build { default with legacy = seg @ prefix @ size_prefix (size ()); w = (size () = S64); reg = r.rnum; rm = Some rm; opcode = [ 0x0F; op ] }
+  (* the bit-test family, which the OCaml compiler emits for Int.logand
+     against a single bit.  The index is a register (0F A3 and its three
+     neighbours, the operation in the opcode) or an immediate (0F BA, the
+     operation in ModRM.reg); either way the bit is counted within the
+     destination, so there is no separate width to give. *)
+  | ("bt" | "bts" | "btr" | "btc"), [ s; d ] ->
+      let rm, seg, frex = rm_of (size ()) d in
+      let common = { default with legacy = seg @ size_prefix (size ()); w = (size () = S64);
+                                  rm = Some rm; force_rex = frex } in
+      (match s with
+       | Imm e ->
+           let ext = match base with "bt" -> 4 | "bts" -> 5 | "btr" -> 6 | _ -> 7 in
+           build { common with reg = ext; opcode = [ 0x0F; 0xBA ]; imm = Some (e, 1, false) }
+       | _ ->
+           let op = match base with "bt" -> 0xA3 | "bts" -> 0xAB | "btr" -> 0xB3 | _ -> 0xBB in
+           build { common with reg = (gpr s).rnum; opcode = [ 0x0F; op ] })
   | "call", [ op ] -> call op
   | "jmp", [ op ] -> jmp op
   | _ -> bad "bad operands for %s" base
