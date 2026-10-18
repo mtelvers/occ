@@ -128,7 +128,10 @@ let data ppf (d : data) =
 
 let func ppf (f : func) =
   let p fmt = Format.fprintf ppf fmt in
-  p "\t.text@.";
+  (* -ffunction-sections puts the function in a section of its own,
+     named after it, which is what lets a linker drop it whole *)
+  if !Target.function_sections then p "\t.section\t.text.%s,\"ax\",@progbits@." f.name
+  else p "\t.text@.";
   (* an instruction is four bytes and must be aligned to four; every
      function here is a whole number of them, but say so anyway *)
   p "\t.align\t2@.";

@@ -131,7 +131,10 @@ let data ppf (d : data) =
 
 let func ppf (f : func) =
   let p fmt = Format.fprintf ppf fmt in
-  p "\t.text@.";
+  (* -ffunction-sections puts the function in a section of its own,
+     named after it, which is what lets a linker drop it whole *)
+  if !Target.function_sections then p "\t.section\t.text.%s,\"ax\",@progbits@." f.name
+  else p "\t.text@.";
   linkage ppf ~global:f.global ~weak:f.weak ~hidden:f.hidden f.name;
   p "\t.type\t%s, @function@." f.name;
   p "%s:@." f.name;

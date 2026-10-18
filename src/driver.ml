@@ -128,6 +128,8 @@ let parse_args argv =
      | "-o" -> o.output <- Some (next a)
      | "-v" -> o.verbose <- true
      | "-fPIC" | "-fpic" | "-fPIE" | "-fpie" -> o.pic <- true; o.passthrough <- o.passthrough @ [ a ]
+     | "-ffunction-sections" -> Target.function_sections := true; o.passthrough <- o.passthrough @ [ a ]
+     | "-fno-function-sections" -> Target.function_sections := false; o.passthrough <- o.passthrough @ [ a ]
      (* Which machine to compile for.  The default is the one this
         compiler was built for, and OCC_TARGET says otherwise for a
         build whose scripts cannot be given a flag. *)

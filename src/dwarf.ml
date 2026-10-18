@@ -76,6 +76,11 @@ let abbrevs = [
   6, 0x0f, false, [ 0x0b, 0x0b ];
   7, 0x13, false, [ 0x03, 0x08; 0x3c, 0x19 ];
   8, 0x17, false, [ 0x03, 0x08; 0x3c, 0x19 ];
+  (* the compile unit again, for -ffunction-sections: code spread over a
+     section per function has no one range, so DW_AT_ranges names a list
+     of them (DWARF 4, 3.1.1) and DW_AT_low_pc is the zero base those
+     entries are measured from *)
+  9, 0x11, true,  [ 0x25, 0x08; 0x13, 0x0b; 0x03, 0x08; 0x1b, 0x08; 0x11, 0x01; 0x55, 0x17; 0x10, 0x17 ];
 ]
 
 let sleb128_size v =
@@ -105,8 +110,11 @@ let info ppf (subprograms : subprogram list) ~source =
   p ".Ldebug_info_start:@.";
   p "\t.short\t4@.\t.long\t.Ldebug_abbrev0@.\t.byte\t8@.";
   (* compile unit *)
-  p "\t.uleb128 1@.\t.string\t\"occ 0.1\"@.\t.byte\t0x0c@.\t.string\t\"%s\"@.\t.string\t\"%s\"@." (escape source) (escape (Sys.getcwd ()));
-  p "\t.quad\t.Ltext0@.\t.quad\t.Letext0-.Ltext0@.\t.long\t.Ldebug_line0@.";
+  let spread = !Target.function_sections in
+  p "\t.uleb128 %d@.\t.string\t\"occ 0.1\"@.\t.byte\t0x0c@.\t.string\t\"%s\"@.\t.string\t\"%s\"@."
+    (if spread then 9 else 1) (escape source) (escape (Sys.getcwd ()));
+  if spread then p "\t.quad\t0@.\t.long\t.Ldebug_ranges0@.\t.long\t.Ldebug_line0@."
+  else p "\t.quad\t.Ltext0@.\t.quad\t.Letext0-.Ltext0@.\t.long\t.Ldebug_line0@.";
   List.iter (fun s ->
       let d = s.sinfo in
       let ret = type_label d.dret in
@@ -141,5 +149,12 @@ let info ppf (subprograms : subprogram list) ~source =
       List.iter (fun (a, f) -> p "\t.uleb128 0x%x@.\t.uleb128 0x%x@." a f) attrs;
       p "\t.byte\t0@.\t.byte\t0@.") abbrevs;
   p "\t.byte\t0@.";
+  (* one entry per function, ended by a pair of zeros (DWARF 4, 2.17.3) *)
+  if spread then begin
+    p "\t.section .debug_ranges,\"\",@progbits@.";
+    p ".Ldebug_ranges0:@.";
+    List.iter (fun s -> p "\t.quad\t.LFB.%s@.\t.quad\t.LFE.%s@." s.sname s.sname) subprograms;
+    p "\t.quad\t0@.\t.quad\t0@."
+  end;
   p "\t.section .debug_line,\"\",@progbits@.";
   p ".Ldebug_line0:@."

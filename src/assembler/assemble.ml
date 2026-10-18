@@ -46,6 +46,7 @@ type section = {
   mutable symidx : int;                 (* the section symbol's index in .symtab *)
   mutable locs : Debug_line.entry list; (* reversed *)
   mutable frames : Eh_frame.frame list; (* reversed *)
+  mutable mapped : bool;                (* RISC-V: the ISA mapping symbol is in this section *)
 }
 
 type def =
@@ -123,9 +124,13 @@ let type_of_string = function
   | "init_array" -> 14 | "fini_array" -> 15
   | t -> failwith ("unknown section type " ^ t)
 
+(* The instruction set the code in this file belongs to, as gas spells
+   it in the mapping symbol and in .riscv.attributes. *)
+let riscv_arch = "rv64i2p0_m2p0_a2p0_f2p0_d2p0_zmmul1p0"
+
 let new_section name flags typ =
   { sname = name; flags; typ; entsize = 0; chunks = []; count = 0; arr = [||]; offsets = [||]; size = 0;
-    align = 1; index = 0; symidx = 0; locs = []; frames = [] }
+    align = 1; index = 0; symidx = 0; locs = []; frames = []; mapped = false }
 
 let find_section st name =
   match Hashtbl.find_opt st.sections name with
@@ -349,6 +354,23 @@ let rec statement st (l : line) =
 
 and statement_instr st encode i =
       st.has_code <- true;
+      (* RISC-V marks every section that holds code with the instruction
+         set its contents belong to, not just the first: with
+         -ffunction-sections there is one such section per function. *)
+      if !Target.machine = Target.Riscv64 && not st.current.mapped then begin
+        st.current.mapped <- true;
+        (* Each one is a separate local symbol under the same name, as
+           several ".L0"s are, so it is kept apart here by a name of its
+           own and written out under the name gas gives it. *)
+        (* .text keeps the plain name, as a file with one code section
+           is the ordinary case and gas writes it under that name *)
+        if st.current.sname = ".text" then define_label st ("$x" ^ riscv_arch)
+        else begin
+          let key = "$x." ^ st.current.sname in
+          define_label st key;
+          (symbol st key).out_name <- "$x" ^ riscv_arch
+        end
+      end;
       (match encode i with
        | Encode.Fixed (bytes, fixups) -> add_chunk st (Bytes (bytes, fixups, st.line))
        | Encode.Relaxable { short; long } ->
@@ -553,7 +575,7 @@ type resolved =
      same, and the relocation overwrites the field with the same value. *)
   | Value_and_reloc of int64 * int * [ `Sym of symbol | `Section of section ] * int64
 
-let reloc_type st ~modifier ~pcrel ~size ~signed ~branch ~relaxable ~rex =
+let reloc_type st ~modifier ~pcrel ~size ~signed ~branch ~relaxable ~rex ~local =
   let open Elf in
   match modifier with
   | Some ("PLT" | "plt") -> r_x86_64_plt32
@@ -562,7 +584,16 @@ let reloc_type st ~modifier ~pcrel ~size ~signed ~branch ~relaxable ~rex =
   | Some ("tpoff" | "TPOFF") -> r_x86_64_tpoff32
   | Some m -> error st "unsupported relocation modifier @%s" m
   | None ->
-      if pcrel then (if branch then r_x86_64_plt32 else match size with 8 -> r_x86_64_pc64 | 4 -> r_x86_64_pc32 | 2 -> r_x86_64_pc16 | _ -> r_x86_64_pc8)
+      (* A call or jump to a symbol this file defines locally cannot go
+         through a procedure linkage table -- nothing can interpose on
+         it -- so it is an ordinary pc-relative reference, which the
+         rule below then expresses against the symbol's section.  It
+         only arises across sections, since within one the displacement
+         is worked out here and no relocation is left; -ffunction-sections
+         puts every function in a section of its own, so every such call
+         arrives here. *)
+      if pcrel then (if branch && not local then r_x86_64_plt32
+                     else match size with 8 -> r_x86_64_pc64 | 4 -> r_x86_64_pc32 | 2 -> r_x86_64_pc16 | _ -> r_x86_64_pc8)
       else match size with 8 -> r_x86_64_64 | 4 -> if signed then r_x86_64_32s else r_x86_64_32 | 2 -> r_x86_64_16 | _ -> r_x86_64_8
 
 (* A relocation against a local symbol is expressed against its section,
@@ -607,15 +638,16 @@ let against st rtype (sy : symbol) =
 let resolve st (sec : section) ~pos ~base ~rex ?(relaxed = false) (f : fixup) =
   let v = eval st f.target in
   let modifier = modifier_of f.target in
-  let rtype () =
+  let is_global (sy : symbol) = sy.binding = Some Elf.stb_global || sy.binding = Some Elf.stb_weak in
+  let rtype (sy : symbol) =
     match !Target.machine with
     | Target.Riscv64 ->
         (try Encode_riscv.reloc_type ~field:f.field ~modifier ~size:f.size ~pcrel:f.pcrel
          with Fixup.Bad m -> error st "%s" m)
     | Target.Amd64 ->
         reloc_type st ~modifier ~pcrel:f.pcrel ~size:f.size ~signed:f.signed
-          ~branch:f.branch ~relaxable:f.relaxable ~rex in
-  let is_global (sy : symbol) = sy.binding = Some Elf.stb_global || sy.binding = Some Elf.stb_weak in
+          ~branch:f.branch ~relaxable:f.relaxable ~rex
+          ~local:(not (is_global sy) && sy.def <> Undefined) in
   (* may a same-section pc-relative reference be resolved here? *)
   let resolvable sy = match modifier with
     | None ->
@@ -636,11 +668,11 @@ let resolve st (sec : section) ~pos ~base ~rex ?(relaxed = false) (f : fixup) =
            (match !Target.machine with
             | Target.Amd64 -> Value value
             | Target.Riscv64 ->
-                let rtype = rtype () in
+                let rtype = rtype sy in
                 let target, extra = against st rtype sy in
                 Value_and_reloc (value, rtype, target, Int64.add v.addend extra))
        | _ ->
-           let rtype = rtype () in
+           let rtype = rtype sy in
            let target, extra = against st rtype sy in
            let addend = if f.pcrel then Int64.sub v.addend (Int64.of_int (base - pos)) else v.addend in
            let addend = Int64.add addend extra in
@@ -768,7 +800,6 @@ let is_local_label name = starts_with ".L" name
    linker reads to check that what it is joining agrees, and a symbol
    marking the start of each code section for the disassembler -- and it
    is the string gas writes when it is told nothing else. *)
-let riscv_arch = "rv64i2p0_m2p0_a2p0_f2p0_d2p0_zmmul1p0"
 
 (* the section as the psABI describes it: a format byte, then one
    vendor sub-section holding one file attribute, the architecture *)
@@ -795,10 +826,7 @@ let run file text =
              symbol_order = []; current = text_section; previous = None; files = []; file_symbol = None;
              frame = None; counter = 0; line = 0; pic = false; has_code = false } in
   Hashtbl.replace st.sections ".text" text_section;
-  (* RISC-V marks each code section with the instruction set its
-     contents belong to, so that a disassembler knows how to read them;
-     gas writes the symbol first, before anything the file says. *)
-  if !Target.machine = Target.Riscv64 then define_label st ("$x" ^ riscv_arch);
+
   (* pass 1 *)
   List.iter (statement st) lines;
   if st.frame <> None then error st "missing .cfi_endproc";

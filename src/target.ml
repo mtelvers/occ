@@ -19,6 +19,13 @@ let machine = ref Amd64
 
 let name = function Amd64 -> "x86_64" | Riscv64 -> "riscv64"
 
+(* -ffunction-sections: each function goes in a section of its own,
+   ".text.<name>", so that a linker told --gc-sections can drop the ones
+   nothing refers to.  Set by the driver; the emitters and the debug
+   information both have to know, since a compilation unit whose code is
+   spread over many sections has no single range of addresses. *)
+let function_sections = ref false
+
 let pointer_size = 8
 
 (* What a va_list is, which the C library's own declarations have to
